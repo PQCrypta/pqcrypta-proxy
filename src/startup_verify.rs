@@ -1117,6 +1117,8 @@ pub fn probe_waf(
         query,
         headers: &headers,
         body: None,
+        version: None,
+        authority: None,
     };
 
     // Control first, and before any attack has had the chance to get this source
@@ -1260,6 +1262,8 @@ fn probe_connection_rate(
             query: "",
             headers: &headers,
             body: None,
+            version: None,
+            authority: None,
         };
         match engine.evaluate(&view, &policy) {
             SecurityDecision::RateLimited { limit, kind, .. } => {

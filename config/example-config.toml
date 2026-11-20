@@ -788,6 +788,14 @@ custom_patterns = []
 # path = "^/regex/"
 # categories = ["xss"]
 
+# The OWASP Core Rule Set beside the native rules (README: WAF Configuration).
+# The entry file turns the engine on and includes crs-setup.conf, CRS's rules
+# and the site's exclusions; start in "detect", block once they are written.
+# [waf.crs]
+# enabled = true
+# mode = "detect"
+# entry = "/etc/pqcrypta/crs/main.conf"
+
 [fingerprint]
 # Enable TLS fingerprint detection
 enabled = true

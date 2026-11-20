@@ -49,6 +49,7 @@
 //! `(?i)localhost` in a query string was a 403 by itself.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use percent_encoding::percent_decode_str;
@@ -56,6 +57,7 @@ use regex::{Regex, RegexSet, RegexSetBuilder};
 use tracing::debug;
 
 use crate::config::WafConfig;
+use crate::waf_crs::{CrsHead, CrsLayer, CrsOutcome, CrsTransaction};
 
 /// Severity of a WAF rule match
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1202,6 +1204,12 @@ pub struct WafRequest<'a> {
     /// global mode. Lets one route be tuned in detect mode while the rest of
     /// the site stays blocking.
     pub mode_override: Option<&'a str>,
+    /// The protocol the request arrived over, which CRS reads (HTTP/1.1 when
+    /// unknown): some of its rules apply to HTTP/1 alone
+    pub version: Option<http::Version>,
+    /// The request's authority: CRS's Host over HTTP/2 and HTTP/3, which
+    /// carry no Host header
+    pub authority: Option<&'a str>,
 }
 
 /// A rule as compiled into the engine, addressed by its index in
@@ -1231,6 +1239,8 @@ pub struct WafStats {
     blocked: AtomicU64,
     detected: AtomicU64,
     per_rule: Vec<AtomicU64>,
+    /// CRS rules that scored a request CRS denied, by rule id
+    crs_rules: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl WafStats {
@@ -1241,6 +1251,7 @@ impl WafStats {
             blocked: AtomicU64::new(0),
             detected: AtomicU64::new(0),
             per_rule: (0..rule_count).map(|_| AtomicU64::new(0)).collect(),
+            crs_rules: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 }
@@ -1287,6 +1298,8 @@ pub struct WafEngine {
     exclusions: Vec<CompiledExclusion>,
     stats: WafStats,
     config: WafConfig,
+    /// The OWASP Core Rule Set, when `[waf.crs]` runs it
+    crs: Option<Arc<CrsLayer>>,
 }
 
 /// Running tally for one request.
@@ -1324,6 +1337,8 @@ pub enum HeadVerdict {
 
 /// A request's head as assessed, waiting for its body.
 pub struct WafHead {
+    /// CRS's transaction, phase 1 run, when CRS runs
+    crs: Option<CrsTransaction>,
     assessment: Assessment,
     /// The exclusions its path matched, by index into the engine's
     excluded: Vec<usize>,
@@ -1347,8 +1362,25 @@ pub struct WafExplanation {
     pub score: u32,
     pub threshold: u32,
     pub mode: String,
-    /// The score reaches the threshold and the engine is in block mode.
+    /// The score reaches the threshold and the engine is in block mode, or
+    /// CRS denies it and CRS and the route both block.
     pub would_block: bool,
+    /// What the OWASP Core Rule Set made of it, when it runs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crs: Option<WafCrsExplanation>,
+}
+
+/// CRS's part of a [`WafExplanation`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WafCrsExplanation {
+    /// CRS denies the request (its anomaly score reached its threshold)
+    pub denied: bool,
+    /// Its inbound anomaly score at the paranoia level it blocks at
+    pub score: u32,
+    /// The rules that scored it
+    pub rules: Vec<String>,
+    /// `[waf.crs] mode`
+    pub mode: String,
 }
 
 impl WafEngine {
@@ -1360,6 +1392,10 @@ impl WafEngine {
 
     /// Build a new WAF engine from config, compiling all patterns at construction time.
     pub fn new(config: &WafConfig) -> Self {
+        Self::build(config, crs_layer(config, None))
+    }
+
+    fn build(config: &WafConfig, crs: Option<Arc<CrsLayer>>) -> Self {
         let mut rules: Vec<CompiledRule> = Vec::new();
         let mut payload_pats: Vec<&str> = Vec::new();
         let mut payload_map: Vec<usize> = Vec::new();
@@ -1493,6 +1529,7 @@ impl WafEngine {
             exclusions,
             stats,
             config: config.clone(),
+            crs,
         }
     }
 
@@ -1503,7 +1540,7 @@ impl WafEngine {
     /// reload. Totals carry over; per-rule hits carry over by rule identifier,
     /// since `custom_patterns` can add or remove rules and move indices.
     pub fn with_counters_from(config: &WafConfig, previous: &WafEngine) -> Self {
-        let engine = Self::new(config);
+        let engine = Self::build(config, crs_layer(config, previous.crs.as_ref()));
         let carry = |to: &AtomicU64, from: &AtomicU64| {
             to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
         };
@@ -1522,12 +1559,30 @@ impl WafEngine {
                 carry(&engine.stats.per_rule[i], &previous.stats.per_rule[j]);
             }
         }
+        if let (Ok(mut to), Ok(from)) = (
+            engine.stats.crs_rules.lock(),
+            previous.stats.crs_rules.lock(),
+        ) {
+            to.clone_from(&from);
+        }
         engine
     }
 
     /// The configuration this engine was compiled from.
     pub fn config(&self) -> &WafConfig {
         &self.config
+    }
+
+    /// Whether the CRS rules this engine runs are the ones on disk: true
+    /// when it runs none and none are configured, false once a file behind
+    /// the entry has changed (an exclusion edited, a release installed) or
+    /// a configured rule set is not loaded. A reload whose `[waf]` is
+    /// unchanged rebuilds the engine when this is false.
+    pub fn crs_current(&self) -> bool {
+        match &self.crs {
+            Some(layer) => layer.unchanged(&self.config.crs.entry),
+            None => !(self.config.enabled && self.config.crs.enabled),
+        }
     }
 
     /// Counters for the metrics endpoint.
@@ -1546,6 +1601,20 @@ impl WafEngine {
                     hits,
                 })
             })
+            .chain(
+                self.stats
+                    .crs_rules
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, hits)| WafRuleStat {
+                        id,
+                        category: "crs",
+                        severity: "crs",
+                        hits,
+                    }),
+            )
             .collect();
         WafStatsSnapshot {
             inspected: self.stats.inspected.load(Ordering::Relaxed),
@@ -1559,6 +1628,46 @@ impl WafEngine {
     /// Number of compiled rules, including disabled categories.
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+}
+
+/// The CRS rule set `config` runs: `previous`'s when its files are unchanged
+/// (a reload need not compile the same rules again), else loaded anew. A
+/// rule set that fails to load is logged; a reload then keeps `previous`'s.
+fn crs_layer(config: &WafConfig, previous: Option<&Arc<CrsLayer>>) -> Option<Arc<CrsLayer>> {
+    if !(config.enabled && config.crs.enabled) {
+        return None;
+    }
+    if let Some(p) = previous.filter(|p| p.unchanged(&config.crs.entry)) {
+        return Some(Arc::clone(p));
+    }
+    match CrsLayer::load(&config.crs.entry) {
+        Ok(layer) => {
+            tracing::info!(
+                rules = layer.rule_count(),
+                entry = %config.crs.entry,
+                mode = %config.crs.mode,
+                "OWASP CRS loaded"
+            );
+            Some(Arc::new(layer))
+        }
+        Err(e) => {
+            tracing::error!("{e}: CRS not reloaded");
+            previous.cloned()
+        }
+    }
+}
+
+/// A request's head as CRS reads it.
+fn crs_head<'a>(req: &WafRequest<'a>) -> CrsHead<'a> {
+    CrsHead {
+        method: req.method,
+        path: req.path,
+        query: req.query,
+        version: req.version,
+        authority: req.authority,
+        headers: req.headers,
+        skip_scanner_rules: req.skip_bot_ua_check,
     }
 }
 
@@ -1822,7 +1931,15 @@ impl WafEngine {
             .map_or(self.config.mode == "block", |m| m == "block");
         let threshold = self.config.anomaly_threshold.max(1);
         let a = self.assess(req, threshold, false);
-        self.verdict(&a, block_mode, threshold, req.path)
+        let native = self.verdict(&a, block_mode, threshold, req.path);
+        match &self.crs {
+            Some(crs) if !matches!(native, WafVerdict::Block { .. }) => {
+                let mut t = crs.head(&crs_head(req));
+                crs.body(&mut t, self.crs_body(req).as_deref());
+                self.with_crs(native, &t.outcome(), block_mode, req.path)
+            }
+            _ => native,
+        }
     }
 
     /// The head of a request whose body is still to come: everything but the
@@ -1843,7 +1960,17 @@ impl WafEngine {
         if block_mode && a.score >= threshold {
             return HeadVerdict::Decided(self.verdict(&a, block_mode, threshold, req.path));
         }
+        let crs = self.crs.as_ref().map(|crs| crs.head(&crs_head(req)));
+        if let Some(t) = crs
+            .as_ref()
+            .filter(|t| t.denied() && self.crs_blocks(block_mode))
+        {
+            // CRS denies on the head alone: decided now, the body never read
+            let native = self.verdict(&a, block_mode, threshold, req.path);
+            return HeadVerdict::Decided(self.with_crs(native, &t.outcome(), block_mode, req.path));
+        }
         HeadVerdict::Pending(WafHead {
+            crs,
             assessment: a,
             excluded,
             block_mode,
@@ -1856,19 +1983,138 @@ impl WafEngine {
     /// no body, the head's assessment as it stands.
     pub fn inspect_rest(&self, head: WafHead, req: &WafRequest<'_>) -> WafVerdict {
         let WafHead {
+            crs: t,
             assessment: mut a,
             excluded,
             block_mode,
             threshold,
         } = head;
         self.assess_body(&mut a, req, &self.exclusion_refs(&excluded), threshold);
-        self.verdict(&a, block_mode, threshold, req.path)
+        let native = self.verdict(&a, block_mode, threshold, req.path);
+        match (&self.crs, t) {
+            (Some(crs), Some(mut t)) if !matches!(native, WafVerdict::Block { .. }) => {
+                crs.body(&mut t, self.crs_body(req).as_deref());
+                self.with_crs(native, &t.outcome(), block_mode, req.path)
+            }
+            _ => native,
+        }
     }
 
     /// The verdict on a request whose head was left pending and whose body
     /// was never read (it ended first): the head's assessment as it stands.
-    pub fn conclude(&self, head: &WafHead, path: &str) -> WafVerdict {
-        self.verdict(&head.assessment, head.block_mode, head.threshold, path)
+    pub fn conclude(&self, head: WafHead, path: &str) -> WafVerdict {
+        let native = self.verdict(&head.assessment, head.block_mode, head.threshold, path);
+        match (&self.crs, head.crs) {
+            (Some(crs), Some(mut t)) if !matches!(native, WafVerdict::Block { .. }) => {
+                crs.body(&mut t, None);
+                self.with_crs(native, &t.outcome(), head.block_mode, path)
+            }
+            _ => native,
+        }
+    }
+
+    /// CRS's denials block: its own `mode` and the route's both block.
+    fn crs_blocks(&self, block_mode: bool) -> bool {
+        block_mode && self.config.crs.mode == "block"
+    }
+
+    /// The body CRS reads: decoded when the native rules would decode it, and
+    /// none when it is incomplete. CRS parses a form, JSON or multipart body
+    /// whole, and denies one that does not parse (200002, 200003): a body
+    /// truncated to `max_body_scan_bytes`, or still compressed, would be
+    /// denied for that alone. Such a request is judged by CRS on its head and
+    /// URI, and its body by the native rules, which scan what they have.
+    fn crs_body<'r>(&self, req: &WafRequest<'r>) -> Option<std::borrow::Cow<'r, [u8]>> {
+        let body = req.body.filter(|b| !b.is_empty())?;
+        let declared = req
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let truncated = match declared {
+            Some(n) => n > body.len(),
+            None => body.len() >= self.config.max_body_scan_bytes,
+        };
+        if truncated {
+            return None;
+        }
+        let encoding = req
+            .headers
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("identity"));
+        match encoding {
+            None => Some(std::borrow::Cow::Borrowed(body)),
+            Some(enc) if self.config.decode_compressed_body => {
+                decompress_bounded(body, enc, self.config.max_decompressed_body_bytes)
+                    .map(std::borrow::Cow::Owned)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// The native verdict with CRS's: CRS's denial decides when the native
+    /// rules do not block, as a block when CRS blocks and a detection when it
+    /// only reports. Named `crs:<rule>+<rule>` by the rules that scored it.
+    fn with_crs(
+        &self,
+        native: WafVerdict,
+        o: &CrsOutcome,
+        block_mode: bool,
+        path: &str,
+    ) -> WafVerdict {
+        if !o.denied || matches!(native, WafVerdict::Block { .. }) {
+            return native;
+        }
+        if let Ok(mut m) = self.stats.crs_rules.lock() {
+            for id in &o.rules {
+                *m.entry(id.clone()).or_default() += 1;
+            }
+        }
+        match native {
+            WafVerdict::Allow => {
+                self.stats.allowed.fetch_sub(1, Ordering::Relaxed);
+            }
+            WafVerdict::Detect { .. } => {
+                self.stats.detected.fetch_sub(1, Ordering::Relaxed);
+            }
+            WafVerdict::Block { .. } => {}
+        }
+        let rule = if o.rules.is_empty() {
+            "crs:949110".to_string()
+        } else {
+            format!("crs:{}", o.rules.join("+"))
+        };
+        let severity = if o.score >= 10 {
+            Severity::Critical
+        } else {
+            Severity::High
+        };
+        let matched = u32::try_from(o.rules.len()).unwrap_or(u32::MAX);
+        if self.crs_blocks(block_mode) {
+            self.stats.blocked.fetch_add(1, Ordering::Relaxed);
+            WafVerdict::Block {
+                rule,
+                severity,
+                score: o.score,
+                matched,
+                location: "crs".to_string(),
+            }
+        } else {
+            debug!(
+                "CRS would deny: rule={} score={} path={}",
+                rule, o.score, path
+            );
+            self.stats.detected.fetch_add(1, Ordering::Relaxed);
+            WafVerdict::Detect {
+                rule,
+                severity,
+                score: o.score,
+                matched,
+                location: "crs".to_string(),
+            }
+        }
     }
 
     /// Every rule the request matches, without stopping at the threshold and
@@ -1894,12 +2140,27 @@ impl WafEngine {
                 }
             })
             .collect();
+        let crs = self.crs.as_ref().map(|crs| {
+            let mut t = crs.head(&crs_head(req));
+            crs.body(&mut t, self.crs_body(req).as_deref());
+            let o = t.outcome();
+            WafCrsExplanation {
+                denied: o.denied,
+                score: o.score,
+                rules: o.rules,
+                mode: self.config.crs.mode.clone(),
+            }
+        });
+        let crs_blocks = crs
+            .as_ref()
+            .is_some_and(|c| c.denied && c.mode == "block" && mode == "block");
         WafExplanation {
             matches,
             score: a.score,
             threshold,
-            would_block: a.score >= threshold && mode == "block",
+            would_block: (a.score >= threshold && mode == "block") || crs_blocks,
             mode,
+            crs,
         }
     }
 
@@ -2518,6 +2779,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             })
         };
         for body in [
@@ -2592,6 +2855,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             assert!(!matches!(verdict, WafVerdict::Allow), "{payload}: {verdict:?}");
         }
@@ -2634,6 +2899,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             assert!(
                 matches!(verdict, WafVerdict::Allow),
@@ -2692,6 +2959,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         }
     }
 
@@ -2923,6 +3192,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -2998,6 +3269,41 @@ mod tests {
 
     /// X-Forwarded-For carries loopback and private addresses by design. With
     /// SSRF rules on, they must not be read as an SSRF attempt.
+    /// A reload with the same `[waf]` still rebuilds the engine when a CRS
+    /// file changed: the engine says its rules are not current
+    #[test]
+    fn crs_rules_changed_on_disk_make_the_engine_stale() {
+        let dir = std::env::temp_dir().join(format!("waf-crs-current-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.conf");
+        let rule = "SecRuleEngine On\nSecRule REQUEST_HEADERS:User-Agent \"@contains nikto\" \"id:913100,phase:1,deny,status:403\"\n";
+        std::fs::write(&entry, rule).unwrap();
+        let cfg = WafConfig {
+            crs: crate::config::WafCrsConfig {
+                enabled: true,
+                mode: "detect".into(),
+                entry: entry.to_str().unwrap().into(),
+            },
+            enabled: true,
+            ..WafConfig::default()
+        };
+        let engine = WafEngine::new(&cfg);
+        assert!(engine.crs.is_some(), "the rule set loaded");
+        assert!(engine.crs_current(), "just loaded");
+        std::fs::write(&entry, format!("{rule}# an exclusion added\n")).unwrap();
+        assert!(!engine.crs_current(), "a file behind the entry changed");
+        let rebuilt = WafEngine::with_counters_from(&cfg, &engine);
+        assert!(
+            rebuilt.crs_current(),
+            "the rebuilt engine runs what is on disk"
+        );
+        assert!(
+            WafEngine::new(&WafConfig::default()).crs_current(),
+            "no CRS configured"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn proxy_hop_headers_are_exempt_from_ssrf_rules() {
         let mut cfg = config();
@@ -3029,6 +3335,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -3055,6 +3363,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "double-encoded XSS must be blocked");
     }
@@ -3079,6 +3389,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             blocked(&v),
@@ -3101,6 +3413,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         };
         let head_query = "q=1' UNION SELECT password FROM users--";
         let body: &'static [u8] = b"comment=<script>alert(document.cookie)</script>";
@@ -3126,7 +3440,7 @@ mod tests {
         let HeadVerdict::Pending(head) = engine.inspect_head(&req(head_query, None)) else {
             panic!("the head alone is below the threshold");
         };
-        assert!(!blocked(&engine.conclude(&head, "/submit")));
+        assert!(!blocked(&engine.conclude(head, "/submit")));
         assert_eq!(engine.stats().inspected, 2);
 
         // A head that blocks on its own is decided before the body is read.
@@ -3155,6 +3469,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             }))
         };
         let padded = |padding: usize| {
@@ -3224,6 +3540,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             let millis = started.elapsed().as_millis().max(1);
             println!(
@@ -3250,6 +3568,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "a non-UTF-8 body must still be inspected");
     }
@@ -3270,6 +3590,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "Java serialised object body must be blocked");
         assert!(
@@ -3294,6 +3616,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "JSON-escaped XSS in a body must be blocked");
     }
@@ -3363,6 +3687,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "entity-encoded XSS must be blocked");
     }
@@ -3402,6 +3728,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             assert!(blocked(&v), "SSTI payload {query:?} must be blocked");
         }
@@ -3424,6 +3752,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             assert!(blocked(&v), "LFI payload {query:?} must be blocked");
         }
@@ -3442,6 +3772,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "prototype pollution must be blocked");
     }
@@ -3458,6 +3790,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "CRLF response splitting must be blocked");
     }
@@ -3545,6 +3879,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -3569,6 +3905,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             blocked(&v),
@@ -3593,6 +3931,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -3622,6 +3962,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -3649,6 +3991,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(matches!(v, WafVerdict::Detect { .. }), "expected Detect");
     }
@@ -3665,6 +4009,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: Some("detect"),
+            version: None,
+            authority: None,
         });
         assert!(matches!(v, WafVerdict::Detect { .. }));
     }
@@ -3692,6 +4038,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(excluded, WafVerdict::Allow),
@@ -3708,6 +4056,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             blocked(&elsewhere),
@@ -3734,6 +4084,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -3805,6 +4157,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -3865,6 +4219,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             assert!(blocked(&v), "command substitution {q:?} must block");
         }
@@ -3889,6 +4245,8 @@ mod tests {
                 skip_bot_ua_check: false,
                 generic_client_allowed: false,
                 mode_override: None,
+                version: None,
+                authority: None,
             });
             assert!(blocked(&v), "PHP-family SSTI {q:?} must block");
         }
@@ -3908,6 +4266,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "fullwidth-encoded XSS must block");
     }
@@ -3925,6 +4285,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "%u-encoded XSS must block");
     }
@@ -3960,6 +4322,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             blocked(&v),
@@ -3990,6 +4354,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "deflate'd SQLi body must be blocked");
     }
@@ -4015,6 +4381,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -4080,6 +4448,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -4105,6 +4475,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "a file:// SSRF vector must block");
     }
@@ -4122,6 +4494,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             matches!(v, WafVerdict::Allow),
@@ -4196,6 +4570,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(
             !blocked(&v),
@@ -4226,6 +4602,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "injection in a text field must still block");
     }
@@ -4249,6 +4627,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "a traversal filename must still block");
     }
@@ -4272,6 +4652,8 @@ mod tests {
             skip_bot_ua_check: false,
             generic_client_allowed: false,
             mode_override: None,
+            version: None,
+            authority: None,
         });
         assert!(blocked(&v), "a text/* file part must still be scanned");
     }

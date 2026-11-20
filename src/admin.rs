@@ -2380,6 +2380,8 @@ async fn waf_explain_handler(
         // No route here to say whether it lets credentialed clients through
         generic_client_allowed: false,
         mode_override: None,
+        version: None,
+        authority: None,
     });
     Ok(Json(serde_json::json!({
         "matches": explanation.matches,
@@ -2387,6 +2389,7 @@ async fn waf_explain_handler(
         "threshold": explanation.threshold,
         "mode": explanation.mode,
         "would_block": explanation.would_block,
+        "crs": explanation.crs,
         "body_bytes_inspected": body.as_ref().map_or(0, Vec::len),
         "rules_loaded": waf.rule_count(),
     })))

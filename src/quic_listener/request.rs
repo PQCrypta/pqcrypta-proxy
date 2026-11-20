@@ -479,6 +479,8 @@ impl QuicListener {
                     query: request.uri().query().unwrap_or(""),
                     headers: request.headers(),
                     body: None,
+                    version: Some(http::Version::HTTP_3),
+                    authority: host.as_deref(),
                 };
                 let (decision, pending) = security.evaluate_head(&view, h3_route_policy);
                 waf_pending = pending;
@@ -1507,6 +1509,8 @@ impl QuicListener {
                 query: request.uri().query().unwrap_or(""),
                 headers: body_head,
                 body: Some(&body),
+                version: Some(http::Version::HTTP_3),
+                authority: host.as_deref(),
             };
             let decision = security.inspect_rest(pending, &body_view, body_route_policy);
             let body_origin = request

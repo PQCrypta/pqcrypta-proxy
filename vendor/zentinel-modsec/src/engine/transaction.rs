@@ -1,0 +1,1364 @@
+//! Transaction processing for ModSecurity.
+
+use std::sync::Arc;
+
+use super::chain::ChainState;
+use super::control::{CtlDirective, TransactionControls};
+use super::intervention::Intervention;
+use super::phase::Phase;
+use super::ruleset::{CompiledRule, CompiledRuleset, RuleEngineMode};
+use super::scoring::ANOMALY_SCORE;
+use crate::actions::{
+    execute_actions, ActionResult, DisruptiveOutcome, FlowOutcome, SetVarOp as RuleSetVar,
+    SetVarOperation,
+};
+use crate::error::Result;
+use crate::operators::{compile_operator, Operator};
+use crate::parser::{Action, DataAction, OperatorSpec};
+use crate::variables::{Collection, RequestData, ResponseData, TxCollection, VariableResolver};
+
+/// Whether a lowercased Content-Type denotes a JSON body.
+///
+/// Covers the `+json` structured suffix (RFC 6839) as well as `application/json`,
+/// so `application/vnd.api+json`, `application/problem+json` and friends are
+/// inspected rather than silently falling through to the urlencoded parser.
+fn is_json_content_type(ct_lower: &str) -> bool {
+    let media_type = ct_lower.split(';').next().unwrap_or("").trim();
+    media_type == "application/json" || media_type == "text/json" || media_type.ends_with("+json")
+}
+
+/// Whether a lowercased Content-Type denotes an XML body.
+///
+/// Covers the `+xml` structured suffix (RFC 6839), so SOAP
+/// (`application/soap+xml`), Atom and friends are inspected rather than
+/// falling through to a parser that finds nothing in them.
+fn is_xml_content_type(ct_lower: &str) -> bool {
+    let media_type = ct_lower.split(';').next().unwrap_or("").trim();
+    media_type == "application/xml" || media_type == "text/xml" || media_type.ends_with("+xml")
+}
+
+/// A ModSecurity transaction for processing a single request.
+pub struct Transaction {
+    /// Compiled ruleset reference.
+    ruleset: Arc<CompiledRuleset>,
+    /// Request data.
+    request: RequestData,
+    /// Response data.
+    response: ResponseData,
+    /// TX collection (mutable variables).
+    tx: TxCollection,
+    /// Current phase.
+    phase: Phase,
+    /// Intervention (if any).
+    intervention: Option<Intervention>,
+    /// Default block status.
+    default_status: u16,
+    /// Matched rules.
+    matched_rules: Vec<String>,
+    /// Allow flag (skip further processing).
+    allowed: bool,
+    /// Matched variables for current rule evaluation.
+    matched_vars: Vec<(String, String)>,
+    /// Regex captures from last match.
+    captures: Vec<String>,
+    /// Per-transaction `ctl:` overrides.
+    controls: TransactionControls,
+    /// Every variable that caused a rule to match, in order.
+    ///
+    /// Separate from `matched_vars`, which ModSecurity scopes to the current
+    /// rule so that `MATCHED_VARS` reads correctly. This accumulates for the
+    /// whole transaction, because audit logging wants to answer "what did
+    /// rule 942100 actually see" after the fact.
+    matched_data: Vec<MatchedData>,
+    /// What each `setvar` that ran did, in order. See [`SetVarEffect`].
+    setvar_effects: Vec<SetVarEffect>,
+    /// Whether `setvar_effects` is filled. Off by default.
+    record_setvar_effects: bool,
+}
+
+/// The variable a rule matched on.
+#[derive(Debug, Clone)]
+struct MatchedVariable {
+    name: String,
+    value: String,
+    portion: Option<String>,
+}
+
+/// One variable value a rule's operator matched.
+struct RuleMatch {
+    captures: Vec<String>,
+    matched_variable: Option<MatchedVariable>,
+}
+
+/// Result of evaluating one rule: every match, in the order the variables were
+/// resolved. libmodsecurity runs the operator against every value and handles
+/// each match on its own (`capture`, `setvar`), so a rule over `REQUEST_HEADERS`
+/// acts once per matching header.
+struct RuleOutcome {
+    matches: Vec<RuleMatch>,
+}
+
+impl RuleOutcome {
+    fn no_match() -> Self {
+        Self {
+            matches: Vec::new(),
+        }
+    }
+}
+
+/// What a rule matched on.
+///
+/// `matched_rules()` gives rule IDs, which says a rule fired but not why.
+/// Without the variable and value there is no way to tell a true positive
+/// from a false one, or to write a useful audit log entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedData {
+    /// ID of the rule that matched, if it has one.
+    pub rule_id: Option<String>,
+    /// Name of the variable that matched, e.g. `ARGS:json.q`.
+    pub variable: String,
+    /// The variable's value, after transformations were applied.
+    ///
+    /// This is what `MATCHED_VAR` resolves to -- the whole value, not the
+    /// portion the operator hit.
+    pub value: String,
+    /// The portion of the value the operator matched, when it reports one.
+    ///
+    /// `@contains evil` against `something-evil-here` gives `evil` here and
+    /// the full string in `value`. Operators that match the whole value, or
+    /// do not report a portion, leave this `None`.
+    pub matched_portion: Option<String>,
+}
+
+/// What a `setvar` did to a collection.
+///
+/// The values are the ones that were applied: any `%{...}` macro in the rule
+/// has been expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetVarChange {
+    /// `setvar:tx.name=value`
+    Set(String),
+    /// `setvar:tx.name=+n`
+    Increment(i64),
+    /// `setvar:tx.name=-n`
+    Decrement(i64),
+    /// `setvar:!tx.name`
+    Delete,
+}
+
+/// One `setvar` that ran, with the rule it belongs to.
+///
+/// The engine records these without interpreting them: it does not know which
+/// variables a ruleset uses for scoring. A caller that wants "the rules that
+/// raised the anomaly score" filters on `key` and `op` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetVarEffect {
+    /// ID of the rule, or for a chain link without an id of its own, of the
+    /// chain's starter.
+    pub rule_id: String,
+    /// Collection named by the rule, lowercased: `"tx"`.
+    pub collection: String,
+    /// Variable name as written in the rule, e.g. `inbound_anomaly_score_pl1`.
+    pub key: String,
+    /// The operation, with macros already expanded.
+    pub op: SetVarChange,
+}
+
+impl Transaction {
+    /// Create a new transaction.
+    pub fn new(ruleset: Arc<CompiledRuleset>, default_status: u16) -> Self {
+        Self {
+            ruleset,
+            request: RequestData::new(),
+            response: ResponseData::new(),
+            tx: TxCollection::new(),
+            phase: Phase::RequestHeaders,
+            intervention: None,
+            default_status,
+            matched_rules: Vec::new(),
+            allowed: false,
+            matched_vars: Vec::new(),
+            captures: Vec::new(),
+            controls: TransactionControls::default(),
+            matched_data: Vec::new(),
+            setvar_effects: Vec::new(),
+            record_setvar_effects: false,
+        }
+    }
+
+    /// Set the client address, backing `REMOTE_ADDR` and `REMOTE_PORT`.
+    ///
+    /// Without this there is no way for a caller to populate them, so every
+    /// IP-based rule -- `@ipMatch`, CRS IP reputation, allow and deny lists --
+    /// evaluated against an empty string and never matched.
+    pub fn set_client_addr(&mut self, ip: &str, port: u16) {
+        self.request.client_ip = ip.to_string();
+        self.request.client_port = port;
+    }
+
+    /// Set the local address, backing `SERVER_ADDR` and `SERVER_PORT`.
+    pub fn set_server_addr(&mut self, ip: &str, port: u16) {
+        self.request.server_addr = ip.to_string();
+        self.request.server_port = port;
+    }
+
+    /// Set the server name, backing `SERVER_NAME`.
+    pub fn set_server_name(&mut self, name: &str) {
+        self.request.server_name = name.to_string();
+    }
+
+    /// Every variable that caused a rule to match, in order.
+    ///
+    /// Pairs with [`matched_rules`](Self::matched_rules): that says which
+    /// rules fired, this says what they saw.
+    pub fn matched_data(&self) -> &[MatchedData] {
+        &self.matched_data
+    }
+
+    /// Record what every `setvar` does, for [`setvar_effects`](Self::setvar_effects).
+    ///
+    /// Off by default: a rule that matches many values runs its `setvar` for
+    /// each, so a request with hundreds of arguments records thousands of
+    /// entries (about 250 KB with stock CRS at paranoia 1 for 200 arguments
+    /// that each trip several rules). Call this before processing the request.
+    pub fn set_record_setvar_effects(&mut self, enabled: bool) {
+        self.record_setvar_effects = enabled;
+    }
+
+    /// Every `setvar` that ran in this transaction, in order of execution.
+    ///
+    /// Empty unless [`set_record_setvar_effects`](Self::set_record_setvar_effects)
+    /// was enabled first. A rule over several values (`ARGS`, request headers)
+    /// runs its `setvar` once per matching value, as libmodsecurity does, and
+    /// each run is an entry.
+    ///
+    /// A `setvar` on a chain link runs when that link matches, so a chain that
+    /// fails later still leaves the effects of its earlier links here; they are
+    /// attributed to the chain's starter. A `setvar` of a rule with no id is
+    /// not listed.
+    ///
+    /// Pairs with [`matched_rules`](Self::matched_rules) and
+    /// [`matched_data`](Self::matched_data): those say which rules fired and
+    /// what they saw, this says what they did to TX.
+    pub fn setvar_effects(&self) -> &[SetVarEffect] {
+        &self.setvar_effects
+    }
+
+    /// Process the request URI.
+    pub fn process_uri(&mut self, uri: &str, method: &str, protocol: &str) -> Result<()> {
+        self.request.set_uri(uri);
+        self.request.set_method(method);
+        self.request.set_protocol(protocol);
+        Ok(())
+    }
+
+    /// Add a request header.
+    pub fn add_request_header(&mut self, name: &str, value: &str) -> Result<()> {
+        self.request.add_header(name, value);
+        Ok(())
+    }
+
+    /// Process request headers (Phase 1).
+    pub fn process_request_headers(&mut self) -> Result<()> {
+        self.phase = Phase::RequestHeaders;
+        self.run_phase(Phase::RequestHeaders)?;
+        Ok(())
+    }
+
+    /// Append data to request body.
+    pub fn append_request_body(&mut self, data: &[u8]) -> Result<()> {
+        self.request.append_body(data);
+        Ok(())
+    }
+
+    /// Process request body (Phase 2).
+    pub fn process_request_body(&mut self) -> Result<()> {
+        self.phase = Phase::RequestBody;
+
+        let content_type = self
+            .request
+            .headers
+            .get("content-type")
+            .and_then(|v| v.first().map(|s| s.to_string()));
+        let ct_lower = content_type
+            .as_deref()
+            .map(|ct| ct.trim_start().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        // ctl:requestBodyAccess=Off, typically set in phase 1, suppresses body
+        // parsing entirely. Phase 2 rules still run; they just find no ARGS_POST
+        // or FILES, which is what disabling body access means.
+        if !self.controls.request_body_access() {
+            self.run_phase(Phase::RequestBody)?;
+            return Ok(());
+        }
+
+        // ctl:requestBodyProcessor overrides Content-Type sniffing. CRS relies
+        // on this to force a processor when the header is absent or lying.
+        if let Some(forced) = self.controls.request_body_processor() {
+            match forced {
+                "MULTIPART" => {
+                    if !self
+                        .request
+                        .parse_multipart_body(content_type.as_deref().unwrap_or_default())
+                    {
+                        tracing::warn!(
+                            "ctl:requestBodyProcessor=MULTIPART, but the body has no parseable \
+                             boundary; body arguments were not extracted"
+                        );
+                    }
+                }
+                "URLENCODED" => {
+                    self.request.parse_form_body();
+                    self.request.body_processor = "URLENCODED".to_string();
+                }
+                "JSON" => self.process_json_body(),
+                "XML" => self.process_xml_body(),
+                // CtlDirective::parse admits no other value.
+                other => debug_assert!(false, "unsupported forced body processor: {other}"),
+            }
+            self.run_phase(Phase::RequestBody)?;
+            return Ok(());
+        }
+
+        if ct_lower.starts_with("multipart/form-data") {
+            // Multipart body processor: populates ARGS_POST, FILES and
+            // MULTIPART_PART_HEADERS. Never fall back to the urlencoded
+            // parser for multipart payloads — that would produce bogus ARGS.
+            if !self
+                .request
+                .parse_multipart_body(content_type.as_deref().unwrap_or_default())
+            {
+                tracing::warn!(
+                    "multipart/form-data request without a parseable boundary; \
+                     body arguments were not extracted"
+                );
+            }
+        } else if is_xml_content_type(&ct_lower) {
+            self.process_xml_body();
+        } else if is_json_content_type(&ct_lower) {
+            // JSON bodies previously fell through to the urlencoded parser,
+            // which extracts nothing usable from them -- so ARGS was empty and
+            // rules like CRS 942100 (`SecRule ARGS "@detectSQLi"`) had nothing
+            // to inspect. An injection payload was blocked in a form body and
+            // passed unexamined in a JSON body.
+            self.process_json_body();
+        } else {
+            self.request.parse_form_body();
+            if ct_lower.starts_with("application/x-www-form-urlencoded") {
+                self.request.body_processor = "URLENCODED".to_string();
+            }
+        }
+
+        self.run_phase(Phase::RequestBody)?;
+        Ok(())
+    }
+
+    /// Run the XML body processor, recording any failure.
+    ///
+    /// As with JSON, a failure is not fatal: phase 2 still runs so a rule
+    /// testing `REQBODY_ERROR` can act on it.
+    fn process_xml_body(&mut self) {
+        if let Err(e) = self.request.parse_xml_body() {
+            tracing::debug!(
+                error = %e,
+                "request body could not be processed as XML; REQBODY_ERROR is set"
+            );
+        }
+    }
+
+    /// Run the JSON body processor, recording any failure.
+    ///
+    /// A failure is deliberately not fatal: the request still goes through
+    /// phase 2 so that rules testing `REQBODY_ERROR` can act on it, which is
+    /// how CRS rule 200002 blocks bodies it could not parse. Dropping the
+    /// request here instead would take that decision away from the ruleset.
+    fn process_json_body(&mut self) {
+        if let Err(e) = self.request.parse_json_body() {
+            tracing::debug!(
+                error = %e,
+                "request body could not be processed as JSON; REQBODY_ERROR is set"
+            );
+        }
+    }
+
+    /// Add a response header.
+    pub fn add_response_header(&mut self, name: &str, value: &str) -> Result<()> {
+        self.response.add_header(name, value);
+        Ok(())
+    }
+
+    /// Process response headers (Phase 3).
+    pub fn process_response_headers(&mut self) -> Result<()> {
+        self.phase = Phase::ResponseHeaders;
+        self.run_phase(Phase::ResponseHeaders)?;
+        Ok(())
+    }
+
+    /// Append data to response body.
+    pub fn append_response_body(&mut self, data: &[u8]) -> Result<()> {
+        self.response.append_body(data);
+        Ok(())
+    }
+
+    /// Process response body (Phase 4).
+    pub fn process_response_body(&mut self) -> Result<()> {
+        self.phase = Phase::ResponseBody;
+        self.run_phase(Phase::ResponseBody)?;
+        Ok(())
+    }
+
+    /// Process logging phase (Phase 5).
+    pub fn process_logging(&mut self) -> Result<()> {
+        self.phase = Phase::Logging;
+        self.run_phase(Phase::Logging)?;
+        Ok(())
+    }
+
+    /// Get current intervention (if any).
+    pub fn intervention(&self) -> Option<&Intervention> {
+        self.intervention.as_ref()
+    }
+
+    /// Exclude rules from this transaction, as `ctl:ruleRemoveById` would:
+    /// `942100`, `913100-913999`, or several separated by commas. For an
+    /// exclusion the embedding application decides per request, from what
+    /// it knows and the rules do not (the client is its own monitoring, the
+    /// path is one it serves to crawlers). Called before the phase whose
+    /// rules it names. Returns false, excluding nothing, when `ranges` does
+    /// not parse.
+    pub fn remove_rules_by_id(&mut self, ranges: &str) -> bool {
+        match super::control::parse_id_ranges(ranges) {
+            Some(parsed) if !parsed.is_empty() => {
+                self.controls.apply(CtlDirective::RuleRemoveById(parsed));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if there's an intervention.
+    pub fn has_intervention(&self) -> bool {
+        self.intervention.is_some()
+    }
+
+    /// Get matched rule IDs.
+    pub fn matched_rules(&self) -> &[String] {
+        &self.matched_rules
+    }
+
+    /// Get the anomaly score: the value of `TX:anomaly_score`, or 0 when no
+    /// rule has set it.
+    pub fn anomaly_score(&self) -> i32 {
+        self.tx
+            .get(ANOMALY_SCORE)
+            .and_then(|values| values.first()?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Get the TX collection.
+    pub fn tx(&self) -> &TxCollection {
+        &self.tx
+    }
+
+    /// Get mutable TX collection.
+    pub fn tx_mut(&mut self) -> &mut TxCollection {
+        &mut self.tx
+    }
+
+    /// The engine mode in force for this transaction.
+    ///
+    /// `ctl:ruleEngine` overrides the ruleset's configured mode for the
+    /// remainder of the transaction; with no override this is the ruleset's
+    /// own mode.
+    fn engine_mode(&self) -> RuleEngineMode {
+        self.controls.engine_mode(self.ruleset.engine_mode())
+    }
+
+    /// Run rules for a specific phase.
+    fn run_phase(&mut self, phase: Phase) -> Result<()> {
+        if self.allowed || self.intervention.is_some() {
+            return Ok(());
+        }
+
+        // ctl:ruleEngine overrides the ruleset's mode for this transaction, so
+        // the effective mode has to be re-read rather than captured once: a
+        // rule in an earlier phase may have switched it off.
+        if self.engine_mode() == RuleEngineMode::Off {
+            return Ok(());
+        }
+
+        // Keep the immutable ruleset alive independently of mutable transaction state.
+        let ruleset = Arc::clone(&self.ruleset);
+        let rules = ruleset.rules_for_phase(phase);
+        if rules.is_empty() {
+            return Ok(());
+        }
+
+        let mut chain_state = ChainState::new();
+        // A chain is one logical rule: the starter's actions fire only when
+        // every link matches, so they are held here until the chain completes.
+        let mut pending_chain_actions: Option<ActionResult> = None;
+        let mut pending_chain_id: Option<String> = None;
+        // What each link matched, held with the starter's id: a chain that
+        // fails part-way did not match, so it leaves nothing in matched_data.
+        let mut pending_chain_data: Vec<MatchedData> = Vec::new();
+        let mut skip_count: u32 = 0;
+        let mut skip_after: Option<String> = None;
+
+        let mut idx = 0;
+        while idx < rules.len() {
+            // Handle skip
+            if skip_count > 0 {
+                skip_count -= 1;
+                idx += 1;
+                continue;
+            }
+
+            // Handle skipAfter
+            if let Some(ref marker) = skip_after {
+                if let Some(marker_idx) = self.ruleset.marker(marker, phase) {
+                    if marker_idx > idx {
+                        idx = marker_idx;
+                        skip_after = None;
+                        continue;
+                    }
+                }
+                // The marker is unknown, or sits at or behind the current
+                // position: ModSecurity does not jump backwards, so the rest of
+                // the phase is skipped.
+                idx += 1;
+                continue;
+            }
+
+            // A ctl:ruleEngine=Off from an earlier rule stops this phase where
+            // it stands, rather than only taking effect from the next phase.
+            if self.engine_mode() == RuleEngineMode::Off {
+                return Ok(());
+            }
+
+            let rule = &rules[idx];
+
+            // ctl:ruleRemoveById excluded this rule for this transaction. Skip
+            // it as though it were not in the ruleset -- including its chain
+            // links, which cannot fire without their starter.
+            if self.controls.is_rule_removed(rule.id.as_deref()) {
+                if rule.is_chain {
+                    chain_state.reset();
+                    pending_chain_actions = None;
+                    pending_chain_id = None;
+                    pending_chain_data.clear();
+                    idx += 1;
+                    while idx < rules.len() && rules[idx - 1].is_chain {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                idx += 1;
+                continue;
+            }
+
+            // Handle chain continuation
+            if chain_state.in_chain && !rule.is_chain && rule.chain_next.is_none() {
+                // End of chain, check if previous rules in chain matched
+                if !chain_state.chain_matched {
+                    chain_state.reset();
+                    idx += 1;
+                    continue;
+                }
+            }
+
+            // Evaluate rule
+            let outcome = self.evaluate_rule(rule)?;
+            let matched = !outcome.matches.is_empty();
+            // What the rule left behind for the chain: the last match's captures.
+            let captures = outcome
+                .matches
+                .last()
+                .map(|m| m.captures.clone())
+                .unwrap_or_default();
+
+            if matched {
+                // MATCHED_VARS is scoped to the current rule in ModSecurity,
+                // so this replaces rather than appends -- otherwise a later
+                // rule would read the previous rule's matches.
+                self.matched_vars.clear();
+
+                // Execute actions
+                let mut action_result = execute_actions(&rule.actions, None, &captures);
+                let setvar_ops = std::mem::take(&mut action_result.setvar_ops);
+                let capture = rule
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Data(DataAction::Capture)));
+                let link_rule_id = rule.id.as_deref().or(pending_chain_id.as_deref());
+
+                // `capture` and `setvar` run once for each variable the
+                // operator matched, in order, as libmodsecurity does
+                // (`rule_with_operator.cc:255-317`; the TX:N stores are in
+                // `operators/rx.cc:104-113`): CRS 920450 sets
+                // `tx.header_name_920450_<name>` for every request header so
+                // that its chained `@within` can look the restricted ones up.
+                // `setvar` runs as soon as its own link matches, whether or
+                // not the rest of the chain does (`executeActionsIndependent
+                // OfChainedRuleResult`), and CRS relies on it (a starter's
+                // `setvar:tx.x=%{MATCHED_VAR}` is read by the links after it).
+                // Every other action waits for the whole chain. A continuation
+                // link has no id; its effects belong to the chain's starter.
+                for (n, m) in outcome.matches.iter().enumerate() {
+                    if let Some(var) = &m.matched_variable {
+                        self.matched_vars
+                            .push((var.name.clone(), var.value.clone()));
+                        // The audit record keeps the first match only: one
+                        // entry per rule, however many values it hit.
+                        // A chain link's entry waits for the chain to complete.
+                        if n == 0 {
+                            let entry = MatchedData {
+                                rule_id: link_rule_id.map(str::to_string),
+                                variable: var.name.clone(),
+                                value: var.value.clone(),
+                                matched_portion: var.portion.clone(),
+                            };
+                            if rule.is_chain || chain_state.in_chain {
+                                pending_chain_data.push(entry);
+                            } else {
+                                self.matched_data.push(entry);
+                            }
+                        }
+                    }
+                    // TX:0 (the whole match) and TX:1..TX:9, before any setvar
+                    // reads `%{tx.N}`.
+                    if capture {
+                        let whole = m.matched_variable.as_ref().and_then(|v| v.portion.clone());
+                        self.store_captures(whole, &m.captures);
+                    }
+                    for op in &setvar_ops {
+                        self.apply_setvar(op, link_rule_id);
+                    }
+                }
+
+                if rule.is_chain {
+                    // A link that expects more links after it. Hold the
+                    // starter's remaining actions: nothing else may fire until
+                    // the whole chain has matched. The starter's id is held
+                    // back too, so a chain that later fails does not count as
+                    // a match.
+                    if !chain_state.in_chain {
+                        chain_state.start_chain(idx);
+                        pending_chain_id = rule.id.clone();
+                        pending_chain_actions = Some(action_result);
+                    } else if let Some(held) = pending_chain_actions.as_mut() {
+                        // A middle link: its ctl runs with the chain.
+                        held.control_ops.extend(action_result.control_ops);
+                    }
+                    chain_state.continue_chain(true, &captures);
+                    idx += 1;
+                    continue;
+                }
+
+                // Either a standalone rule, or the final link of a chain that
+                // has now matched in full. A completed chain keeps the
+                // starter's disruptive action, flow and metadata, and runs the
+                // ctl of every link.
+                let action_result = if chain_state.in_chain {
+                    chain_state.reset();
+                    if let Some(id) = pending_chain_id.take() {
+                        self.matched_rules.push(id);
+                    }
+                    self.matched_data.append(&mut pending_chain_data);
+                    match pending_chain_actions.take() {
+                        Some(mut held) => {
+                            held.control_ops.extend(action_result.control_ops);
+                            held
+                        }
+                        None => action_result,
+                    }
+                } else {
+                    // Track matched rule
+                    if let Some(ref id) = rule.id {
+                        self.matched_rules.push(id.clone());
+                    }
+                    action_result
+                };
+
+                // Apply ctl: overrides before the disruptive action below, so
+                // that ctl:ruleEngine=DetectionOnly on the same rule governs
+                // whether that rule blocks.
+                for ctl in &action_result.control_ops {
+                    self.controls.apply(CtlDirective::parse(ctl));
+                }
+
+                // Handle flow control
+                match action_result.flow {
+                    FlowOutcome::Chain => {
+                        if !chain_state.in_chain {
+                            chain_state.start_chain(idx);
+                        }
+                        chain_state.continue_chain(true, &captures);
+                    }
+                    FlowOutcome::Skip(n) => {
+                        skip_count = n;
+                    }
+                    FlowOutcome::SkipAfter(marker) => {
+                        skip_after = Some(marker);
+                    }
+                    FlowOutcome::Continue => {}
+                }
+
+                // Handle disruptive action
+                if let Some(outcome) = action_result.disruptive {
+                    // Only apply if not in detection-only mode
+                    let should_block = self.engine_mode() == RuleEngineMode::On;
+
+                    match outcome {
+                        DisruptiveOutcome::Deny(status) => {
+                            if should_block {
+                                let mut intervention =
+                                    Intervention::deny(status, phase, rule.id.clone());
+                                intervention.add_metadata(action_result.metadata);
+                                self.intervention = Some(intervention);
+                                return Ok(());
+                            }
+                        }
+                        DisruptiveOutcome::Block => {
+                            if should_block {
+                                let mut intervention =
+                                    Intervention::deny(self.default_status, phase, rule.id.clone());
+                                intervention.add_metadata(action_result.metadata);
+                                self.intervention = Some(intervention);
+                                return Ok(());
+                            }
+                        }
+                        DisruptiveOutcome::Allow => {
+                            self.allowed = true;
+                            return Ok(());
+                        }
+                        DisruptiveOutcome::Redirect(url) => {
+                            if should_block {
+                                let mut intervention =
+                                    Intervention::redirect(url, phase, rule.id.clone());
+                                intervention.add_metadata(action_result.metadata);
+                                self.intervention = Some(intervention);
+                                return Ok(());
+                            }
+                        }
+                        DisruptiveOutcome::Drop => {
+                            if should_block {
+                                let mut intervention = Intervention::drop(phase, rule.id.clone());
+                                intervention.add_metadata(action_result.metadata);
+                                self.intervention = Some(intervention);
+                                return Ok(());
+                            }
+                        }
+                        DisruptiveOutcome::Pass => {
+                            // Continue processing
+                        }
+                    }
+                }
+            } else {
+                // Rule didn't match. If it belongs to a chain, the chain as a
+                // whole cannot match: drop the starter's held actions and skip
+                // past the remaining links so they are never evaluated on
+                // their own.
+                if chain_state.in_chain || rule.is_chain {
+                    chain_state.reset();
+                    pending_chain_actions = None;
+                    pending_chain_id = None;
+                    pending_chain_data.clear();
+                    while idx < rules.len() && rules[idx].is_chain {
+                        idx += 1;
+                    }
+                    idx += 1;
+                    continue;
+                }
+            }
+
+            // End chain if this is the last rule in chain
+            if chain_state.in_chain && !rule.is_chain {
+                chain_state.end_chain();
+            }
+
+            idx += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluate a single rule.
+    fn evaluate_rule(&self, rule: &CompiledRule) -> Result<RuleOutcome> {
+        let resolver = VariableResolver::new(
+            &self.request,
+            &self.response,
+            &self.tx,
+            // MATCHED_VAR is the value the previous rule matched on. This was
+            // a literal `None`, so a rule reading MATCHED_VAR could never
+            // fire, however many rules had matched before it.
+            self.matched_vars.last().map(|(_, value)| value.as_str()),
+            &self.matched_vars,
+            &self.captures,
+        );
+
+        // Resolve variables from all specs.
+        //
+        // A spec in count mode (`&VAR`) contributes the *number* of matching
+        // values as a single value — 0 when the variable is absent — rather than
+        // the values themselves. This matches ModSecurity's `&VARIABLE` semantics
+        // and is what CRS's `SecRule &TX:x "@eq 0"` initialization relies on.
+        // Emitting a value even for an absent count also keeps the spec out of
+        // the "resolved to nothing" early-return below, so `&x "@eq 0"` matches.
+        // ctl:ruleRemoveTargetById drops individual targets from this rule for
+        // this transaction. The check is hoisted so rules with no exclusion --
+        // effectively all of them -- pay one comparison rather than a scan per
+        // variable.
+        let filter_targets = self.controls.has_target_removals(rule.id.as_deref());
+
+        let mut all_values = Vec::new();
+        let mut any_excluded = false;
+        for spec in &rule.variables {
+            let mut resolved = resolver.resolve(spec);
+            if filter_targets {
+                let before = resolved.len();
+                resolved.retain(|(name, _)| {
+                    !self
+                        .controls
+                        .is_target_removed(rule.id.as_deref(), spec, name)
+                });
+                any_excluded |= resolved.len() != before;
+            }
+            if spec.count_mode {
+                // An exclusion reduces the count, which is what a rule like
+                // `SecRule &ARGS:x "@eq 0"` is asking about.
+                all_values.push((format!("&{:?}", spec.name), resolved.len().to_string()));
+            } else {
+                all_values.extend(resolved);
+            }
+        }
+
+        // Exclusions removed everything this rule had to test. Return before
+        // the branch below: a rule stripped down to nothing is not the same as
+        // a SecAction with no targets, and running the operator unconditionally
+        // could match.
+        if any_excluded && all_values.is_empty() {
+            return Ok(RuleOutcome::no_match());
+        }
+
+        if all_values.is_empty() {
+            // A rule with no variable specs at all (i.e. SecAction) runs its
+            // operator unconditionally — this is how CRS sets up TX thresholds.
+            if rule.variables.is_empty() {
+                let result = rule.operator.execute("");
+                let matched = if rule.operator_negated {
+                    !result.matched
+                } else {
+                    result.matched
+                };
+                // A SecAction has no variable, so there is nothing to report
+                // as the match target.
+                if !matched {
+                    return Ok(RuleOutcome::no_match());
+                }
+                return Ok(RuleOutcome {
+                    matches: vec![RuleMatch {
+                        captures: result.captures,
+                        matched_variable: None,
+                    }],
+                });
+            }
+            // Variables were specified but resolved to nothing (e.g. absent
+            // header). ModSecurity does not run the operator when there is no
+            // value to run it against, so the rule does not match -- including
+            // when the operator is negated. Reporting a negated operator as a
+            // match here inverts "this variable is absent" into "every request
+            // matches", which is how an unimplemented variable turned CRS
+            // 920100 (`REQUEST_LINE "!@rx ..."`) into a rule that denied all
+            // traffic. Absence is tested with `&VAR "@eq 0"`, which resolves to
+            // a count and so never reaches this branch.
+            return Ok(RuleOutcome::no_match());
+        }
+
+        // If the operator argument references runtime macros (e.g.
+        // `@ge %{tx.inbound_anomaly_score_threshold}`), expand them against the
+        // current TX state and recompile the operator so the comparison runs
+        // against the resolved value. Otherwise use the precompiled operator.
+        let dynamic_operator;
+        let operator: &dyn Operator = if rule.operator_spec.argument.contains("%{") {
+            let expanded = self.expand_operator_macros(&rule.operator_spec.argument);
+            dynamic_operator = compile_operator(&OperatorSpec {
+                negated: rule.operator_spec.negated,
+                name: rule.operator_spec.name,
+                argument: expanded,
+            })?;
+            dynamic_operator.as_ref()
+        } else {
+            rule.operator.as_ref()
+        };
+
+        // Apply transformations and match every value
+        let mut matches = Vec::new();
+        for (name, value) in all_values {
+            let transformed = rule.transformations.apply(&value);
+            let result = operator.execute(&transformed);
+
+            let final_match = if rule.operator_negated {
+                !result.matched
+            } else {
+                result.matched
+            };
+
+            if final_match {
+                let matched = MatchedVariable {
+                    name,
+                    // ModSecurity's MATCHED_VAR is the *variable's* value, not
+                    // the portion the operator hit. The portion is reported
+                    // separately, since an audit log wants both: the value to
+                    // judge the match, the portion to see what triggered it.
+                    value: transformed.into_owned(),
+                    portion: result.matched_value,
+                };
+                matches.push(RuleMatch {
+                    captures: result.captures,
+                    matched_variable: Some(matched),
+                });
+            }
+        }
+
+        Ok(RuleOutcome { matches })
+    }
+
+    /// Expand `%{...}` macros in an operator argument against current TX state.
+    ///
+    /// Resolved: the `TX` collection (thresholds, `tx.allowed_methods`),
+    /// `REQUEST_HEADERS.<name>` and `MATCHED_VAR`/`MATCHED_VAR_NAME`. Anything
+    /// else expands to an empty string.
+    fn expand_operator_macros(&self, arg: &str) -> String {
+        // Compiled once: this runs on every evaluation of an operator whose
+        // argument contains `%{`.
+        static MACRO: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"%\{([^}]+)\}").expect("static macro regex is valid")
+        });
+        MACRO
+            .replace_all(arg, |caps: &regex::Captures| {
+                let inner = &caps[1];
+                // Bare names that are not collections (`%{MATCHED_VAR_NAME}`).
+                match inner.to_ascii_lowercase().as_str() {
+                    "matched_var" => {
+                        return self
+                            .matched_vars
+                            .last()
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default()
+                    }
+                    "matched_var_name" => {
+                        return self
+                            .matched_vars
+                            .last()
+                            .map(|(n, _)| n.clone())
+                            .unwrap_or_default()
+                    }
+                    _ => {}
+                }
+                let (collection, name) = match inner.split_once('.') {
+                    Some((c, n)) => (c.to_ascii_lowercase(), n),
+                    None => ("tx".to_string(), inner),
+                };
+                match collection.as_str() {
+                    "tx" => self
+                        .tx
+                        .get(name)
+                        .and_then(|v| v.first().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                    // CRS 943110: `!@endsWith %{request_headers.host}`.
+                    "request_headers" => self
+                        .request
+                        .headers
+                        .get(&name.to_ascii_lowercase())
+                        .and_then(|v| v.first().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                }
+            })
+            .into_owned()
+    }
+
+    /// Publish the captures of a `capture` rule as `TX:0`..`TX:9`.
+    ///
+    /// `whole` is the text the operator matched (TX:0); `groups` are the regex
+    /// groups, in order (TX:1...). Slots the match did not fill are removed so
+    /// a stale value from an earlier rule cannot be read.
+    ///
+    /// Clearing all ten slots first is deliberate, and differs from
+    /// libmodsecurity v3: there each capture is stored on its own and nothing
+    /// is removed (`operators/rx.cc:104-113`), so a higher slot written by an
+    /// earlier rule survives a match that did not fill it. A rule that reads
+    /// `%{tx.3}` after a match with two groups then sees the old value. No
+    /// ruleset should depend on a leftover like that, so the stale read is
+    /// closed here.
+    fn store_captures(&mut self, whole: Option<String>, groups: &[String]) {
+        use crate::variables::MutableCollection;
+        for i in 0..10 {
+            self.tx.delete(&i.to_string());
+        }
+        if let Some(w) = whole {
+            self.tx.set("0".to_string(), w);
+        }
+        for (i, g) in groups.iter().take(9).enumerate() {
+            self.tx.set((i + 1).to_string(), g.clone());
+        }
+    }
+
+    /// Apply a setvar operation.
+    fn apply_setvar(&mut self, op: &RuleSetVar, rule_id: Option<&str>) {
+        // The variable name may carry a macro too (CRS 920450:
+        // `tx.header_name_920450_%{tx.0}`, one variable per request header);
+        // without expanding it every header would overwrite one variable.
+        let name = if op.name.contains("%{") {
+            self.expand_operator_macros(&op.name)
+        } else {
+            op.name.clone()
+        };
+        // A macro-bearing value (e.g. `+%{tx.critical_anomaly_score}`) is
+        // resolved here, where TX state is available. Which operation it is
+        // comes from the text as written, before any expansion.
+        let operation = if let SetVarOperation::Macro(raw) = &op.operation {
+            let (kind, operand) = split_setvar_rhs(raw);
+            let operand = self.expand_operator_macros(operand);
+            match kind {
+                SetVarKind::Set => SetVarOperation::Set(operand),
+                SetVarKind::Add => SetVarOperation::Increment(leading_int(&operand)),
+                SetVarKind::Subtract => SetVarOperation::Decrement(leading_int(&operand)),
+            }
+        } else {
+            op.operation.clone()
+        };
+        let resolved = RuleSetVar {
+            collection: op.collection.clone(),
+            name,
+            operation,
+        };
+        crate::actions::apply_setvar(&mut self.tx, &resolved);
+
+        if let Some(rule_id) = rule_id.filter(|_| self.record_setvar_effects) {
+            let effect_op = match &resolved.operation {
+                SetVarOperation::Set(v) => Some(SetVarChange::Set(v.clone())),
+                SetVarOperation::Increment(n) => Some(SetVarChange::Increment(*n)),
+                SetVarOperation::Decrement(n) => Some(SetVarChange::Decrement(*n)),
+                SetVarOperation::Delete => Some(SetVarChange::Delete),
+                // Resolved above; `apply_setvar` ignores it too.
+                SetVarOperation::Macro(_) => None,
+            };
+            if let Some(effect_op) = effect_op {
+                self.setvar_effects.push(SetVarEffect {
+                    rule_id: rule_id.to_string(),
+                    collection: resolved.collection.to_ascii_lowercase(),
+                    key: resolved.name.clone(),
+                    op: effect_op,
+                });
+            }
+        }
+    }
+}
+
+/// How a `setvar` right-hand side changes its variable.
+enum SetVarKind {
+    /// `setvar:tx.x=value`
+    Set,
+    /// `setvar:tx.x=+n`
+    Add,
+    /// `setvar:tx.x=-n`
+    Subtract,
+}
+
+/// Split a `setvar` right-hand side, as written in the rule, into the
+/// operation and the text of its operand.
+///
+/// libmodsecurity fixes the operation when it parses the rule: `=+` and `=-`
+/// are tokens of their own (`seclang-scanner.ll:489-490`, `726-728`, mapped
+/// to `sumAndSetOperation` and `substractAndSetOperation` at
+/// `seclang-parser.yy:3145-3152`), and only the operand after them is a
+/// run-time string. So `setvar:tx.x=%{tx.0}` is an assignment even when
+/// `TX:0` expands to `-7`; reading the sign after expansion would turn it into
+/// a decrement.
+fn split_setvar_rhs(raw: &str) -> (SetVarKind, &str) {
+    if let Some(rest) = raw.strip_prefix('+') {
+        (SetVarKind::Add, rest)
+    } else if let Some(rest) = raw.strip_prefix('-') {
+        (SetVarKind::Subtract, rest)
+    } else {
+        (SetVarKind::Set, raw)
+    }
+}
+
+/// The integer at the start of an expanded operand, or 0 when there is none.
+///
+/// libmodsecurity reads the operand with `stoi` and takes 0 if that throws
+/// (`set_var.cc:93-100`), so `5abc` is 5, `abc` and the empty string are 0,
+/// and a sign belongs to the number: `=+%{tx.0}` with `TX:0` = `-7` adds -7.
+/// (Not identical to `stoi`: that is 32-bit, this is 64-bit, and `trim_start`
+/// skips Unicode whitespace where `stoi` skips the C locale's `isspace`.)
+fn leading_int(s: &str) -> i64 {
+    let s = s.trim_start();
+    let digits = s
+        .strip_prefix(['+', '-'])
+        .unwrap_or(s)
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let sign = s.len() - s.strip_prefix(['+', '-']).unwrap_or(s).len();
+    s[..sign + digits].parse().unwrap_or(0)
+}
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transaction")
+            .field("phase", &self.phase)
+            .field("has_intervention", &self.intervention.is_some())
+            .field("anomaly_score", &self.anomaly_score())
+            .field("matched_rules", &self.matched_rules)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::variables::Collection;
+
+    fn make_ruleset(rules: &str) -> Arc<CompiledRuleset> {
+        Arc::new(CompiledRuleset::from_string(rules).unwrap())
+    }
+
+    #[test]
+    fn test_basic_match() {
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /admin" "id:1,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/admin/dashboard", "GET", "HTTP/1.1")
+            .unwrap();
+        tx.process_request_headers().unwrap();
+
+        assert!(tx.has_intervention());
+        let intervention = tx.intervention().unwrap();
+        assert_eq!(intervention.status, 403);
+    }
+
+    #[test]
+    fn test_no_match() {
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /admin" "id:1,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/public/index.html", "GET", "HTTP/1.1")
+            .unwrap();
+        tx.process_request_headers().unwrap();
+
+        assert!(!tx.has_intervention());
+    }
+
+    #[test]
+    fn test_setvar() {
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /test" "id:1,phase:1,pass,setvar:TX.score=5"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/test/page", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+
+        assert!(!tx.has_intervention());
+        let score = tx
+            .tx()
+            .get("score")
+            .and_then(|v| v.first().map(|s| s.to_string()));
+        assert_eq!(score, Some("5".to_string()));
+    }
+
+    #[test]
+    fn test_operator_arg_macro_ge_threshold() {
+        // @ge with a %{tx.*} argument must compare against the resolved value.
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /" "id:1,phase:1,pass,nolog,setvar:tx.threshold=5"
+            SecRule REQUEST_URI "@contains /" "id:2,phase:1,pass,nolog,setvar:tx.score=10"
+            SecRule TX:score "@ge %{tx.threshold}" "id:3,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        assert!(
+            tx.has_intervention(),
+            "score 10 >= threshold 5 should block"
+        );
+    }
+
+    #[test]
+    fn test_operator_arg_macro_ge_below_threshold() {
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /" "id:1,phase:1,pass,nolog,setvar:tx.threshold=5"
+            SecRule REQUEST_URI "@contains /" "id:2,phase:1,pass,nolog,setvar:tx.score=3"
+            SecRule TX:score "@ge %{tx.threshold}" "id:3,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        assert!(
+            !tx.has_intervention(),
+            "score 3 < threshold 5 should not block"
+        );
+    }
+
+    #[test]
+    fn test_negated_within_macro_does_not_block_allowed() {
+        // Regression for the 911100 case: a negated @within whose argument is a
+        // resolvable macro must not block when the value IS in the list.
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /" "id:1,phase:1,pass,nolog,setvar:tx.allowed=GET"
+            SecRule REQUEST_METHOD "!@within %{tx.allowed}" "id:2,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        assert!(!tx.has_intervention(), "GET is allowed, must not block");
+    }
+
+    #[test]
+    fn test_negated_within_macro_blocks_disallowed() {
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /" "id:1,phase:1,pass,nolog,setvar:tx.allowed=GET"
+            SecRule REQUEST_METHOD "!@within %{tx.allowed}" "id:2,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "POST", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        assert!(tx.has_intervention(), "POST is not allowed, must block");
+    }
+
+    #[test]
+    fn test_secaction_sets_tx_and_macro_resolves() {
+        // CRS-style: SecAction (no variables) seeds a TX threshold that a later
+        // rule's operator macro resolves against.
+        let ruleset = make_ruleset(
+            r#"
+            SecAction "id:1,phase:1,pass,nolog,setvar:tx.threshold=5"
+            SecRule REQUEST_URI "@contains /" "id:2,phase:1,pass,nolog,setvar:tx.score=10"
+            SecRule TX:score "@ge %{tx.threshold}" "id:3,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        let threshold = tx
+            .tx()
+            .get("threshold")
+            .and_then(|v| v.first().map(|s| s.to_string()));
+        assert_eq!(
+            threshold,
+            Some("5".to_string()),
+            "SecAction setvar must apply"
+        );
+        assert!(tx.has_intervention(), "10 >= 5 should block");
+    }
+
+    #[test]
+    fn test_request_header_named_selector_matches() {
+        // REQUEST_HEADERS:User-Agent must match regardless of header-name case.
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_HEADERS:User-Agent "@contains sqlmap" "id:1,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.add_request_header("User-Agent", "sqlmap/1.0").unwrap();
+        tx.process_request_headers().unwrap();
+        assert!(tx.has_intervention(), "User-Agent selector should match");
+    }
+
+    #[test]
+    fn test_setvar_value_macro_accumulates() {
+        // CRS-style score accumulation: setvar:'tx.anomaly_score=+%{tx.critical_anomaly_score}'
+        // must add the resolved delta (5), and twice must yield 10.
+        let ruleset = make_ruleset(
+            r#"
+            SecAction "id:1,phase:1,pass,nolog,setvar:tx.critical_anomaly_score=5"
+            SecRule REQUEST_URI "@contains /" "id:2,phase:1,pass,nolog,setvar:'tx.anomaly_score=+%{tx.critical_anomaly_score}'"
+            SecRule REQUEST_URI "@contains /" "id:3,phase:1,pass,nolog,setvar:'tx.anomaly_score=+%{tx.critical_anomaly_score}'"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        let score = tx
+            .tx()
+            .get("anomaly_score")
+            .and_then(|v| v.first().map(|s| s.to_string()));
+        assert_eq!(
+            score,
+            Some("10".to_string()),
+            "two +5 macro increments should total 10"
+        );
+    }
+
+    #[test]
+    fn test_setvar_value_macro_unresolved_is_noop() {
+        // An unresolved macro delta must not silently increment by 1.
+        let ruleset = make_ruleset(
+            r#"
+            SecRule REQUEST_URI "@contains /" "id:1,phase:1,pass,nolog,setvar:'tx.anomaly_score=+%{tx.missing}'"
+        "#,
+        );
+        let mut tx = Transaction::new(ruleset, 403);
+        tx.process_uri("/", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+        let score = tx
+            .tx()
+            .get("anomaly_score")
+            .and_then(|v| v.first().map(|s| s.to_string()));
+        assert_eq!(
+            score,
+            Some("0".to_string()),
+            "unresolved macro increment should be a no-op"
+        );
+    }
+
+    #[test]
+    fn test_detection_only_mode() {
+        let _ruleset = make_ruleset(
+            r#"
+            SecRuleEngine DetectionOnly
+            SecRule REQUEST_URI "@contains /admin" "id:1,phase:1,deny"
+        "#,
+        );
+        let mut tx = Transaction::new(
+            Arc::new(
+                CompiledRuleset::from_string(
+                    r#"
+                SecRuleEngine DetectionOnly
+                SecRule REQUEST_URI "@contains /admin" "id:1,phase:1,deny"
+            "#,
+                )
+                .unwrap(),
+            ),
+            403,
+        );
+        tx.process_uri("/admin/dashboard", "GET", "HTTP/1.1")
+            .unwrap();
+        tx.process_request_headers().unwrap();
+
+        // Should match but not block
+        assert!(!tx.has_intervention());
+        assert!(tx.matched_rules().contains(&"1".to_string()));
+    }
+}
