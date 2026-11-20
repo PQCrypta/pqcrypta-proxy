@@ -354,12 +354,10 @@ impl Transaction {
         if let Some(forced) = self.controls.request_body_processor() {
             match forced {
                 "MULTIPART" => {
-                    if !self
-                        .request
-                        .parse_multipart_body(content_type.as_deref().unwrap_or_default())
-                    {
-                        self.multipart_without_boundary();
-                    }
+                    // Errors are recorded for REQBODY_ERROR and the
+                    // MULTIPART_* variables; phase 2 runs either way
+                    self.request
+                        .parse_multipart_body(content_type.as_deref().unwrap_or_default());
                 }
                 "URLENCODED" => {
                     self.request.parse_form_body();
@@ -378,12 +376,10 @@ impl Transaction {
             // Multipart body processor: populates ARGS_POST, FILES and
             // MULTIPART_PART_HEADERS. Never fall back to the urlencoded
             // parser for multipart payloads — that would produce bogus ARGS.
-            if !self
-                .request
-                .parse_multipart_body(content_type.as_deref().unwrap_or_default())
-            {
-                self.multipart_without_boundary();
-            }
+            // Errors are recorded for REQBODY_ERROR and the MULTIPART_*
+            // variables; phase 2 runs either way
+            self.request
+                .parse_multipart_body(content_type.as_deref().unwrap_or_default());
         } else if is_xml_content_type(&ct_lower) {
             self.process_xml_body();
         } else if is_json_content_type(&ct_lower) {
@@ -402,16 +398,6 @@ impl Transaction {
 
         self.run_phase(Phase::RequestBody)?;
         Ok(())
-    }
-
-    /// A multipart body whose Content-Type names no boundary cannot be parsed:
-    /// a body error, as in ModSecurity, so `REQBODY_ERROR` reports it (CRS's
-    /// 200002 denies it) rather than the body passing with nothing extracted.
-    /// Not a log line: the client chose it, and would choose it per request.
-    fn multipart_without_boundary(&mut self) {
-        tracing::debug!("multipart body without a boundary in its Content-Type");
-        self.request.body_processor = "MULTIPART".to_string();
-        self.request.body_error = Some("Multipart: boundary not found in Content-Type".into());
     }
 
     /// Run the XML body processor, recording any failure.

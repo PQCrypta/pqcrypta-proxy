@@ -43,6 +43,16 @@ The changes from that commit:
   (`TX:/.../`, `ARGS:/.../`, and in exclusions), as a key selection does and
   as ModSecurity does: TX keys are stored lowercased, so CRS's 922110 never
   found the multipart content types its 922150 recorded.
+- **The multipart processor** (`src/variables/multipart.rs`) is
+  libmodsecurity v3's: the boundary checked in the Content-Type, the body
+  read as bytes line by line, part headers and Content-Disposition parsed as
+  strictly (quoting, `filename*`, duplicates, folding), and the flags
+  behind `MULTIPART_STRICT_ERROR` and the other `MULTIPART_*` variables,
+  which resolved to nothing before (a rule like 200003 could never fire),
+  with `FILES_SIZES` and `FILES_COMBINED_SIZE`. Two departures: an empty
+  boundary is an error, where v3 stops silently and leaves the body
+  uninspected; and the file limit is never reached, since v3 checks it only
+  when writing uploads to disk, which this engine never does.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -50,7 +60,7 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 5001 of 5184 cases pass here, 4947 upstream, and no case
+(CRS 30cb436): 5019 of 5184 cases pass here, 4947 upstream, and no case
 upstream passes fails here. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).
 

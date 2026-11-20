@@ -40,6 +40,13 @@ pub struct RequestData {
     /// Uploaded files (key = part name, value = client-supplied filename),
     /// populated by the multipart body processor. Backs `FILES`/`FILES_NAMES`.
     pub files: HashMapCollection,
+    /// `FILES_SIZES`: each file part's size in bytes, by part name.
+    pub files_sizes: HashMapCollection,
+    /// `FILES_COMBINED_SIZE`: the file parts' sizes added up.
+    pub files_combined_size: usize,
+    /// What the multipart processor's strict checks found, for the
+    /// `MULTIPART_*` variables; `None` when it did not run.
+    pub multipart: Option<super::multipart::MultipartFlags>,
     /// Name of the body processor that handled the request body
     /// (`MULTIPART`, `URLENCODED`, `JSON`, or empty when none ran). Backs
     /// `REQBODY_PROCESSOR`.
@@ -160,85 +167,37 @@ impl RequestData {
         }
     }
 
-    /// Parse a `multipart/form-data` body.
-    ///
-    /// Populates `args_post` from form fields, `files` from file parts, and
-    /// `multipart_part_headers` with every part header line keyed by the part
-    /// name (ModSecurity `MULTIPART_PART_HEADERS` semantics). Returns `false`
-    /// when no boundary parameter can be extracted from the Content-Type.
+    /// Parse a `multipart/form-data` body (`super::multipart`, libmodsecurity
+    /// v3's processor): form fields into `args_post`, file parts into `files`
+    /// (name to file name) and `files_sizes`, every part header line into
+    /// `multipart_part_headers` under its part's name, and the strict checks'
+    /// findings into `multipart` and, for an error, `body_error`. Returns
+    /// false when parsing stopped on an error.
     pub fn parse_multipart_body(&mut self, content_type: &str) -> bool {
-        let Some(boundary) = extract_multipart_boundary(content_type) else {
-            return false;
-        };
-        let body = self.body_str();
-        let delimiter = format!("--{boundary}");
-
-        let mut sections = body.split(delimiter.as_str());
-        // Everything before the first boundary is preamble; discard it.
-        let _preamble = sections.next();
-
-        for section in sections {
-            if section.starts_with("--") {
-                // Closing delimiter (`--boundary--`); anything after is epilogue.
-                break;
-            }
-            // The boundary line ends with CRLF before the part headers.
-            let section = section
-                .strip_prefix("\r\n")
-                .or_else(|| section.strip_prefix("\n"))
-                .unwrap_or(section);
-
-            // Headers are separated from the part content by a blank line.
-            let (head, content) = match section.split_once("\r\n\r\n") {
-                Some(split) => split,
-                None => match section.split_once("\n\n") {
-                    Some(split) => split,
-                    None => (section, ""),
-                },
-            };
-            // The CRLF before the next boundary belongs to the framing, not
-            // the content.
-            let content = content
-                .strip_suffix("\r\n")
-                .or_else(|| content.strip_suffix("\n"))
-                .unwrap_or(content);
-
-            let mut part_name: Option<String> = None;
-            let mut filename: Option<String> = None;
-            let mut header_lines: Vec<String> = Vec::new();
-
-            for line in head.lines() {
-                let line = line.trim_end_matches('\r');
-                if line.is_empty() {
-                    continue;
+        let mp = super::multipart::parse(content_type, &self.body);
+        for (name, line) in mp.part_headers {
+            self.multipart_part_headers.add(name, line);
+        }
+        for part in mp.parts {
+            match part.filename {
+                Some(filename) => {
+                    self.files_combined_size += part.value.len();
+                    self.files_sizes
+                        .add(part.name.clone(), part.value.len().to_string());
+                    self.files.add(part.name, filename);
                 }
-                header_lines.push(line.to_string());
-                if let Some((hname, hval)) = line.split_once(':') {
-                    if hname.trim().eq_ignore_ascii_case("content-disposition") {
-                        part_name = extract_disposition_param(hval, "name");
-                        filename = extract_disposition_param(hval, "filename");
-                    }
-                }
-            }
-
-            let Some(name) = part_name else {
-                // A part without a Content-Disposition name cannot be
-                // addressed by any collection key; skip it.
-                continue;
-            };
-
-            for line in header_lines {
-                self.multipart_part_headers.add(name.clone(), line);
-            }
-            if let Some(fname) = filename {
-                self.files.add(name, fname);
-            } else {
-                self.args_post.add(name, content.to_string());
+                None => self
+                    .args_post
+                    .add(part.name, String::from_utf8_lossy(&part.value).into_owned()),
             }
         }
-
         self.body_processor = "MULTIPART".to_string();
-        true
+        if let Some(e) = mp.error {
+            self.body_error.get_or_insert(e);
+        }
+        let parsed = !mp.flags.fatal;
+        self.multipart = Some(mp.flags);
+        parsed
     }
 
     /// Whether `REQUEST_BODY` holds the body: after the URLENCODED or JSON
@@ -673,37 +632,6 @@ fn push_json_arg(
     args.add(path.to_string(), value);
     false
 }
-
-/// Extract the `boundary` parameter from a multipart Content-Type value.
-fn extract_multipart_boundary(content_type: &str) -> Option<String> {
-    for param in content_type.split(';').skip(1) {
-        let param = param.trim();
-        if let Some((key, value)) = param.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("boundary") {
-                let value = value.trim().trim_matches('"');
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract a parameter value (e.g. `name`, `filename`) from a
-/// Content-Disposition header value.
-fn extract_disposition_param(header_value: &str, param: &str) -> Option<String> {
-    for part in header_value.split(';') {
-        let part = part.trim();
-        if let Some((key, value)) = part.split_once('=') {
-            if key.trim().eq_ignore_ascii_case(param) {
-                return Some(value.trim().trim_matches('"').to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +692,11 @@ mod tests {
         let mut req = RequestData::new();
         req.append_body(b"irrelevant");
         assert!(!req.parse_multipart_body("multipart/form-data"));
-        assert!(req.body_processor.is_empty());
+        assert_eq!(req.body_processor, "MULTIPART");
+        assert_eq!(
+            req.body_error.as_deref(),
+            Some("Multipart: Boundary not found in C-T.")
+        );
+        assert!(req.multipart.as_ref().is_some_and(|f| f.strict_error()));
     }
 }
