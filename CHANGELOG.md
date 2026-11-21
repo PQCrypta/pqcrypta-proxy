@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.18.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.18.0...v0.18.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* **tls:** one server_name reader before the handshake, read as rustls reads it for the handshake ([28f21b5](https://github.com/PQCrypta/pqcrypta-proxy/commit/28f21b5c6aa14e948114ecac1cf59b5223285936))
+* **waf:** %uXXXX in t:urlDecodeUni through ModSecurity's Unicode map (code page 20127), else the low byte ([bb01bf8](https://github.com/PQCrypta/pqcrypta-proxy/commit/bb01bf80486128588973ecf20a740c4aebac6344))
+* **waf:** a body CRS reads is inspected off the async worker from 16 KiB, its cost following its arguments, not its bytes ([af51eb6](https://github.com/PQCrypta/pqcrypta-proxy/commit/af51eb64d1377e318f962bda064539991ef24249))
+* **waf:** braced byte escapes (\x{e2}) are bytes, as in PCRE without UTF mode ([470dbd2](https://github.com/PQCrypta/pqcrypta-proxy/commit/470dbd205ce9ef9e27aae6c39e19d4bbca2abd04))
+* **waf:** key-selection regexes compiled once and matched as ModSecurity v3 does (bytes, ASCII case folding), never cloned per value ([a0ce085](https://github.com/PQCrypta/pqcrypta-proxy/commit/a0ce085fdfd8d55f517a025b86916627dc14ddc0))
+* **waf:** macros expand any variable (%{ARGS._method}); crs_conformance: the server's HTTP/1 framing (CR/LF in a field refused, chunked de-chunked, no length no body) ([76b984a](https://github.com/PQCrypta/pqcrypta-proxy/commit/76b984a41c98af00b373bf085ec978f00c96a320))
+* **waf:** multiMatch runs the operator at every transformation stage, as ModSecurity ([c8f743d](https://github.com/PQCrypta/pqcrypta-proxy/commit/c8f743d7c46e7f174ab96cfa4a38676b18826dc6))
+* **waf:** rule messages as ModSecurity logs them; the CRS corpus's every stage and expectation ([5ada641](https://github.com/PQCrypta/pqcrypta-proxy/commit/5ada6414e1b36277263059cdce863d69738d82b3))
+* **waf:** t:normalizePath(Win) and t:escapeSeqDecode ported from libmodsecurity v3 ([172f9ec](https://github.com/PQCrypta/pqcrypta-proxy/commit/172f9ec6b276ec3e35bf4fa167c8792e738602ca))
+
 ## [0.18.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.3...v0.18.0) (2026-11-21)
 
 
