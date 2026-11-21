@@ -52,6 +52,9 @@ pub(super) async fn tcp_upload_measure_handler(
     let mut total_bytes: u64 = 0;
     let mut post_warmup_bytes: u64 = 0;
     let mut exhausted: Option<std::time::Duration> = None;
+    // The upload's draw on the hourly allowance, a block at a time; what it
+    // took and did not use is given back when it ends.
+    let mut allowance: Option<crate::speedtest_budget::Reservation> = None;
 
     // Read for as long as the WebTransport upload may, and no more than it may
     // send; each piece is charged to the client's hourly upload allowance as
@@ -63,16 +66,22 @@ pub(super) async fn tcp_upload_measure_handler(
             if n == 0 {
                 continue;
             }
-            match crate::speedtest_budget::reserve(
-                client,
-                crate::speedtest_budget::Direction::Upload,
-                n,
-            ) {
-                Ok(mut charged) => charged.use_bytes(n),
-                Err(refused) => {
-                    exhausted = Some(refused.retry_after);
-                    break;
-                }
+            let drawn = match allowance.as_mut() {
+                Some(allowance) => allowance.draw(n),
+                None => crate::speedtest_budget::reserve(
+                    client,
+                    crate::speedtest_budget::Direction::Upload,
+                    0,
+                )
+                .and_then(|mut fresh| {
+                    fresh.draw(n)?;
+                    allowance = Some(fresh);
+                    Ok(())
+                }),
+            };
+            if let Err(refused) = drawn {
+                exhausted = Some(refused.retry_after);
+                break;
             }
             if start.is_none() {
                 start = Some(Instant::now());

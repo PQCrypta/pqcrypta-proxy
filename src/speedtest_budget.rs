@@ -6,8 +6,9 @@
 //!
 //! - [`STREAMS_PER_NETWORK`] test streams at once, across its connections;
 //! - an hourly allowance of bytes each way ([`HOURLY_DOWNLOAD`],
-//!   [`HOURLY_UPLOAD`]), reserved before a transfer starts and the unused
-//!   part given back when it ends, so concurrent transfers cannot overdraw it;
+//!   [`HOURLY_UPLOAD`]), which a transfer draws on as its bytes move, a block
+//!   at a time ([`Reservation::draw`]), so transfers side by side cannot
+//!   overdraw it and none holds more than it is about to move;
 //! - one route analysis at a time, [`ANALYSIS_COOLDOWN`] apart, and no more
 //!   than [`ANALYSES_AT_ONCE`] analyses on the server at once.
 //!
@@ -21,7 +22,24 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
 /// Test streams one network may have open at once.
-pub const STREAMS_PER_NETWORK: usize = 32;
+///
+/// That is the page's largest QUIC upload pool and its control streams beside
+/// it (the node's info and meter). A browser keeps about 128 KB in flight per
+/// WebTransport session,
+/// so the page uploads on a pool of sessions, up to [`UPLOAD_POOL_SESSIONS`]
+/// of [`UPLOAD_POOL_STREAMS_PER_SESSION`] streams, and a long path needs most
+/// of them. The node's info answer carries this limit, and the page fits its
+/// pool under it.
+pub const STREAMS_PER_NETWORK: usize =
+    UPLOAD_POOL_SESSIONS * UPLOAD_POOL_STREAMS_PER_SESSION + CONTROL_STREAMS;
+/// The most sessions the page's QUIC upload pool opens.
+pub const UPLOAD_POOL_SESSIONS: usize = 32;
+/// The streams the page's QUIC upload pool runs on each session.
+pub const UPLOAD_POOL_STREAMS_PER_SESSION: usize = 4;
+/// Streams beside the pool: the node's info, meter and route analysis.
+const CONTROL_STREAMS: usize = 8;
+/// What a transfer takes of its allowance at a time ([`Reservation::draw`]).
+pub const DRAW_BLOCK: u64 = 16 * 1024 * 1024;
 /// Bytes one network may download in an hour.
 pub const HOURLY_DOWNLOAD: u64 = 16 * 1024 * 1024 * 1024;
 /// Bytes one network may upload in an hour.
@@ -112,9 +130,40 @@ pub struct Reservation {
 }
 
 impl Reservation {
-    /// Note `bytes` more of the reservation used.
-    pub fn use_bytes(&mut self, bytes: u64) {
-        self.used = self.used.saturating_add(bytes).min(self.reserved);
+    /// Use `bytes` more, taking more of the allowance first when what is
+    /// reserved is spent: a block at a time ([`DRAW_BLOCK`]), or just what
+    /// `bytes` needs when a block no longer fits. A transfer draws as its
+    /// bytes move, so transfers side by side hold only what they are about
+    /// to move rather than all they might, and together cannot overdraw the
+    /// allowance. Refused, using nothing more, when the allowance cannot
+    /// cover `bytes`.
+    pub fn draw(&mut self, bytes: u64) -> Result<(), Refused> {
+        self.draw_at(bytes, Instant::now())
+    }
+
+    fn draw_at(&mut self, bytes: u64, now: Instant) -> Result<(), Refused> {
+        let needed = self.used.saturating_add(bytes);
+        if needed > self.reserved {
+            let short = needed - self.reserved;
+            let block = short.max(DRAW_BLOCK);
+            let (window, taken) = match take(self.budget, self.network, self.direction, block, now)
+            {
+                Ok(window) => (window, block),
+                Err(_) => (
+                    take(self.budget, self.network, self.direction, short, now)?,
+                    short,
+                ),
+            };
+            if window != self.window {
+                // The window this was taken in has ended, and what it left
+                // unused went with it: count from the new one
+                self.reserved = self.used;
+                self.window = window;
+            }
+            self.reserved += taken;
+        }
+        self.used = needed;
+        Ok(())
     }
 }
 
@@ -139,6 +188,10 @@ impl Drop for Reservation {
 }
 
 /// Reserve `bytes` of `ip`'s allowance for one transfer.
+///
+/// The transfer then draws on it, and on more, as its bytes move
+/// ([`Reservation::draw`]). It reserves what it moves first (a block, or
+/// less), so one the allowance cannot start is refused before any byte moves.
 pub fn reserve(ip: IpAddr, direction: Direction, bytes: u64) -> Result<Reservation, Refused> {
     reserve_in(&BUDGET, ip, direction, bytes, Instant::now())
 }
@@ -151,6 +204,26 @@ fn reserve_in(
     now: Instant,
 ) -> Result<Reservation, Refused> {
     let network = network(ip);
+    let window = take(budget, network, direction, bytes, now)?;
+    Ok(Reservation {
+        budget,
+        network,
+        direction,
+        reserved: bytes,
+        used: 0,
+        window,
+    })
+}
+
+/// Take `bytes` of `network`'s allowance in the window running at `now`,
+/// which it returns, or refuse, taking nothing.
+fn take(
+    budget: &'static Budget,
+    network: IpAddr,
+    direction: Direction,
+    bytes: u64,
+    now: Instant,
+) -> Result<Instant, Refused> {
     if budget.usage.len() >= NETWORKS {
         budget
             .usage
@@ -179,15 +252,7 @@ fn reserve_in(
         });
     }
     *taken += bytes;
-    let window = usage.window_start;
-    Ok(Reservation {
-        budget,
-        network,
-        direction,
-        reserved: bytes,
-        used: 0,
-        window,
-    })
+    Ok(usage.window_start)
 }
 
 /// One route analysis under way, given back when dropped.
@@ -272,13 +337,73 @@ mod tests {
         assert!(refused.retry_after <= WINDOW && refused.retry_after > Duration::ZERO);
         // Downloads are their own allowance
         assert!(reserve_in(budget, ip, Direction::Download, half, now).is_ok());
-        second.use_bytes(1024);
+        second.draw(1024).unwrap();
         drop(second);
         drop(first);
         assert!(reserve_in(budget, ip, Direction::Upload, half, now).is_ok());
         // An hour on, the window starts again
         let later = now + WINDOW;
         assert!(reserve_in(budget, ip, Direction::Upload, HOURLY_UPLOAD, later).is_ok());
+    }
+
+    /// A transfer draws a block at a time, then just what it needs when a
+    /// block no longer fits, is refused past the allowance, and gives back
+    /// what it took and did not use.
+    #[test]
+    fn a_transfer_draws_its_allowance_as_its_bytes_move() {
+        let budget: &'static Budget = Box::leak(Box::default());
+        let ip: IpAddr = "198.51.100.43".parse().unwrap();
+        let now = Instant::now();
+        let taken = |budget: &Budget| budget.usage.get(&network(ip)).unwrap().uploaded;
+        let mut transfer = reserve_in(budget, ip, Direction::Upload, 0, now).unwrap();
+        transfer.draw_at(1000, now).unwrap();
+        assert_eq!(
+            taken(budget),
+            DRAW_BLOCK,
+            "a block taken for the first bytes"
+        );
+        transfer.draw_at(DRAW_BLOCK - 1000, now).unwrap();
+        assert_eq!(taken(budget), DRAW_BLOCK, "the block covers them");
+        // Another transfer takes all but what is left of half a block
+        let rest = HOURLY_UPLOAD - DRAW_BLOCK - DRAW_BLOCK / 2;
+        let other = reserve_in(budget, ip, Direction::Upload, rest, now).unwrap();
+        transfer.draw_at(DRAW_BLOCK / 4, now).unwrap();
+        assert_eq!(
+            taken(budget),
+            HOURLY_UPLOAD - DRAW_BLOCK / 2 + DRAW_BLOCK / 4,
+            "just what is needed once a block does not fit"
+        );
+        let refused = transfer.draw_at(DRAW_BLOCK, now).unwrap_err();
+        assert!(refused.retry_after > Duration::ZERO);
+        assert_eq!(
+            transfer.used,
+            DRAW_BLOCK + DRAW_BLOCK / 4,
+            "a refusal uses nothing"
+        );
+        drop(other);
+        drop(transfer);
+        assert_eq!(
+            taken(budget),
+            DRAW_BLOCK + DRAW_BLOCK / 4,
+            "only what moved stays taken"
+        );
+    }
+
+    /// A transfer running across the hour draws on the new window and gives
+    /// back to it only what it took there.
+    #[test]
+    fn a_transfer_across_the_hour_draws_on_the_new_window() {
+        let budget: &'static Budget = Box::leak(Box::default());
+        let ip: IpAddr = "198.51.100.44".parse().unwrap();
+        let now = Instant::now();
+        let mut transfer = reserve_in(budget, ip, Direction::Download, 0, now).unwrap();
+        transfer.draw_at(DRAW_BLOCK, now).unwrap();
+        let later = now + WINDOW;
+        transfer.draw_at(10, later).unwrap();
+        drop(transfer);
+        let usage = budget.usage.get(&network(ip)).unwrap();
+        assert_eq!(usage.window_start, later);
+        assert_eq!(usage.downloaded, 10, "the new window keeps what it moved");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ipnet::IpNet;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -95,16 +95,20 @@ pub struct ConfigManager {
     config: ArcSwap<ProxyConfig>,
     /// File watcher for hot-reload
     watcher: RwLock<Option<RecommendedWatcher>>,
-    /// Channel to notify config changes
-    reload_tx: mpsc::Sender<ConfigReloadEvent>,
+    /// Channel to notify config changes. Unbounded, so the watcher's
+    /// callback, which runs on the watcher's own thread, never waits on it:
+    /// a reload that moves the watch (`refresh_crs_watch`) waits on that
+    /// thread, and the two waiting on each other deadlocked.
+    reload_tx: mpsc::UnboundedSender<ConfigReloadEvent>,
     /// Configuration file path
     config_path: PathBuf,
     /// Applied to the file on every load, see [`ConfigOverrides`].
     overrides: Arc<RwLock<ConfigOverrides>>,
     /// The CRS entry's directory the watcher follows (`[waf.crs]`), shared
     /// with its callback: a reload that turns the rule set on, or moves its
-    /// entry, moves the watch with it ([`Self::store_config`]).
-    crs_watch: Arc<RwLock<Option<PathBuf>>>,
+    /// entry, moves the watch with it ([`Self::store_config`]). Read without
+    /// a lock, so the callback never waits on a reload.
+    crs_watch: Arc<ArcSwapOption<PathBuf>>,
     /// The directories the watcher was started on (the config's, the
     /// certificate's), which a CRS directory never takes off it.
     base_watch: RwLock<Vec<PathBuf>>,
@@ -514,7 +518,8 @@ impl Default for WafCrsConfig {
     }
 }
 
-/// Suppress specific WAF rules or categories on paths matching a regex.
+/// Suppress specific WAF rules or categories on paths matching a regex, on
+/// every host or on the hosts `host` matches.
 ///
 /// Tuning used to mean switching a whole category off globally: a single
 /// false positive on one endpoint cost the protection everywhere.
@@ -522,6 +527,12 @@ impl Default for WafCrsConfig {
 pub struct WafExclusion {
     /// Regex matched against the request path
     pub path: String,
+    /// Regex matched against the request's host (its authority over HTTP/2
+    /// and HTTP/3, its Host header over HTTP/1.1, without a port); every
+    /// host when absent. A node serves many sites, and an endpoint's path
+    /// alone may name another site's page.
+    #[serde(default)]
+    pub host: Option<String>,
     /// Rule identifiers to suppress, e.g. "PQW-NOSQL-001"
     #[serde(default)]
     pub rules: Vec<String>,
@@ -4027,9 +4038,9 @@ impl ConfigManager {
     #[expect(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         config_path: impl AsRef<Path>,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<ConfigReloadEvent>)> {
+    ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<ConfigReloadEvent>)> {
         let config_path = config_path.as_ref().to_path_buf();
-        let (reload_tx, reload_rx) = mpsc::channel(16);
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel();
 
         // Load initial configuration
         let config = Self::load_config(&config_path)?;
@@ -4041,7 +4052,7 @@ impl ConfigManager {
             reload_tx,
             config_path,
             overrides: Arc::new(RwLock::new(ConfigOverrides::default())),
-            crs_watch: Arc::new(RwLock::new(None)),
+            crs_watch: Arc::new(ArcSwapOption::empty()),
             base_watch: RwLock::new(Vec::new()),
         };
 
@@ -4118,15 +4129,24 @@ impl ConfigManager {
     /// rule set turned on after the proxy started is watched from that
     /// reload on, and one turned off stops being watched. A directory the
     /// watcher was started on stays watched.
+    ///
+    /// `watch` and `unwatch` wait on the watcher's own thread, which runs its
+    /// callback; the callback reads the directory without a lock and sends on
+    /// an unbounded channel, so it never waits on this. Reloads take the
+    /// watcher's lock, one at a time. The new directory is published before
+    /// it is watched, so its first event is recognised; the old one's last
+    /// events, from before it is unwatched, are ignored with it.
     pub fn refresh_crs_watch(&self, config: &ProxyConfig) {
         let next = crs_watch_dir(config);
-        let mut current = self.crs_watch.write();
-        if *current == next {
+        let mut watcher = self.watcher.write();
+        let current = self.crs_watch.load_full();
+        if current.as_deref() == next.as_ref() {
             return;
         }
-        if let Some(watcher) = self.watcher.write().as_mut() {
-            let base = self.base_watch.read();
-            if let Some(old) = current.as_ref().filter(|d| !base.contains(d)) {
+        self.crs_watch.store(next.clone().map(Arc::new));
+        if let Some(watcher) = watcher.as_mut() {
+            let base = self.base_watch.read().clone();
+            if let Some(old) = current.as_deref().filter(|d| !base.contains(d)) {
                 if let Err(e) = watcher.unwatch(old) {
                     warn!("Could not stop watching {:?}: {}", old, e);
                 }
@@ -4141,7 +4161,6 @@ impl ConfigManager {
                 }
             }
         }
-        *current = next;
     }
 } // impl ConfigManager
 
@@ -4333,10 +4352,16 @@ fn is_crs_file(dir: &Path, path: &Path) -> bool {
 impl ConfigManager {
     // re-open for remaining methods
 
-    /// Manually reload configuration
+    /// Manually reload configuration. The file is read and parsed on the
+    /// blocking pool, never on a runtime worker.
     pub async fn reload(&self) -> anyhow::Result<()> {
         let overrides = self.overrides.read().clone();
-        match Self::load_effective(&self.config_path, &overrides) {
+        let path = self.config_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || Self::load_effective(&path, &overrides))
+            .await
+            .map_err(|e| anyhow::anyhow!("the configuration load task failed: {e}"))
+            .and_then(|loaded| loaded);
+        match loaded {
             Ok(new_config) => {
                 let new_config = Arc::new(new_config);
                 self.config.store(new_config.clone());
@@ -4345,16 +4370,14 @@ impl ConfigManager {
                 // Notify listeners
                 let _ = self
                     .reload_tx
-                    .send(ConfigReloadEvent::ConfigReloaded(new_config))
-                    .await;
+                    .send(ConfigReloadEvent::ConfigReloaded(new_config));
                 Ok(())
             }
             Err(e) => {
                 error!("Failed to reload configuration: {}", e);
                 let _ = self
                     .reload_tx
-                    .send(ConfigReloadEvent::ReloadFailed(e.to_string()))
-                    .await;
+                    .send(ConfigReloadEvent::ReloadFailed(e.to_string()));
                 Err(e)
             }
         }
@@ -4416,7 +4439,7 @@ impl ConfigManager {
                 dirs.push(d.clone());
             }
         }
-        *self.crs_watch.write() = crs_dir;
+        self.crs_watch.store(crs_dir.map(Arc::new));
         *self.base_watch.write() = base;
         let crs_watch = Arc::clone(&self.crs_watch);
         if dirs.is_empty() {
@@ -4436,7 +4459,7 @@ impl ConfigManager {
                     // A directory watch also reports siblings — editor swap files,
                     // .bak copies, certbot's staging files — so dispatch strictly
                     // on which watched path the event names.
-                    let crs_dir = crs_watch.read().clone();
+                    let crs_dir = crs_watch.load_full();
                     let hit_config = event.paths.iter().any(|p| {
                         p == &ev_config || crs_dir.as_deref().is_some_and(|d| is_crs_file(d, p))
                     });
@@ -4449,14 +4472,14 @@ impl ConfigManager {
                             Ok(new_config) => {
                                 let new_config = Arc::new(new_config);
                                 info!("Configuration hot-reloaded");
-                                // blocking send: this closure is not async
-                                let _ = reload_tx
-                                    .blocking_send(ConfigReloadEvent::ConfigReloaded(new_config));
+                                // Unbounded: this thread never waits on a reload
+                                let _ =
+                                    reload_tx.send(ConfigReloadEvent::ConfigReloaded(new_config));
                             }
                             Err(e) => {
                                 error!("Failed to hot-reload configuration: {}", e);
-                                let _ = reload_tx
-                                    .blocking_send(ConfigReloadEvent::ReloadFailed(e.to_string()));
+                                let _ =
+                                    reload_tx.send(ConfigReloadEvent::ReloadFailed(e.to_string()));
                             }
                         }
                     }
@@ -4468,7 +4491,7 @@ impl ConfigManager {
                         // actually reload a renewed cert. Emit the event that
                         // main.rs and quic_listener.rs already handle.
                         info!("TLS certificate or key changed on disk");
-                        let _ = reload_tx.blocking_send(ConfigReloadEvent::TlsCertsReloaded);
+                        let _ = reload_tx.send(ConfigReloadEvent::TlsCertsReloaded);
                     }
                 }
                 Err(e) => {
@@ -5826,12 +5849,13 @@ mod tests {
         std::fs::write(crs.join("main.conf"), "SecRuleEngine On\n").unwrap();
 
         let (manager, mut events) = ConfigManager::new(&file).await.expect("config loads");
+        let manager = Arc::new(manager);
         manager.start_watching().expect("watching");
         let mut on = (*manager.get()).clone();
         on.waf.enabled = true;
         on.waf.crs.enabled = true;
         on.waf.crs.entry = crs.join("main.conf").to_string_lossy().into_owned();
-        manager.store_config(Arc::new(on));
+        store_within(&manager, on).await;
 
         // Renamed into place, as an install or an editor replaces a file: the
         // event every platform reports (macOS reports no close after write)
@@ -5852,7 +5876,7 @@ mod tests {
 
         let mut off = (*manager.get()).clone();
         off.waf.crs.enabled = false;
-        manager.store_config(Arc::new(off));
+        store_within(&manager, off).await;
         while events.try_recv().is_ok() {}
         replace("# 2\n");
         let quiet = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await;
@@ -5860,6 +5884,79 @@ mod tests {
             quiet.is_err(),
             "CRS turned off: its directory is no longer watched"
         );
+        manager.stop_watching();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Store `config` as a reload does, failing rather than hanging if it
+    /// waits on the watcher's thread while that thread waits on it. On a
+    /// thread of its own, not the runtime's blocking pool, whose shutdown
+    /// would wait for a deadlocked task and hang the test instead.
+    async fn store_within(manager: &Arc<ConfigManager>, config: ProxyConfig) {
+        let manager = Arc::clone(manager);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            manager.store_config(Arc::new(config));
+            let _ = done_tx.send(());
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), done_rx)
+            .await
+            .expect("a reload that moves the watch does not deadlock with the watcher")
+            .unwrap();
+    }
+
+    /// Reloads that move the watch, while the watcher's thread is busy with
+    /// the directory's events, never wait on each other: each such reload
+    /// asks that thread to watch or unwatch, and that thread used to wait on
+    /// the reload's lock and on a full reload channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reloads_that_move_the_watch_never_deadlock_with_its_events() {
+        let base = std::env::temp_dir().join(format!("crs-watch-race-{}", std::process::id()));
+        let etc = base.join("etc");
+        let crs = base.join("crs");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(&crs).unwrap();
+        let file = etc.join("proxy.toml");
+        std::fs::write(&file, "[waf]\nenabled = false\n").unwrap();
+        std::fs::write(crs.join("main.conf"), "SecRuleEngine On\n").unwrap();
+        // Nobody reads the reload events: a bounded channel filled up
+        let (manager, _events) = ConfigManager::new(&file).await.expect("config loads");
+        let manager = Arc::new(manager);
+        manager.start_watching().expect("watching");
+        /// Stops the writer however the test ends
+        struct Stop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop_writer = Stop(Arc::clone(&stop));
+        let writer = {
+            let (crs, stop) = (crs.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let tmp = crs.join(".x.tmp");
+                    std::fs::write(&tmp, format!("# {n}\n")).unwrap();
+                    std::fs::rename(
+                        &tmp,
+                        crs.join("REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"),
+                    )
+                    .unwrap();
+                    n += 1;
+                }
+            })
+        };
+        for round in 0..50 {
+            let mut next = (*manager.get()).clone();
+            next.waf.enabled = true;
+            next.waf.crs.enabled = round % 2 == 0;
+            next.waf.crs.entry = crs.join("main.conf").to_string_lossy().into_owned();
+            store_within(&manager, next).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
         manager.stop_watching();
         std::fs::remove_dir_all(&base).unwrap();
     }

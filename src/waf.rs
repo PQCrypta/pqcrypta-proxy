@@ -1212,6 +1212,21 @@ pub struct WafRequest<'a> {
     pub authority: Option<&'a str>,
 }
 
+/// The host a request names, without its port: its authority over HTTP/2
+/// and HTTP/3, its Host header over HTTP/1.1.
+fn request_host<'a>(req: &WafRequest<'a>) -> Option<&'a str> {
+    let named = req.authority.or_else(|| {
+        req.headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+    })?;
+    // `[v6]:port`, `name:port`, or either without a port
+    Some(match named.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or(named, |(addr, _)| addr),
+        None => named.rsplit_once(':').map_or(named, |(name, _)| name),
+    })
+}
+
 /// A rule as compiled into the engine, addressed by its index in
 /// [`WafEngine::rules`].
 struct CompiledRule {
@@ -1220,9 +1235,11 @@ struct CompiledRule {
     severity: Severity,
 }
 
-/// A `[[waf.exclusions]]` entry with its path pattern compiled.
+/// A `[[waf.exclusions]]` entry with its path and host patterns compiled.
 struct CompiledExclusion {
     path: Regex,
+    /// `None`: every host
+    host: Option<Regex>,
     rules: Vec<String>,
     categories: Vec<String>,
 }
@@ -1507,16 +1524,32 @@ impl WafEngine {
         let exclusions: Vec<CompiledExclusion> = config
             .exclusions
             .iter()
-            .filter_map(|e| match Regex::new(&e.path) {
-                Ok(path) => Some(CompiledExclusion {
+            .filter_map(|e| {
+                let path = Regex::new(&e.path)
+                    .map_err(|err| {
+                        tracing::warn!("Invalid waf.exclusions path pattern '{}': {}", e.path, err);
+                    })
+                    .ok()?;
+                // An exclusion whose host pattern does not compile is not
+                // applied anywhere, rather than everywhere
+                let host = match e.host.as_deref().map(Regex::new) {
+                    None => None,
+                    Some(Ok(host)) => Some(host),
+                    Some(Err(err)) => {
+                        tracing::warn!(
+                            "Invalid waf.exclusions host pattern '{}': {}",
+                            e.host.as_deref().unwrap_or_default(),
+                            err
+                        );
+                        return None;
+                    }
+                };
+                Some(CompiledExclusion {
                     path,
+                    host,
                     rules: e.rules.clone(),
                     categories: e.categories.clone(),
-                }),
-                Err(err) => {
-                    tracing::warn!("Invalid waf.exclusions path pattern '{}': {}", e.path, err);
-                    None
-                }
+                })
             })
             .collect();
 
@@ -1977,7 +2010,7 @@ impl WafEngine {
             .mode_override
             .map_or(self.config.mode == "block", |m| m == "block");
         let threshold = self.config.anomaly_threshold.max(1);
-        let excluded = self.exclusions_for(req.path);
+        let excluded = self.exclusions_for(req);
         let mut a = Assessment::default();
         self.assess_head(&mut a, req, &self.exclusion_refs(&excluded), threshold);
         if block_mode && a.score >= threshold {
@@ -2196,7 +2229,7 @@ impl WafEngine {
     /// Run the rules over a request. Scanning stops once the score reaches
     /// `threshold`; `explain` passes `u32::MAX` so every rule is evaluated.
     fn assess(&self, req: &WafRequest<'_>, threshold: u32, explain: bool) -> Assessment {
-        let excluded = self.exclusions_for(req.path);
+        let excluded = self.exclusions_for(req);
         let excluded = self.exclusion_refs(&excluded);
         let mut a = Assessment {
             explain,
@@ -2207,13 +2240,23 @@ impl WafEngine {
         a
     }
 
-    /// The exclusions matching `path`, by index. Almost always none, and when
-    /// the operator has configured none this costs a length check.
-    fn exclusions_for(&self, path: &str) -> Vec<usize> {
+    /// The exclusions matching the request's path and host, by index. Almost
+    /// always none, and when the operator has configured none this costs a
+    /// length check.
+    fn exclusions_for(&self, req: &WafRequest<'_>) -> Vec<usize> {
+        if self.exclusions.is_empty() {
+            return Vec::new();
+        }
+        let host = request_host(req);
         self.exclusions
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.path.is_match(path))
+            .filter(|(_, e)| {
+                e.path.is_match(req.path)
+                    && e.host
+                        .as_ref()
+                        .is_none_or(|re| host.is_some_and(|h| re.is_match(h)))
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -4051,6 +4094,7 @@ mod tests {
         let mut cfg = config();
         cfg.exclusions = vec![WafExclusion {
             path: "^/api/graphql".to_string(),
+            host: None,
             rules: vec!["PQW-NOSQL-001".to_string()],
             categories: Vec::new(),
         }];
@@ -4098,6 +4142,7 @@ mod tests {
     fn exclusions_can_suppress_a_whole_category() {
         let mut cfg = config();
         cfg.exclusions = vec![WafExclusion {
+            host: None,
             path: "^/regex/".to_string(),
             rules: Vec::new(),
             categories: vec!["xss".to_string()],
@@ -4121,6 +4166,78 @@ mod tests {
             "the xss category must be suppressed on this path, got {}",
             rule_of(&v)
         );
+    }
+
+    /// An exclusion with a host applies on that host alone, whether the host
+    /// arrives as an HTTP/2 or HTTP/3 authority or as an HTTP/1.1 Host header
+    /// (with or without a port), and on no other site behind the node.
+    #[test]
+    fn an_exclusion_with_a_host_applies_on_that_host_only() {
+        let mut cfg = config();
+        cfg.exclusions = vec![WafExclusion {
+            path: "^/encrypt$".to_string(),
+            host: Some(r"^api\.example\.com$".to_string()),
+            rules: Vec::new(),
+            categories: vec!["xss".to_string()],
+        }];
+        let engine = WafEngine::new(&cfg);
+        let inspect = |authority: Option<&str>, host_header: Option<&str>| {
+            let mut headers = browser_headers();
+            if let Some(h) = host_header {
+                headers.insert(http::header::HOST, h.parse().unwrap());
+            }
+            engine.inspect(&WafRequest {
+                method: "GET",
+                path: "/encrypt",
+                query: "data=<script>alert(1)</script>",
+                headers: &headers,
+                body: None,
+                skip_bot_ua_check: false,
+                generic_client_allowed: false,
+                mode_override: None,
+                version: None,
+                authority,
+            })
+        };
+        for (authority, host_header) in [
+            (Some("api.example.com"), None),
+            (Some("api.example.com:443"), None),
+            (None, Some("api.example.com")),
+            (None, Some("api.example.com:8443")),
+        ] {
+            let v = inspect(authority, host_header);
+            assert!(
+                matches!(v, WafVerdict::Allow),
+                "excluded on {authority:?}/{host_header:?}, got {}",
+                rule_of(&v)
+            );
+        }
+        for (authority, host_header) in [
+            (Some("www.example.com"), None),
+            (None, Some("www.example.com")),
+            (None, None),
+        ] {
+            assert!(
+                blocked(&inspect(authority, host_header)),
+                "not excluded on {authority:?}/{host_header:?}"
+            );
+        }
+        // A host pattern that does not compile applies the exclusion nowhere
+        cfg.exclusions[0].host = Some("(".to_string());
+        let engine = WafEngine::new(&cfg);
+        let headers = browser_headers();
+        assert!(blocked(&engine.inspect(&WafRequest {
+            method: "GET",
+            path: "/encrypt",
+            query: "data=<script>alert(1)</script>",
+            headers: &headers,
+            body: None,
+            skip_bot_ua_check: false,
+            generic_client_allowed: false,
+            mode_override: None,
+            version: None,
+            authority: Some("api.example.com"),
+        })));
     }
 
     /// Rules used to be named by the first 40 characters of their own regex, so

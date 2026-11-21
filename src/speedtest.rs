@@ -460,6 +460,11 @@ async fn handle_op_info<W: AsyncWrite + Unpin + Send>(
             "max_download_bytes": MAX_DOWNLOAD_BYTES,
             "max_upload_bytes":   MAX_UPLOAD_BYTES,
             "max_traceroute_hops": TRACEROUTE_MAX_HOPS,
+            // What the page fits its QUIC upload pool under
+            "streams_per_network": crate::speedtest_budget::STREAMS_PER_NETWORK,
+            "upload_pool_sessions": crate::speedtest_budget::UPLOAD_POOL_SESSIONS,
+            "upload_pool_streams_per_session":
+                crate::speedtest_budget::UPLOAD_POOL_STREAMS_PER_SESSION,
         },
         "server_ts_ms": jiff::Timestamp::now().as_millisecond()
     });
@@ -563,10 +568,12 @@ async fn handle_op_download<W: AsyncWrite + Unpin + Send>(
         return Ok(());
     }
 
+    // The first block of the allowance, so a download it cannot start is
+    // refused before any byte; the rest is drawn as the bytes are sent.
     let mut allowance = match crate::speedtest_budget::reserve(
         remote_addr.ip(),
         crate::speedtest_budget::Direction::Download,
-        requested as u64,
+        (requested as u64).min(crate::speedtest_budget::DRAW_BLOCK),
     ) {
         Ok(reservation) => reservation,
         Err(refused) => {
@@ -598,9 +605,17 @@ async fn handle_op_download<W: AsyncWrite + Unpin + Send>(
     // The extra second allows the connection's QUIC CWND / window to drain normally.
     let download_timeout = std::time::Duration::from_secs(max_secs + 1);
 
+    let mut exhausted = false;
     let result = tokio::time::timeout(download_timeout, async {
         while remaining > 0 {
             let to_send = remaining.min(DOWNLOAD_CHUNK);
+            // Each piece comes off the allowance before it is sent; a
+            // download that spends it ends there, and the client's next
+            // request is refused with the time to wait
+            if allowance.draw(to_send as u64).is_err() {
+                exhausted = true;
+                break;
+            }
             send.write_all(&chunk[..to_send]).await?;
             remaining -= to_send;
         }
@@ -608,8 +623,12 @@ async fn handle_op_download<W: AsyncWrite + Unpin + Send>(
     })
     .await;
 
-    // What was sent comes off the allowance; the rest is given back.
-    allowance.use_bytes((requested - remaining) as u64);
+    if exhausted {
+        info!(
+            "Download for {} ended: the network's hourly allowance is spent",
+            remote_addr
+        );
+    }
     match result {
         Ok(Ok(())) => {
             send.shutdown().await?;
@@ -662,10 +681,12 @@ async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + S
         return Ok(());
     }
 
+    // The first block of the allowance, so an upload it cannot start is
+    // refused before any byte; the rest is drawn as the bytes arrive.
     let mut allowance = match crate::speedtest_budget::reserve(
         remote_addr.ip(),
         crate::speedtest_budget::Direction::Upload,
-        declared as u64,
+        (declared as u64).min(crate::speedtest_budget::DRAW_BLOCK),
     ) {
         Ok(reservation) => reservation,
         Err(refused) => {
@@ -701,10 +722,17 @@ async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + S
     let mut buf = vec![0u8; DOWNLOAD_CHUNK];
     let upload_timeout = UPLOAD_TIME_LIMIT;
 
+    let mut exhausted: Option<std::time::Duration> = None;
     let read_result = tokio::time::timeout(upload_timeout, async {
         loop {
             match recv.read(&mut buf).await {
                 Ok(n) if n > 0 => {
+                    // Each piece comes off the allowance as it arrives; an
+                    // upload that spends it is read no further
+                    if let Err(refused) = allowance.draw(n as u64) {
+                        exhausted = Some(refused.retry_after);
+                        break;
+                    }
                     if start.is_none() {
                         start = Some(Instant::now()); // clock starts on first byte received
                     }
@@ -730,11 +758,14 @@ async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + S
 
     // The stream has stopped receiving: the meter stops counting it as open.
     drop(meter);
-    // What was received comes off the allowance; the rest is given back.
-    allowance.use_bytes(total_bytes as u64);
-
     match read_result {
         Ok(Ok(())) => {}
+        // The page closes its sessions when its time is up, and a stream
+        // still open then ends this way: the upload's normal end
+        Ok(Err(e)) if closed_by_peer(&e) => debug!(
+            "Upload from {} ended: the client closed its session",
+            remote_addr
+        ),
         Ok(Err(e)) => error!("Upload read error from {}: {}", remote_addr, e),
         Err(_) => info!(
             "Upload timeout from {} (measured {} bytes)",
@@ -768,6 +799,24 @@ async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + S
         total_bytes, duration_ms, throughput_mbps, steady_mbps, remote_addr
     );
 
+    if let Some(retry_after) = exhausted {
+        info!(
+            "Upload from {} ended: the network's hourly allowance is spent",
+            remote_addr
+        );
+        write_framed_json(
+            send,
+            &json!({
+                "error": "budget_exhausted",
+                "bytes_received": total_bytes,
+                "retry_after_secs": retry_after.as_secs().max(1)
+            }),
+        )
+        .await?;
+        send.shutdown().await?;
+        return Ok(());
+    }
+
     write_framed_json(
         send,
         &json!({
@@ -782,6 +831,36 @@ async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + S
     .await?;
     send.shutdown().await?;
     Ok(())
+}
+
+/// Whether a stream's read failed because the peer closed the connection (an
+/// application or transport close, or a reset), rather than because it was
+/// lost (an idle timeout, a protocol error on our side).
+fn closed_by_peer(error: &std::io::Error) -> bool {
+    use quinn::ConnectionError as Ce;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error
+        .get_ref()
+        .map(|e| e as &(dyn std::error::Error + 'static));
+    while let Some(e) = source {
+        if let Some(read) = e.downcast_ref::<quinn::ReadError>() {
+            return match read {
+                quinn::ReadError::Reset(_) => true,
+                quinn::ReadError::ConnectionLost(lost) => matches!(
+                    lost,
+                    Ce::ApplicationClosed(_) | Ce::ConnectionClosed(_) | Ce::Reset
+                ),
+                _ => false,
+            };
+        }
+        if let Some(lost) = e.downcast_ref::<Ce>() {
+            return matches!(
+                lost,
+                Ce::ApplicationClosed(_) | Ce::ConnectionClosed(_) | Ce::Reset
+            );
+        }
+        source = e.source();
+    }
+    false
 }
 
 /// Return the client's GeoIP information (city, country, ASN) based on their

@@ -105,8 +105,6 @@ const CHUNK_BYTES: usize = 16 * 1024;
 /// limit): two seconds of its rate. Past it the channel produces nothing
 /// until there is room, as an application whose writes block.
 const QUEUE_LIMIT: usize = (2 * CHANNEL_RATE_BPS as usize / 8) / CHUNK_BYTES;
-/// What is taken from the client network's download allowance at a time.
-const ALLOWANCE_BLOCK: u64 = 8 * 1024 * 1024;
 /// How often a channel with no allowance left says so.
 const BUDGET_NOTICE: Duration = Duration::from_secs(1);
 /// The longest a channel sleeps between looking at its queue and its
@@ -364,43 +362,34 @@ impl TokenBucket {
 type ChannelMap = HashMap<String, Arc<RwLock<ImpairmentConfig>>>;
 
 /// The client network's download allowance, as the session's channels
-/// draw on it: a block reserved at a time, its unused part given back when
-/// the session ends.
+/// draw on it ([`crate::speedtest_budget::Reservation::draw`]): a block taken
+/// at a time, and what was taken and not used given back when the session
+/// ends.
 struct Allowance {
     client: std::net::IpAddr,
     held: Option<crate::speedtest_budget::Reservation>,
-    left: u64,
 }
 
 impl Allowance {
     fn new(client: std::net::IpAddr) -> Self {
-        Self {
-            client,
-            held: None,
-            left: 0,
-        }
+        Self { client, held: None }
     }
 
     /// Take `bytes` for one chunk; false when the allowance is spent.
     fn take(&mut self, bytes: u64) -> bool {
-        if self.left < bytes {
+        if self.held.is_none() {
             match crate::speedtest_budget::reserve(
                 self.client,
                 crate::speedtest_budget::Direction::Download,
-                ALLOWANCE_BLOCK,
+                0,
             ) {
-                Ok(block) => {
-                    self.held = Some(block);
-                    self.left = ALLOWANCE_BLOCK;
-                }
+                Ok(fresh) => self.held = Some(fresh),
                 Err(_) => return false,
             }
         }
-        self.left -= bytes;
-        if let Some(block) = &mut self.held {
-            block.use_bytes(bytes);
-        }
-        true
+        self.held
+            .as_mut()
+            .is_some_and(|held| held.draw(bytes).is_ok())
     }
 }
 
@@ -1356,15 +1345,16 @@ mod tests {
     }
 
     #[test]
-    fn the_allowance_is_drawn_a_block_at_a_time() {
+    fn the_allowance_is_drawn_as_chunks_are_sent() {
         let mut allowance = Allowance::new("198.51.100.201".parse().unwrap());
         assert!(allowance.take(CHUNK_BYTES as u64));
-        assert_eq!(allowance.left, ALLOWANCE_BLOCK - CHUNK_BYTES as u64);
-        allowance.left = 10;
         assert!(
-            allowance.take(CHUNK_BYTES as u64),
+            allowance.take(crate::speedtest_budget::DRAW_BLOCK),
             "a new block when one runs out"
         );
-        assert_eq!(allowance.left, ALLOWANCE_BLOCK - CHUNK_BYTES as u64);
+        assert!(
+            !allowance.take(crate::speedtest_budget::HOURLY_DOWNLOAD),
+            "refused past the allowance"
+        );
     }
 }

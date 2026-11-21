@@ -5108,6 +5108,7 @@ mod hot_reload_tests {
         assert!(blocked_before >= 1);
 
         config.waf.exclusions = vec![WafExclusion {
+            host: None,
             path: "^/crypto-assets/scan/results$".into(),
             rules: Vec::new(),
             categories: vec!["ssrf".into()],
