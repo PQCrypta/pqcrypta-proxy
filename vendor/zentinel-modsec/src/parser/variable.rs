@@ -3,6 +3,7 @@
 //! Optimized with perfect hash function for O(1) variable name lookup.
 
 use crate::error::{Error, Result};
+use crate::variables::KeyRegex;
 use phf::phf_map;
 
 /// A variable specification in a SecRule.
@@ -15,7 +16,70 @@ pub struct VariableSpec {
     /// Count mode (& prefix).
     pub count_mode: bool,
     /// Exclusions (e.g., !ARGS:foo).
-    pub exclusions: Vec<String>,
+    pub exclusions: Vec<TargetExclusion>,
+}
+
+/// A target a rule leaves out (`!ARGS:password`, `!REQUEST_COOKIES:/__utm/`, or
+/// one added by `SecRuleUpdateTargetById`), read once, with the rule: it is
+/// tested against every value the rule resolves.
+///
+/// The forms ModSecurity accepts:
+/// - `COLLECTION:key`: that member (the key compared case-insensitively);
+/// - `COLLECTION:/regex/`: the members whose key the expression finds
+///   ([`KeyRegex`]);
+/// - `COLLECTION`: the whole collection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetExclusion {
+    /// As written, without the `!`.
+    pub text: String,
+    collection: String,
+    member: Option<ExcludedMember>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExcludedMember {
+    Key(String),
+    Regex(KeyRegex),
+}
+
+impl TargetExclusion {
+    /// Read an exclusion's text (without its `!`).
+    pub fn parse(text: &str) -> Self {
+        let (collection, member) = match text.split_once(':') {
+            Some((collection, sel)) => {
+                let member = if sel.len() > 2 && sel.starts_with('/') && sel.ends_with('/') {
+                    ExcludedMember::Regex(KeyRegex::new(&sel[1..sel.len() - 1]))
+                } else {
+                    ExcludedMember::Key(sel.to_string())
+                };
+                (collection, Some(member))
+            }
+            None => (text, None),
+        };
+        Self {
+            text: text.to_string(),
+            collection: collection.to_string(),
+            member,
+        }
+    }
+
+    /// Whether a resolved value, named `COLLECTION:key` (or a bare name for a
+    /// scalar variable), is left out.
+    pub fn matches(&self, resolved: &str) -> bool {
+        let (collection, key) = match resolved.split_once(':') {
+            Some((collection, key)) => (collection, Some(key)),
+            None => (resolved, None),
+        };
+        if !collection.eq_ignore_ascii_case(&self.collection) {
+            return false;
+        }
+        match (&self.member, key) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(ExcludedMember::Key(wanted)), Some(key)) => key.eq_ignore_ascii_case(wanted),
+            (Some(ExcludedMember::Regex(re)), Some(key)) => re.is_match(key),
+        }
+    }
 }
 
 /// Selection mode for collection variables.
@@ -23,8 +87,8 @@ pub struct VariableSpec {
 pub enum Selection {
     /// Static key selection (ARGS:foo).
     Key(String),
-    /// Regex key selection (ARGS:/^user/).
-    Regex(String),
+    /// Regex key selection (ARGS:/^user/), compiled as the rule is read.
+    Regex(KeyRegex),
 }
 
 /// Variable names supported by ModSecurity.
@@ -537,7 +601,7 @@ impl VariableName {
 #[inline]
 pub fn parse_variables(input: &str) -> Result<Vec<VariableSpec>> {
     let mut variables = Vec::with_capacity(4);
-    let mut exclusions: Vec<String> = Vec::new();
+    let mut exclusions: Vec<TargetExclusion> = Vec::new();
 
     // Split by | for OR conditions
     for part in input.split('|') {
@@ -548,7 +612,7 @@ pub fn parse_variables(input: &str) -> Result<Vec<VariableSpec>> {
 
         // Handle exclusions (!VAR)
         if let Some(excluded) = part.strip_prefix('!') {
-            exclusions.push(excluded.to_string());
+            exclusions.push(TargetExclusion::parse(excluded));
             continue;
         }
 
@@ -623,7 +687,9 @@ pub(crate) fn parse_single_variable(input: &str) -> Result<VariableSpec> {
 
             let selection =
                 if sel_str.starts_with('/') && sel_str.ends_with('/') && sel_str.len() > 2 {
-                    Some(Selection::Regex(sel_str[1..sel_str.len() - 1].to_string()))
+                    Some(Selection::Regex(KeyRegex::new(
+                        &sel_str[1..sel_str.len() - 1],
+                    )))
                 } else {
                     Some(Selection::Key(sel_str.to_string()))
                 };
@@ -671,7 +737,7 @@ mod tests {
         let vars = parse_variables("ARGS:/^user/").unwrap();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].name, VariableName::Args);
-        assert!(matches!(&vars[0].selection, Some(Selection::Regex(r)) if r == "^user"));
+        assert!(matches!(&vars[0].selection, Some(Selection::Regex(r)) if r.as_str() == "^user"));
     }
 
     #[test]

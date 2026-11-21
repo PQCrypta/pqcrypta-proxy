@@ -157,11 +157,17 @@ impl ZeroRttNonceStore {
     }
 }
 
-/// The body of extension `ext_type` in a raw ClientHello record (record and
-/// handshake headers included), or `None` if it is absent or the extensions
-/// block is not all in `data`.
+/// The body of extension `ext_type` in a raw ClientHello record.
+///
+/// `data` holds the record and handshake headers. `None` if the extension is
+/// absent, the record is not a ClientHello, or the extensions block is not all
+/// in `data` or not well formed.
 pub fn client_hello_extension(data: &[u8], ext_type: u16) -> Option<&[u8]> {
-    // TLS record header (5 bytes) and handshake header (4 bytes).
+    // A handshake record (22) whose message is a ClientHello (1): the TLS
+    // record header (5 bytes) and the handshake header (4 bytes).
+    if data.first() != Some(&22) || data.get(5) != Some(&1) {
+        return None;
+    }
     let ch = data.get(9..)?;
     // legacy_version (2) + random (32)
     let mut off = 34usize;
@@ -181,13 +187,98 @@ pub fn client_hello_extension(data: &[u8], ext_type: u16) -> Option<&[u8]> {
         let ty = u16::from_be_bytes([ch[off], ch[off + 1]]);
         let len = u16::from_be_bytes([ch[off + 2], ch[off + 3]]) as usize;
         off += 4;
-        let body = ch.get(off..off.checked_add(len)?.min(ext_end))?;
+        // An extension that runs past the extensions block is a malformed
+        // ClientHello, which the handshake refuses: it has no extensions to read.
+        let end = off.checked_add(len).filter(|&end| end <= ext_end)?;
         if ty == ext_type {
-            return Some(body);
+            return ch.get(off..end);
         }
-        off += len;
+        off = end;
     }
     None
+}
+
+/// The name a ClientHello asks for (RFC 6066 `server_name`), as the handshake
+/// reads it.
+///
+/// What the TLS stack answers for is what everything that decides before it
+/// (passthrough routing, the HTTP/1.1-only acceptor) reads too.
+///
+/// The rules are rustls's (`ServerNamePayload::read`), which serves the
+/// handshake: the `server_name_list` fills the extension exactly; a
+/// `host_name` is non-empty; a second `host_name` refuses the handshake, and so
+/// is no name here; a name type other than `host_name` ends the list, since
+/// its encoding is unknown; a `host_name` that is not a DNS name (an IP
+/// address, a NUL, a space) is no name; and the name is lowercased. Two readers
+/// used to do this apart, the acceptor's and the passthrough router's, and each
+/// took names from a malformed extension the other read differently.
+pub fn client_hello_server_name(data: &[u8]) -> Option<String> {
+    let ext = client_hello_extension(data, 0x0000)?;
+    let len = usize::from(u16::from_be_bytes([*ext.first()?, *ext.get(1)?]));
+    let mut list = ext.get(2..)?;
+    if len == 0 || list.len() != len {
+        return None;
+    }
+    let mut found: Option<Option<String>> = None;
+    while let Some((&name_type, rest)) = list.split_first() {
+        if name_type != 0 {
+            break;
+        }
+        let n = usize::from(u16::from_be_bytes([*rest.first()?, *rest.get(1)?]));
+        let name = rest.get(2..2 + n).filter(|name| !name.is_empty())?;
+        if found.is_some() {
+            return None;
+        }
+        found = Some(match rustls::pki_types::ServerName::try_from(name) {
+            Ok(rustls::pki_types::ServerName::DnsName(dns)) => {
+                Some(dns.as_ref().to_ascii_lowercase())
+            }
+            _ => None,
+        });
+        list = &rest[2 + n..];
+    }
+    found.flatten()
+}
+
+/// What the handshake reads from `data`, for checking
+/// [`client_hello_server_name`] against it.
+#[cfg(any(test, fuzzing))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HandshakeReads {
+    /// `data` is not one TLS record holding exactly one ClientHello that
+    /// rustls accepts.
+    NoClientHello,
+    /// A ClientHello naming this server (lowercased), or naming none.
+    ServerName(Option<String>),
+}
+
+/// rustls's own parse of `data`: the server name the handshake reads.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn handshake_server_name(data: &[u8]) -> HandshakeReads {
+    let byte = |i: usize| data.get(i).copied().map(usize::from);
+    let (Some(r0), Some(r1), Some(m0), Some(m1), Some(m2)) =
+        (byte(3), byte(4), byte(6), byte(7), byte(8))
+    else {
+        return HandshakeReads::NoClientHello;
+    };
+    let (record, message) = ((r0 << 8) | r1, (m0 << 16) | (m1 << 8) | m2);
+    if data.len() != 5 + record || record != 4 + message {
+        return HandshakeReads::NoClientHello;
+    }
+    let mut acceptor = rustls::server::Acceptor::default();
+    let mut rest = data;
+    while !rest.is_empty() {
+        match acceptor.read_tls(&mut rest) {
+            Ok(0) | Err(_) => return HandshakeReads::NoClientHello,
+            Ok(_) => {}
+        }
+    }
+    match acceptor.accept() {
+        Ok(Some(accepted)) => {
+            HandshakeReads::ServerName(accepted.client_hello().server_name().map(str::to_owned))
+        }
+        _ => HandshakeReads::NoClientHello,
+    }
 }
 
 /// The first PSK identity -- the session ticket being resumed -- in a
@@ -867,76 +958,6 @@ impl FingerprintingTlsAcceptor {
         self
     }
 
-    /// Extract the SNI hostname from a raw TLS ClientHello record.
-    ///
-    /// Parses the SNI extension (type 0x0000) and returns the first `host_name`
-    /// entry as a UTF-8 string.  Returns `None` if SNI is absent, malformed, or
-    /// the data is too short to parse.
-    pub(crate) fn extract_sni(data: &[u8]) -> Option<String> {
-        // TLS record header: 5 bytes.  Handshake header: 4 bytes.
-        if data.len() < 9 {
-            return None;
-        }
-        let ch = &data[9..]; // ClientHello body starts here
-        if ch.len() < 34 {
-            return None;
-        }
-        // Skip legacy_version (2) + random (32)
-        let mut off = 34usize;
-        // Session ID
-        if off >= ch.len() {
-            return None;
-        }
-        let sid_len = ch[off] as usize;
-        off = off.saturating_add(1 + sid_len);
-        // Cipher suites
-        if off + 2 > ch.len() {
-            return None;
-        }
-        let cs_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
-        off = off.saturating_add(2 + cs_len);
-        // Compression methods
-        if off >= ch.len() {
-            return None;
-        }
-        let cm_len = ch[off] as usize;
-        off = off.saturating_add(1 + cm_len);
-        // Extensions block
-        if off + 2 > ch.len() {
-            return None;
-        }
-        let ext_total = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
-        off += 2;
-        let ext_end = off.saturating_add(ext_total);
-        if ext_end > ch.len() {
-            return None;
-        }
-        // Walk extensions looking for SNI (type 0x0000)
-        while off + 4 <= ext_end {
-            let ext_type = u16::from_be_bytes([ch[off], ch[off + 1]]);
-            let ext_len = u16::from_be_bytes([ch[off + 2], ch[off + 3]]) as usize;
-            off += 4;
-            if ext_type == 0x0000 {
-                // SNI extension: 2 bytes list_length, 1 byte name_type, 2 bytes name_length, N bytes name
-                if off + 5 > ext_end {
-                    return None;
-                }
-                let name_type = ch[off + 2];
-                if name_type != 0x00 {
-                    return None; // only host_name (0x00) is supported
-                }
-                let name_len = u16::from_be_bytes([ch[off + 3], ch[off + 4]]) as usize;
-                let name_off = off + 5;
-                if name_off + name_len > ch.len() {
-                    return None;
-                }
-                return String::from_utf8(ch[name_off..name_off + name_len].to_vec()).ok();
-            }
-            off = off.saturating_add(ext_len);
-        }
-        None
-    }
-
     /// SEC-002: Scan a raw ClientHello record for the TLS 1.3 `early_data`
     /// extension (type 0x002a, RFC 8446 §4.2.10).  Returns true if the client
     /// offered early data, regardless of whether the server will accept it.
@@ -1035,7 +1056,7 @@ impl FingerprintingTlsAcceptor {
         // the client is connecting to a host that must not use HTTP/2.  This
         // prevents the browser from coalescing all parallel fetch() streams onto
         // a single HTTP/2 TCP connection (which would stall all streams together).
-        let sni = Self::extract_sni(&peek_buf[..peek_len]);
+        let sni = client_hello_server_name(&peek_buf[..peek_len]);
         let use_http11_only = sni
             .as_deref()
             .map(|name| {
@@ -1196,7 +1217,7 @@ mod tests {
             let _ = client_hello_extension(m, 41);
             let _ = client_hello_extension(m, 0);
             let _ = client_hello_psk_identity(m);
-            let _ = FingerprintingTlsAcceptor::extract_sni(m);
+            let _ = client_hello_server_name(m);
             let _ = FingerprintingTlsAcceptor::client_hello_has_early_data_extension(m);
             let _ = store.check(m);
             let _ = !strict.accepts_early_data(m);
@@ -1429,6 +1450,118 @@ mod tests {
         rec.extend_from_slice(&u16::try_from(hs.len()).unwrap().to_be_bytes());
         rec.extend_from_slice(&hs);
         rec
+    }
+
+    /// A signature_algorithms extension (ecdsa_secp256r1_sha256,
+    /// rsa_pss_rsae_sha256): rustls takes no ClientHello without one.
+    fn sigalgs() -> (u16, Vec<u8>) {
+        (13, b"\x00\x04\x04\x03\x08\x04".to_vec())
+    }
+
+    /// A server_name extension body: `names` as `(name_type, name)` entries,
+    /// its list length as given or as the entries need.
+    fn sni_body(names: &[(u8, &[u8])], list_len: Option<u16>) -> Vec<u8> {
+        let mut list = Vec::new();
+        for (ty, name) in names {
+            list.push(*ty);
+            list.extend_from_slice(&u16::try_from(name.len()).unwrap().to_be_bytes());
+            list.extend_from_slice(name);
+        }
+        let len = list_len.unwrap_or_else(|| u16::try_from(list.len()).unwrap());
+        let mut body = len.to_be_bytes().to_vec();
+        body.extend_from_slice(&list);
+        body
+    }
+
+    /// What the proxy reads as SNI before the handshake is what the handshake
+    /// reads, in every case RFC 6066 and rustls define.
+    #[test]
+    fn the_sni_read_before_the_handshake_is_the_handshakes() {
+        let cases: Vec<(Vec<u8>, Option<&str>)> = vec![
+            (sni_body(&[(0, b"example.com")], None), Some("example.com")),
+            (
+                sni_body(&[(0, b"Api.PQCrypta.COM")], None),
+                Some("api.pqcrypta.com"),
+            ),
+            // An IP address is no name (RFC 6066 permits none)
+            (sni_body(&[(0, b"192.0.2.1")], None), None),
+            // An unknown name type ends the list: its encoding is unknown
+            (
+                sni_body(&[(0, b"example.com"), (7, b"x")], None),
+                Some("example.com"),
+            ),
+        ];
+        for (i, (body, want)) in cases.iter().enumerate() {
+            let record = client_hello(9, &[(0, body.clone()), sigalgs()]);
+            assert_eq!(
+                client_hello_server_name(&record).as_deref(),
+                *want,
+                "case {i}"
+            );
+            assert_eq!(
+                handshake_server_name(&record),
+                HandshakeReads::ServerName(want.map(str::to_owned)),
+                "case {i}: rustls reads the same"
+            );
+        }
+        // Malformed: rustls refuses these handshakes, and nothing is read
+        // from them before it either
+        for body in [
+            sni_body(&[(0, b"exa\0mple.com")], None),
+            sni_body(&[(0, b"exa mple.com")], None),
+            sni_body(&[(0, b"example.com"), (0, b"other.example")], None),
+            sni_body(&[(0, b"example.com")], Some(4)),
+            sni_body(&[(0, b"example.com")], Some(40)),
+            sni_body(&[(0, b"")], None),
+            sni_body(&[], None),
+        ] {
+            let record = client_hello(9, &[(0, body.clone()), sigalgs()]);
+            assert_eq!(client_hello_server_name(&record), None, "{body:?}");
+            assert_eq!(
+                handshake_server_name(&record),
+                HandshakeReads::NoClientHello,
+                "{body:?}"
+            );
+        }
+        // The input the fuzzer found the two old readers disagreeing on: a
+        // server_name extension running past the extensions block
+        let found = include_bytes!("../fuzz/seeds/client_hello/sni-extension-overrun");
+        assert_eq!(client_hello_server_name(found), None);
+    }
+
+    /// Mutations of a ClientHello: wherever rustls takes one as a ClientHello,
+    /// the proxy reads the server name it reads.
+    #[test]
+    fn mutated_client_hellos_name_the_server_the_handshake_names() {
+        let record = client_hello(
+            7,
+            &[
+                (0, sni_body(&[(0, b"example.com")], None)),
+                (16, b"\x00\x03\x02h2".to_vec()),
+                (43, b"\x02\x03\x04".to_vec()),
+                sigalgs(),
+            ],
+        );
+        // and one OpenSSL sent (ML-KEM key share, SNI, ALPN)
+        let openssl = include_bytes!("../fuzz/seeds/client_hello/openssl-mlkem-sni-alpn.bin");
+        for seed in [record.as_slice(), openssl.as_slice()] {
+            let HandshakeReads::ServerName(Some(named)) = handshake_server_name(seed) else {
+                panic!("rustls takes the seed as a ClientHello naming a server");
+            };
+            assert_eq!(client_hello_server_name(seed), Some(named));
+            let compared = std::cell::Cell::new(0usize);
+            crate::fuzz_support::fuzz_bytes(seed, 100_000, |m| {
+                if let HandshakeReads::ServerName(theirs) = handshake_server_name(m) {
+                    compared.set(compared.get() + 1);
+                    assert_eq!(client_hello_server_name(m), theirs, "{m:02x?}");
+                }
+            });
+            assert!(
+                compared.get() > 1_000,
+                "{} mutations compared",
+                compared.get()
+            );
+        }
     }
 
     /// A pre_shared_key extension body naming one ticket.

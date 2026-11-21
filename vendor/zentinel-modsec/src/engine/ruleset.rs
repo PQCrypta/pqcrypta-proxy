@@ -432,9 +432,10 @@ fn apply_target_updates(ruleset: &mut CompiledRuleset, updates: &[UpdateTargetBy
                         .retain(|var| !variable_matches_target(var, replaced));
                 }
                 for exclusion in &update.exclusions {
+                    let parsed = crate::parser::TargetExclusion::parse(exclusion);
                     for var in rule.variables.iter_mut() {
-                        if !var.exclusions.iter().any(|e| e == exclusion) {
-                            var.exclusions.push(exclusion.clone());
+                        if !var.exclusions.iter().any(|e| e.text == *exclusion) {
+                            var.exclusions.push(parsed.clone());
                         }
                     }
                 }
@@ -526,7 +527,7 @@ fn report_unsupported_xml_selectors(variables: &[VariableSpec], rule_id: &Option
         }
         let selector = match &var.selection {
             Some(Selection::Key(k)) => k.clone(),
-            Some(Selection::Regex(r)) => format!("/{r}/"),
+            Some(Selection::Regex(r)) => format!("/{}/", r.as_str()),
             None => String::new(),
         };
         tracing::warn!(

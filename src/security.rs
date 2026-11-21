@@ -1900,9 +1900,9 @@ impl SecurityState {
 
     /// The WAF's verdict on a request whose head [`Self::evaluate_head`]
     /// left pending, now that its body (`view.body`) is in hand: the body is
-    /// read and added to what the head scored. A body over
-    /// [`LONG_BODY_SCAN`] is read with the worker handed to the runtime's
-    /// other tasks (see [`Self::inspect_body`]).
+    /// read and added to what the head scored. A long body
+    /// ([`WafEngine::body_scan_is_long`]) is read with the worker handed to the
+    /// runtime's other tasks (see [`Self::inspect_body`]).
     pub fn inspect_rest(
         &self,
         mut pending: PendingWaf,
@@ -1914,7 +1914,9 @@ impl SecurityState {
         };
         let (engine, is_pentest) = (Arc::clone(&pending.engine), pending.is_pentest);
         let req = self.waf_request(view, policy, is_pentest);
-        let long = view.body.is_some_and(|body| body.len() > LONG_BODY_SCAN);
+        let long = view
+            .body
+            .is_some_and(|body| engine.body_scan_is_long(body.len()));
         let verdict = if long && on_multi_thread_runtime() {
             tokio::task::block_in_place(|| engine.inspect_rest(head, &req))
         } else {
@@ -1945,17 +1947,21 @@ impl SecurityState {
     /// request during [`Self::evaluate`], and charging them twice for one
     /// request would halve every configured limit.
     ///
-    /// The WAF reads a whole body, at some hundreds of MiB a second: a body
-    /// over [`LONG_BODY_SCAN`] is read with its worker thread handed over to
-    /// the runtime's other tasks for the length of it, so the connections
-    /// that worker serves are not held while it reads.
+    /// The WAF reads a whole body: a long one
+    /// ([`WafEngine::body_scan_is_long`]: over [`LONG_BODY_SCAN`](crate::waf::LONG_BODY_SCAN), or less
+    /// where CRS reads it) is read with its worker thread handed over to the
+    /// runtime's other tasks for the length of it, so the connections that
+    /// worker serves are not held while it reads.
     pub fn inspect_body(
         &self,
         view: &SecurityRequestView<'_>,
         policy: &RequestPolicy,
         is_pentest: bool,
     ) -> SecurityDecision {
-        let long = view.body.is_some_and(|body| body.len() > LONG_BODY_SCAN);
+        let long = view.body.is_some_and(|body| {
+            self.waf()
+                .is_some_and(|waf| waf.body_scan_is_long(body.len()))
+        });
         if long && on_multi_thread_runtime() {
             tokio::task::block_in_place(|| self.run_waf(view, policy, is_pentest))
         } else {
@@ -2711,10 +2717,6 @@ fn on_multi_thread_runtime() -> bool {
     tokio::runtime::Handle::try_current()
         .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
 }
-
-/// A body longer than this is inspected off the async worker (see
-/// `SecurityState::inspect_body`): about 3 to 7 ms of the WAF's reading.
-const LONG_BODY_SCAN: usize = 1024 * 1024;
 
 /// One request's place in its client address's in-flight count
 /// (`security.max_connections_per_ip`).

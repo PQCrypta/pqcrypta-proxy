@@ -1,7 +1,7 @@
 //! TX (transaction) collection.
 
 use super::collection::{Collection, HashMapCollection, MutableCollection};
-use regex::Regex;
+use super::KeyRegex;
 use std::borrow::Cow;
 
 /// Transaction collection for storing intermediate values.
@@ -51,7 +51,7 @@ impl Collection for TxCollection {
 
     /// Regex selection (`TX:/^foo/`) matches against the stored, lowercased
     /// key, so a pattern anchored on uppercase will not match.
-    fn get_regex(&self, pattern: &Regex) -> Vec<(&str, &str)> {
+    fn get_regex(&self, pattern: &KeyRegex) -> Vec<(&str, &str)> {
         self.data.get_regex(pattern)
     }
 

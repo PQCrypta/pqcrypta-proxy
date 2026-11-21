@@ -78,6 +78,14 @@ The changes from that commit:
   matched rule's `msg` and `logdata` with their macros expanded at the match,
   `nolog` honoured, in ModSecurity's log form and escaping (`log_escape`);
   `Transaction::request_body_error` gives `REQBODY_ERROR_MSG`.
+- **Key-selection regexes** (`ARGS:/^user/`, `!REQUEST_COOKIES:/__utm/`,
+  the targets of `ctl:ruleRemoveTarget*`; `src/variables/key_regex.rs`):
+  compiled once as the rule is read and shared, matched as ModSecurity v3
+  matches them (bytes, PCRE without UTF: ASCII letters fold, nothing else
+  does). They were looked up and cloned per resolved value, and a cloned
+  `regex::Regex` starts with an empty cache pool: a 1,000-argument body under
+  a `ctl:ruleRemoveTargetByTag` with an expression took ~0.2 s more. Rule
+  exclusions (`!TARGET`) are parsed with the rule (`TargetExclusion`).
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
