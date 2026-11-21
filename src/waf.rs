@@ -1383,7 +1383,30 @@ pub struct WafCrsExplanation {
     pub mode: String,
 }
 
+/// A body longer than this is inspected off the async worker (see
+/// [`WafEngine::body_scan_is_long`]): about 3 to 7 ms of the native rules'
+/// reading.
+pub(crate) const LONG_BODY_SCAN: usize = 1024 * 1024;
+
+/// The same where CRS reads the body: it runs each of its rules over every
+/// argument the body holds, so cost follows the number of arguments, which a
+/// 16 KiB form or JSON body already has a hundred or more of.
+pub(crate) const CRS_LONG_BODY_SCAN: usize = 16 * 1024;
+
 impl WafEngine {
+    /// Whether reading a body of `len` bytes takes long enough that the worker
+    /// thread's other tasks are handed over first (`block_in_place`).
+    ///
+    /// The native rules read some hundreds of MiB a second, so for them only a
+    /// body over [`LONG_BODY_SCAN`] is long. CRS runs each of its rules over
+    /// every argument a body holds (each JSON value, each form field): a
+    /// discovery agent's batch of 1,000 arguments, about 150 KiB, took tens of
+    /// milliseconds inline, and every other task on that worker waited, a
+    /// rate-limit reply from Redis among them, which then timed out.
+    pub fn body_scan_is_long(&self, len: usize) -> bool {
+        len > LONG_BODY_SCAN || (self.crs.is_some() && len > CRS_LONG_BODY_SCAN)
+    }
+
     /// Whether a request body with a content coding is decoded to be read
     /// (`waf.decode_compressed_body`), and then forwarded decoded.
     pub fn decodes_bodies(&self) -> bool {
