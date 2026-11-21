@@ -34,7 +34,7 @@ pub use directive::{
 pub use lexer::{Lexer, Token, TokenKind};
 pub use operator::{OperatorName, OperatorSpec};
 pub(crate) use variable::parse_single_variable;
-pub use variable::{Selection, VariableName, VariableSpec, XmlTarget};
+pub use variable::{Selection, TargetExclusion, VariableName, VariableSpec, XmlTarget};
 
 use crate::error::{Error, Result, SourceLocation};
 use std::collections::HashMap;

@@ -1,7 +1,7 @@
 //! Collection trait and implementations.
 
+use super::KeyRegex;
 use indexmap::IndexMap;
-use regex::Regex;
 
 /// A collection of key-value pairs.
 pub trait Collection: Send + Sync {
@@ -12,7 +12,7 @@ pub trait Collection: Send + Sync {
     fn get(&self, key: &str) -> Option<Vec<&str>>;
 
     /// Get values matching a regex pattern.
-    fn get_regex(&self, pattern: &Regex) -> Vec<(&str, &str)>;
+    fn get_regex(&self, pattern: &KeyRegex) -> Vec<(&str, &str)>;
 
     /// Count items.
     fn count(&self) -> usize;
@@ -84,7 +84,7 @@ impl Collection for HashMapCollection {
             .map(|vs| vs.iter().map(|s| s.as_str()).collect())
     }
 
-    fn get_regex(&self, pattern: &Regex) -> Vec<(&str, &str)> {
+    fn get_regex(&self, pattern: &KeyRegex) -> Vec<(&str, &str)> {
         self.data
             .iter()
             .filter(|(k, _)| pattern.is_match(k))

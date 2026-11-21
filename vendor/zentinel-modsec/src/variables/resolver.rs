@@ -2,42 +2,6 @@
 
 use super::{RequestData, ResponseData, TxCollection};
 use crate::parser::{Selection, VariableName, VariableSpec, XmlTarget};
-use once_cell::sync::Lazy;
-use regex::Regex;
-use std::collections::HashMap;
-use std::sync::RwLock;
-
-/// Compile a regex written in rule text (an `ARGS:/.../` selection or a
-/// `!ARGS:/.../` exclusion), once per pattern.
-///
-/// These used to be compiled on every evaluation, once per resolved key for an
-/// exclusion. Compiling costs orders of magnitude more than matching: CRS
-/// 942431's two `!ARGS_NAMES:/.../` exclusions took ~5.5ms per request on
-/// clean traffic, for patterns that never change.
-///
-/// Patterns come only from loaded rules, so the cache is bounded by the rule
-/// set. A pattern that does not compile is cached as `None` and never matches,
-/// as before. `Regex` clones share the compiled program.
-fn cached_regex(pattern: &str) -> Option<Regex> {
-    static CACHE: Lazy<RwLock<HashMap<String, Option<Regex>>>> = Lazy::new(Default::default);
-    if let Some(hit) = CACHE.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
-        return hit.clone();
-    }
-    // Case-insensitive, as a key selection is: collection keys are, in
-    // ModSecurity, and TX keys are stored lowercased, so CRS's 922110 reading
-    // `TX:/MULTIPART_HEADERS_CONTENT_TYPES_*/` found none of the keys its
-    // 922150 sets
-    let compiled = regex::RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .build()
-        .ok();
-    CACHE
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(pattern.to_string())
-        .or_insert(compiled)
-        .clone()
-}
 
 /// Variable resolver for transaction context.
 pub struct VariableResolver<'a> {
@@ -82,7 +46,7 @@ impl<'a> VariableResolver<'a> {
         } else {
             values
                 .into_iter()
-                .filter(|(k, _)| !spec.exclusions.iter().any(|e| exclusion_matches(k, e)))
+                .filter(|(k, _)| !spec.exclusions.iter().any(|e| e.matches(k)))
                 .collect()
         }
     }
@@ -431,17 +395,11 @@ impl<'a> VariableResolver<'a> {
                     vec![]
                 }
             }
-            Some(Selection::Regex(pattern)) => {
-                if let Some(re) = cached_regex(pattern) {
-                    collection
-                        .get_regex(&re)
-                        .into_iter()
-                        .map(|(k, v)| (format!("{}:{}", prefix, k), v.to_string()))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
+            Some(Selection::Regex(pattern)) => collection
+                .get_regex(pattern)
+                .into_iter()
+                .map(|(k, v)| (format!("{}:{}", prefix, k), v.to_string()))
+                .collect(),
             None => collection
                 .all()
                 .into_iter()
@@ -535,9 +493,7 @@ impl<'a> VariableResolver<'a> {
             for (key, _) in collection.all() {
                 let selected = match selection {
                     Some(Selection::Key(sel)) => key.eq_ignore_ascii_case(sel),
-                    Some(Selection::Regex(pattern)) => cached_regex(pattern)
-                        .map(|re| re.is_match(key))
-                        .unwrap_or(false),
+                    Some(Selection::Regex(pattern)) => pattern.is_match(key),
                     None => true,
                 };
                 if selected {
@@ -563,17 +519,12 @@ impl<'a> VariableResolver<'a> {
                     vec![]
                 }
             }
-            Some(Selection::Regex(pattern)) => {
-                if let Some(re) = cached_regex(pattern) {
-                    self.tx
-                        .get_regex(&re)
-                        .into_iter()
-                        .map(|(k, v)| (format!("TX:{}", k), v.to_string()))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            }
+            Some(Selection::Regex(pattern)) => self
+                .tx
+                .get_regex(pattern)
+                .into_iter()
+                .map(|(k, v)| (format!("TX:{}", k), v.to_string()))
+                .collect(),
             None => self
                 .tx
                 .all()
@@ -584,79 +535,45 @@ impl<'a> VariableResolver<'a> {
     }
 }
 
-/// Check whether a resolved variable key (e.g. `ARGS:password`) is excluded by
-/// a target exclusion (`!TARGET` in a rule's variable list or in
-/// `SecRuleUpdateTargetById`).
-///
-/// Supported exclusion forms, per ModSecurity:
-/// - `COLLECTION:key` — excludes that member (key compared case-insensitively);
-/// - `COLLECTION:/regex/` — excludes members whose key matches the regex;
-/// - `COLLECTION` — excludes the entire collection.
-fn exclusion_matches(key: &str, exclusion: &str) -> bool {
-    match exclusion.split_once(':') {
-        Some((excl_coll, excl_sel)) => {
-            let Some((key_coll, key_member)) = key.split_once(':') else {
-                return false;
-            };
-            if !key_coll.eq_ignore_ascii_case(excl_coll) {
-                return false;
-            }
-            if excl_sel.len() > 2 && excl_sel.starts_with('/') && excl_sel.ends_with('/') {
-                cached_regex(&excl_sel[1..excl_sel.len() - 1])
-                    .map(|re| re.is_match(key_member))
-                    .unwrap_or(false)
-            } else {
-                key_member.eq_ignore_ascii_case(excl_sel)
-            }
-        }
-        None => {
-            let key_coll = key.split_once(':').map(|(c, _)| c).unwrap_or(key);
-            key_coll.eq_ignore_ascii_case(exclusion)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cached_regex, exclusion_matches};
+    use crate::parser::TargetExclusion;
+
+    fn excluded(resolved: &str, exclusion: &str) -> bool {
+        TargetExclusion::parse(exclusion).matches(resolved)
+    }
 
     #[test]
-    fn test_cached_regex_compiles_once_and_keeps_invalid_patterns_dead() {
-        let a = cached_regex(r"^user_\d+$").expect("valid pattern");
-        let b = cached_regex(r"^user_\d+$").expect("valid pattern");
-        assert!(a.is_match("user_42") && b.is_match("user_42"));
-        // An invalid pattern stays a never-matching selection, cached or not.
-        assert!(cached_regex("(unclosed").is_none());
-        assert!(cached_regex("(unclosed").is_none());
-        assert!(!exclusion_matches("ARGS:x", "ARGS:/(unclosed/"));
+    fn test_invalid_exclusion_regex_excludes_nothing() {
+        assert!(!excluded("ARGS:x", "ARGS:/(unclosed/"));
+        assert!(!excluded("ARGS:(unclosed", "ARGS:/(unclosed/"));
     }
 
     #[test]
     fn test_exclusion_exact_key() {
-        assert!(exclusion_matches("ARGS:password", "ARGS:password"));
-        assert!(exclusion_matches("ARGS:Password", "ARGS:password"));
+        assert!(excluded("ARGS:password", "ARGS:password"));
+        assert!(excluded("ARGS:Password", "ARGS:password"));
         // Must NOT be a prefix/substring match.
-        assert!(!exclusion_matches("ARGS:password2", "ARGS:password"));
-        assert!(!exclusion_matches("ARGS:xpassword", "ARGS:password"));
+        assert!(!excluded("ARGS:password2", "ARGS:password"));
+        assert!(!excluded("ARGS:xpassword", "ARGS:password"));
         // Different collection.
-        assert!(!exclusion_matches(
-            "REQUEST_COOKIES:password",
-            "ARGS:password"
-        ));
+        assert!(!excluded("REQUEST_COOKIES:password", "ARGS:password"));
+        // A keyed exclusion cannot select a scalar variable.
+        assert!(!excluded("ARGS", "ARGS:password"));
     }
 
     #[test]
     fn test_exclusion_regex_key() {
         // CRS pattern: SecRuleUpdateTargetById 941100 "!REQUEST_COOKIES:/^_ga(?:_\w+)?$/"
-        assert!(exclusion_matches(
+        assert!(excluded(
             "REQUEST_COOKIES:_ga_ABC123",
             r"REQUEST_COOKIES:/^_ga(?:_\w+)?$/"
         ));
-        assert!(exclusion_matches(
-            "REQUEST_COOKIES:_ga",
+        assert!(excluded(
+            "REQUEST_COOKIES:_GA",
             r"REQUEST_COOKIES:/^_ga(?:_\w+)?$/"
         ));
-        assert!(!exclusion_matches(
+        assert!(!excluded(
             "REQUEST_COOKIES:session",
             r"REQUEST_COOKIES:/^_ga(?:_\w+)?$/"
         ));
@@ -664,7 +581,8 @@ mod tests {
 
     #[test]
     fn test_exclusion_whole_collection() {
-        assert!(exclusion_matches("ARGS:anything", "ARGS"));
-        assert!(!exclusion_matches("ARGS_NAMES:anything", "ARGS"));
+        assert!(excluded("ARGS:anything", "ARGS"));
+        assert!(excluded("ARGS", "ARGS"));
+        assert!(!excluded("ARGS_NAMES:anything", "ARGS"));
     }
 }

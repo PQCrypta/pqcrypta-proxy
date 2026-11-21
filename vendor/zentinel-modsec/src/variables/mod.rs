@@ -4,6 +4,7 @@
 
 mod collection;
 mod json;
+mod key_regex;
 pub mod multipart;
 mod request;
 mod resolver;
@@ -11,6 +12,7 @@ mod response;
 mod tx;
 
 pub use collection::{Collection, HashMapCollection, MutableCollection};
+pub use key_regex::KeyRegex;
 pub use request::RequestData;
 pub use resolver::VariableResolver;
 pub use response::ResponseData;
