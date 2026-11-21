@@ -203,6 +203,36 @@ fn load(dir: &Path, extra: &str) -> ModSecurity {
     ModSecurity::from_string(&cfg).expect("CRS should load")
 }
 
+/// A chunked body's data (RFC 9112 section 7.1): each chunk's size line in
+/// hex, its data, to the zero-size chunk. Line endings CRLF or LF.
+fn dechunk(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let Some((line, after)) = rest.split_once('\n') else {
+            break;
+        };
+        let size = line
+            .trim_end_matches('\r')
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            break;
+        };
+        if size == 0 || after.len() < size {
+            out.push_str(&after[..size.min(after.len())]);
+            break;
+        }
+        out.push_str(&after[..size]);
+        rest = after[size..]
+            .trim_start_matches('\r')
+            .trim_start_matches('\n');
+    }
+    out
+}
+
 /// go-ftw's `methodsWithBodyRegex`, `^POST|PUT|PATCH|DELETE$`, alternation
 /// and all.
 fn body_method(m: &str) -> bool {
@@ -312,6 +342,25 @@ fn drive_stage(m: &ModSecurity, input: &Input) -> zentinel_modsec::engine::Trans
         if !has(&headers, "Content-Length") && (!body.is_empty() || body_method(&method)) {
             headers.push(("Content-Length".into(), body.len().to_string()));
         }
+    }
+    // What the server makes of it before any module sees it (RFC 9112
+    // framing, as Apache, the corpus's reference, and pqcrypta-proxy's HTTP
+    // stack both apply it): a field holding CR or LF is a request refused;
+    // chunked framing drops Content-Length and the body is de-chunked; with
+    // neither, an HTTP/1 request has no body.
+    if headers
+        .iter()
+        .any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n']))
+    {
+        return tx;
+    }
+    let chunked = header(&headers, "Transfer-Encoding")
+        .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"));
+    if chunked {
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("Content-Length"));
+        body = dechunk(&body);
+    } else if !has(&headers, "Content-Length") && !version.starts_with("HTTP/2") {
+        body.clear();
     }
     for (k, v) in &headers {
         let _ = tx.add_request_header(k, v);

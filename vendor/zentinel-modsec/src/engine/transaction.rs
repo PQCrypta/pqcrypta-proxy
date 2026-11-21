@@ -1019,16 +1019,23 @@ impl Transaction {
                     }
                     _ => {}
                 }
-                let (collection, name) = match inner.split_once('.') {
-                    Some((c, n)) => (c.to_ascii_lowercase(), n),
-                    None => ("tx".to_string(), inner),
-                };
-                match collection.as_str() {
-                    "tx" => self
-                        .tx
+                let tx_value = |name: &str| {
+                    self.tx
                         .get(name)
                         .and_then(|v| v.first().map(|s| s.to_string()))
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                };
+                let (collection, name) = match inner.split_once('.') {
+                    Some((c, n)) => (c.to_ascii_lowercase(), n),
+                    // A bare name is a variable (`%{REQUEST_METHOD}`), or
+                    // else a TX key
+                    None => match self.macro_variable(&inner.to_ascii_uppercase()) {
+                        Some(v) => return v,
+                        None => return tx_value(inner),
+                    },
+                };
+                match collection.as_str() {
+                    "tx" => tx_value(name),
                     // CRS 943110: `!@endsWith %{request_headers.host}`.
                     "request_headers" => self
                         .request
@@ -1036,10 +1043,41 @@ impl Transaction {
                         .get(&name.to_ascii_lowercase())
                         .and_then(|v| v.first().map(|s| s.to_string()))
                         .unwrap_or_default(),
-                    _ => String::new(),
+                    // Any other collection member, as ModSecurity expands any
+                    // variable: CRS 920650 compares REQUEST_METHOD with
+                    // `%{ARGS._method}`
+                    other => self
+                        .macro_variable(&format!("{}:{}", other.to_ascii_uppercase(), name))
+                        .unwrap_or_default(),
                 }
             })
             .into_owned()
+    }
+
+    /// The first value of a variable written as a rule target (`ARGS:_method`,
+    /// `REQUEST_METHOD`), for a macro. `None` when the name is not a variable
+    /// this engine resolves.
+    fn macro_variable(&self, target: &str) -> Option<String> {
+        let spec = crate::parser::parse_single_variable(target).ok()?;
+        if !spec.name.is_implemented() {
+            return None;
+        }
+        let resolver = VariableResolver::new(
+            &self.request,
+            &self.response,
+            &self.tx,
+            self.matched_vars.last().map(|(_, value)| value.as_str()),
+            &self.matched_vars,
+            &self.captures,
+        );
+        Some(
+            resolver
+                .resolve(&spec)
+                .into_iter()
+                .next()
+                .map(|(_, v)| v)
+                .unwrap_or_default(),
+        )
     }
 
     /// Publish the captures of a `capture` rule as `TX:0`..`TX:9`.
