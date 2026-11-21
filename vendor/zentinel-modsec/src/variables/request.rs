@@ -94,9 +94,8 @@ impl RequestData {
     /// `REQUEST_FILENAME` and `REQUEST_BASENAME` are `%XX`-decoded
     /// (`uri_decode`: `+` kept, an invalid escape kept), without any
     /// fragment; `QUERY_STRING` stays raw, its arguments form-decoded. CRS's
-    /// path rules apply no URL decoding of their own (932130's
-    /// `REQUEST_FILENAME`, `t:cmdLine` alone), so a path read raw hid
-    /// `%24%28...%29` from them.
+    /// path rules expect the decoded path and apply no URL decoding of their
+    /// own (932130's `REQUEST_FILENAME`, `t:cmdLine` alone).
     pub fn set_uri(&mut self, uri: &str) {
         self.uri_raw = uri.to_string();
         let uri = uri.split('#').next().unwrap_or_default();

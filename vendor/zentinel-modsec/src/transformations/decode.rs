@@ -6,13 +6,8 @@ use std::borrow::Cow;
 /// ModSecurity's non-strict URL decoding, on bytes: `%XX` decoded, an
 /// invalid or truncated escape kept as it is, `+` to a space, and with
 /// `unicode`, `%uXXXX` too (full-width ASCII folded to ASCII). `None` when
-/// nothing changed.
-///
-/// The decoders this replaces decoded through UTF-8 and gave the input back
-/// unchanged when the result was not UTF-8: one `%ff` anywhere in a value
-/// turned decoding off for all of it. And neither turned `+` into a space,
-/// which CRS's rules expect of both (932200 reads a command's arguments
-/// after `t:urlDecodeUni`).
+/// nothing changed. CRS's rules expect `+` as a space from both (932200
+/// reads a command's arguments after `t:urlDecodeUni`).
 fn url_decode(input: &str, unicode: bool) -> Option<String> {
     fn hex(c: u8) -> Option<u8> {
         (c as char).to_digit(16).map(|d| d as u8)

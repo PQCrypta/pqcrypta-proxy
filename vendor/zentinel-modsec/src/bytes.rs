@@ -1,10 +1,7 @@
 //! Text from bytes that need not be UTF-8.
 //!
 //! A request carries bytes; rules match text, and this engine's values are
-//! `String`s. Decoding replaced every byte that was not UTF-8 with U+FFFD,
-//! so `@validateUtf8Encoding` could never see an invalid sequence (an
-//! overlong `%c0%af` for `/` arrived as two replacement characters) and
-//! `@validateByteRange` never saw the byte. Here each such byte becomes one
+//! `String`s. Each byte that is not part of valid UTF-8 becomes one
 //! private-use character, U+F700 plus the byte (U+F780..U+F7FF, since only
 //! bytes from 0x80 can be invalid), which the operators that judge bytes
 //! read back as the byte it stands for.

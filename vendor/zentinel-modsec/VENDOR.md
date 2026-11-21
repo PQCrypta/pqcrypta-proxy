@@ -48,30 +48,24 @@ The changes from that commit:
   read as bytes line by line, part headers and Content-Disposition parsed as
   strictly (quoting, `filename*`, duplicates, folding), and the flags
   behind `MULTIPART_STRICT_ERROR` and the other `MULTIPART_*` variables,
-  which resolved to nothing before (a rule like 200003 could never fire),
   with `FILES_SIZES` and `FILES_COMBINED_SIZE`. Two departures: an empty
-  boundary is an error, where v3 stops silently and leaves the body
-  uninspected; and the file limit is never reached, since v3 checks it only
-  when writing uploads to disk, which this engine never does.
+  boundary is an error, and the file limit is never reached, since v3
+  checks it only when writing uploads to disk, which this engine never does.
 - **URL decoding as ModSecurity's** (`t:urlDecode`, `t:urlDecodeUni`): on
   bytes, non-strict (an invalid escape kept), and `+` to a space, as v2's
   `urldecode_nonstrict_inplace_ex` / `urldecode_uni_nonstrict_inplace_ex`
-  and v3's `url_decode_uni.cc` do. The decoder before went through UTF-8 and
-  gave the input back unchanged when the result was not UTF-8, so a single
-  `%ff` turned `t:urlDecode` off for a whole value. CRS's corpus has three
+  and v3's `url_decode_uni.cc` do. CRS's corpus has three
   cases (934160 test 4, 942500 tests 3 and 4) that expect a `%2B` to survive
   `t:urlDecodeUni`; under ModSecurity's decoding it cannot, and they fail
   here as they would there.
 - **The path variables as libmodsecurity v3's `processURI` sets them**:
   `REQUEST_URI`, `REQUEST_FILENAME` and `REQUEST_BASENAME` are `%XX`-decoded
   (`uri_decode`: `+` and invalid escapes kept), `REQUEST_URI_RAW`,
-  `REQUEST_LINE` and `QUERY_STRING` are not. CRS's path rules apply no URL
-  decoding of their own, so a path read raw hid `/%24%28id%29` from them.
+  `REQUEST_LINE` and `QUERY_STRING` are not, as CRS's path rules expect.
 - **Bytes that are not UTF-8 kept as themselves** (`src/bytes.rs`): each
   becomes one private-use character (U+F780..U+F7FF) instead of U+FFFD, in
-  every decoder, so `@validateUtf8Encoding` finds an overlong `%c0%af` or a
-  truncated sequence (and no longer calls a NUL invalid), and
-  `@validateByteRange` judges the byte itself.
+  every decoder, which `@validateUtf8Encoding` and `@validateByteRange`
+  read as the bytes they are; a NUL is valid UTF-8, as in ModSecurity.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
