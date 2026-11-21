@@ -125,6 +125,8 @@ pub struct RuleMetadata {
     pub rev: Option<String>,
     /// Version.
     pub ver: Option<String>,
+    /// `nolog`: the rule's match is not logged (no message).
+    pub nolog: bool,
 }
 
 /// Execute actions and collect results.
@@ -278,13 +280,12 @@ fn execute_metadata(action: &MetadataAction, metadata: &mut RuleMetadata) {
 }
 
 /// Execute a logging action.
-fn execute_logging(action: &LoggingAction, _metadata: &mut RuleMetadata) {
+fn execute_logging(action: &LoggingAction, metadata: &mut RuleMetadata) {
     match action {
-        LoggingAction::Log
-        | LoggingAction::NoLog
-        | LoggingAction::AuditLog
-        | LoggingAction::NoAuditLog => {
-            // Logging flags handled elsewhere
+        LoggingAction::Log => metadata.nolog = false,
+        LoggingAction::NoLog => metadata.nolog = true,
+        LoggingAction::AuditLog | LoggingAction::NoAuditLog => {
+            // The audit log is the embedding application's
         }
         LoggingAction::SanitiseMatched | LoggingAction::SanitizeMatched => {
             // Sanitization not implemented yet

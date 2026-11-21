@@ -180,65 +180,151 @@ impl Transformation for TrimRight {
     }
 }
 
-/// Normalize path transformation (Unix-style).
+/// libmodsecurity v3's `normalize_path_inplace` (`normalise_path.cc`,
+/// Apache-2.0, Copyright (c) 2015 - 2021 Trustwave Holdings, Inc.), ported
+/// step for step on bytes: empty segments and self-references dropped, a
+/// back-reference removes the segment before it, a relative path keeps the
+/// back-references it cannot resolve (`../.history` stays), and with `win`
+/// a backslash is a separator. Returns whether anything changed.
+fn normalize_path_inplace(val: &mut Vec<u8>, win: bool) -> bool {
+    enum Step {
+        Normalize,
+        Copy,
+        SkipCopy,
+    }
+    if val.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let end = val.len() - 1;
+    let relative = !(val[0] == b'/' || (win && val[0] == b'\\'));
+    let trailing = val[end] == b'/' || (win && val[end] == b'\\');
+    let (mut src, mut dst) = (0usize, 0usize);
+    let (mut hitroot, mut done) = (false, false);
+
+    while !done && src <= end && dst <= end {
+        // Convert backslash to forward slash on Windows only
+        if win {
+            if val[src] == b'\\' {
+                val[src] = b'/';
+                changed = true;
+            }
+            if src < end && val[src + 1] == b'\\' {
+                val[src + 1] = b'/';
+                changed = true;
+            }
+        }
+        // Always normalize at the end of the input; skip normalization if
+        // this is not the end of the path segment
+        let mut step = Step::Normalize;
+        if src == end {
+            done = true;
+        } else if val[src + 1] != b'/' {
+            step = Step::Copy;
+        }
+        if let Step::Normalize = step {
+            step = Step::Copy;
+            if src != end && val[src] == b'/' {
+                // An empty path segment: the copy takes care of it
+                changed = true;
+            } else if val[src] == b'.' {
+                if dst > 0 && val[dst - 1] == b'.' {
+                    // A back-reference. In a relative path that has hit the
+                    // root, or with no segment before it, it is kept.
+                    if relative && (hitroot || dst <= 2) {
+                        hitroot = true;
+                    } else {
+                        // Remove it and the segment before, not above the root
+                        let mut d = dst as isize - 3;
+                        while d > 0 && val[d as usize] != b'/' {
+                            d -= 1;
+                        }
+                        if d <= 0 {
+                            hitroot = true;
+                            d = 0;
+                            // Leave the root slash of an absolute path that
+                            // ended on a back-reference
+                            if !relative && src == end {
+                                d += 1;
+                            }
+                        }
+                        dst = d as usize;
+                        if done {
+                            step = Step::SkipCopy;
+                        } else {
+                            src += 1;
+                            changed = true;
+                        }
+                    }
+                } else if dst == 0 {
+                    // A relative self-reference: ignored
+                    changed = true;
+                    if done {
+                        step = Step::SkipCopy;
+                    } else {
+                        src += 1;
+                    }
+                } else if val[dst - 1] == b'/' {
+                    // A self-reference: ignored
+                    changed = true;
+                    if done {
+                        step = Step::SkipCopy;
+                    } else {
+                        dst -= 1;
+                        src += 1;
+                    }
+                }
+            } else if dst > 0 {
+                // A regular path segment
+                hitroot = false;
+            }
+        }
+        if let Step::Copy = step {
+            // Skip to the last of several separators
+            if val[src] == b'/' {
+                let old = src;
+                while src < end && (val[src + 1] == b'/' || (win && val[src + 1] == b'\\')) {
+                    src += 1;
+                }
+                if old != src {
+                    changed = true;
+                }
+                // A relative path does not gain a root slash
+                if relative && dst == 0 {
+                    src += 1;
+                    continue;
+                }
+            }
+            val[dst] = val[src];
+            dst += 1;
+            src += 1;
+        }
+    }
+    // No trailing slash the original did not have
+    if !trailing && dst > 0 && val[dst - 1] == b'/' {
+        dst -= 1;
+    }
+    val.truncate(dst);
+    changed
+}
+
+fn normalize_path(input: &str, win: bool) -> Cow<'_, str> {
+    let mut bytes = input.as_bytes().to_vec();
+    if normalize_path_inplace(&mut bytes, win) {
+        // Whole segments and ASCII separators are removed, never part of a
+        // character, so the bytes stay the text they were
+        Cow::Owned(crate::bytes::text(&bytes))
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
+/// Normalize path transformation (Unix-style): `t:normalizePath`.
 pub struct NormalizePath;
 
 impl Transformation for NormalizePath {
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        let mut result = String::new();
-        let mut modified = false;
-
-        // Replace backslashes with forward slashes
-        let normalized = if input.contains('\\') {
-            modified = true;
-            Cow::Owned(input.replace('\\', "/"))
-        } else {
-            Cow::Borrowed(input)
-        };
-
-        // Collapse multiple slashes
-        let mut last_was_slash = false;
-        for c in normalized.chars() {
-            if c == '/' {
-                if !last_was_slash {
-                    result.push('/');
-                } else {
-                    modified = true;
-                }
-                last_was_slash = true;
-            } else {
-                result.push(c);
-                last_was_slash = false;
-            }
-        }
-
-        // Remove . and .. components
-        let parts: Vec<&str> = result.split('/').collect();
-        let mut stack: Vec<&str> = Vec::new();
-
-        for part in parts {
-            match part {
-                "." => {
-                    modified = true;
-                }
-                ".." => {
-                    modified = true;
-                    stack.pop();
-                }
-                "" if !stack.is_empty() => {
-                    // Keep leading empty string for absolute paths
-                }
-                other => {
-                    stack.push(other);
-                }
-            }
-        }
-
-        if modified {
-            Cow::Owned(stack.join("/"))
-        } else {
-            Cow::Borrowed(input)
-        }
+        normalize_path(input, false)
     }
 
     fn name(&self) -> &'static str {
@@ -246,12 +332,13 @@ impl Transformation for NormalizePath {
     }
 }
 
-/// Normalize path transformation (Windows-style).
+/// Normalize path transformation (Windows-style, a backslash is a
+/// separator): `t:normalizePathWin`.
 pub struct NormalizePathWin;
 
 impl Transformation for NormalizePathWin {
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        NormalizePath.transform(input)
+        normalize_path(input, true)
     }
 
     fn name(&self) -> &'static str {
@@ -500,85 +587,74 @@ impl Transformation for CmdLine {
 /// Escape sequence decode transformation.
 pub struct EscapeSeqDecode;
 
+/// libmodsecurity v3's `ansi_c_sequences_decode_inplace`
+/// (`escape_seq_decode.cc`, Apache-2.0, Copyright (c) 2015 - 2021 Trustwave
+/// Holdings, Inc.), ported on bytes: `\\a \\b \\f \\n \\r \\t \\v \\\\ \\? \\' \\"`,
+/// `\\xHH` and up to three octal digits; any other escaped byte is that byte,
+/// its backslash dropped; a lone trailing backslash stays.
 impl Transformation for EscapeSeqDecode {
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        // Decode escape sequences like \n, \r, \t, \xHH, \uHHHH
-        let mut result = String::new();
-        let mut chars = input.chars().peekable();
-        let mut modified = false;
-
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(&next) = chars.peek() {
-                    modified = true;
-                    chars.next();
-                    match next {
-                        'n' => result.push('\n'),
-                        'r' => result.push('\r'),
-                        't' => result.push('\t'),
-                        '\\' => result.push('\\'),
-                        '0' => result.push('\0'),
-                        'x' => {
-                            // Hex escape \xHH
-                            let mut hex = String::new();
-                            for _ in 0..2 {
-                                if let Some(&h) = chars.peek() {
-                                    if h.is_ascii_hexdigit() {
-                                        hex.push(chars.next().unwrap());
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                                result.push(byte as char);
-                            } else {
-                                result.push('x');
-                                result.push_str(&hex);
-                            }
-                        }
-                        'u' => {
-                            // Unicode escape \uHHHH
-                            let mut hex = String::new();
-                            for _ in 0..4 {
-                                if let Some(&h) = chars.peek() {
-                                    if h.is_ascii_hexdigit() {
-                                        hex.push(chars.next().unwrap());
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                                if let Some(c) = char::from_u32(code) {
-                                    result.push(c);
-                                } else {
-                                    result.push('u');
-                                    result.push_str(&hex);
-                                }
-                            } else {
-                                result.push('u');
-                                result.push_str(&hex);
-                            }
-                        }
-                        _ => {
-                            result.push('\\');
-                            result.push(next);
-                        }
-                    }
-                } else {
-                    result.push(c);
-                }
-            } else {
-                result.push(c);
+        if !input.contains('\\') {
+            return Cow::Borrowed(input);
+        }
+        let b = input.as_bytes();
+        let len = b.len();
+        let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+        let oct = |c: u8| (b'0'..=b'7').contains(&c);
+        let mut out = Vec::with_capacity(len);
+        let mut i = 0;
+        while i < len {
+            if b[i] != b'\\' || i + 1 >= len {
+                out.push(b[i]);
+                i += 1;
+                continue;
             }
+            let simple = match b[i + 1] {
+                b'a' => Some(0x07),
+                b'b' => Some(0x08),
+                b'f' => Some(0x0c),
+                b'n' => Some(b'\n'),
+                b'r' => Some(b'\r'),
+                b't' => Some(b'\t'),
+                b'v' => Some(0x0b),
+                b'\\' => Some(b'\\'),
+                b'?' => Some(b'?'),
+                b'\'' => Some(b'\''),
+                b'"' => Some(b'"'),
+                _ => None,
+            };
+            if let Some(c) = simple {
+                out.push(c);
+                i += 2;
+                continue;
+            }
+            if b[i + 1] == b'x' || b[i + 1] == b'X' {
+                if i + 3 < len {
+                    if let (Some(h), Some(l)) = (hex(b[i + 2]), hex(b[i + 3])) {
+                        out.push(h * 16 + l);
+                        i += 4;
+                        continue;
+                    }
+                }
+            } else if oct(b[i + 1]) {
+                let mut j = 0;
+                let mut value: u32 = 0;
+                while i + 1 + j < len && j < 3 {
+                    value = value * 8 + u32::from(b[i + 1 + j] - b'0');
+                    j += 1;
+                    if i + 1 + j >= len || !oct(b[i + 1 + j]) {
+                        break;
+                    }
+                }
+                out.push(value as u8);
+                i += 1 + j;
+                continue;
+            }
+            // Not an encoding: the byte, without its backslash
+            out.push(b[i + 1]);
+            i += 2;
         }
-
-        if modified {
-            Cow::Owned(result)
-        } else {
-            Cow::Borrowed(input)
-        }
+        Cow::Owned(crate::bytes::text(&out))
     }
 
     fn name(&self) -> &'static str {
@@ -605,6 +681,42 @@ impl Transformation for Sha256 {
 
 #[cfg(test)]
 mod tests {
+
+    /// libmodsecurity v3's normalize_path_inplace, as ported
+    #[test]
+    fn paths_normalize_as_modsecurity() {
+        let n = |s| NormalizePath.transform(s).into_owned();
+        let w = |s| NormalizePathWin.transform(s).into_owned();
+        assert_eq!(n("/a/b/../c"), "/a/c");
+        assert_eq!(n("/a/./b"), "/a/b");
+        assert_eq!(n("/a//b"), "/a/b");
+        assert_eq!(n("/../x"), "/x", "not above the root");
+        assert_eq!(
+            n("../.history"),
+            "../.history",
+            "a relative back-reference stays"
+        );
+        assert_eq!(n("a\\..\\b"), "a\\..\\b", "a backslash is not a separator");
+        assert_eq!(w("a\\..\\b"), "b");
+        assert_eq!(w("..\\pineapple"), "../pineapple");
+        assert_eq!(n("/a/b/"), "/a/b/", "a trailing slash kept");
+    }
+
+    /// libmodsecurity v3's ansi_c_sequences_decode_inplace, as ported
+    #[test]
+    fn escape_sequences_decode_as_modsecurity() {
+        let d = |s| EscapeSeqDecode.transform(s).into_owned();
+        assert_eq!(d(r#"1;.\"shell"#), r#"1;."shell"#);
+        assert_eq!(d(r"1;.\'shell"), "1;.'shell");
+        assert_eq!(d(r"\a\b\f\n\r\t\v\\\?"), "\u{7}\u{8}\u{c}\n\r\t\u{b}\\?");
+        assert_eq!(d(r"\x41\101\0"), "AA\0");
+        assert_eq!(
+            d(r"\q\xZZ"),
+            "qxZZ",
+            "not an encoding: the byte, no backslash"
+        );
+        assert_eq!(d("tail\\"), "tail\\", "a lone trailing backslash stays");
+    }
     use super::*;
 
     #[test]
@@ -639,7 +751,10 @@ mod tests {
         let t = NormalizePath;
         assert_eq!(t.transform("/a/b/../c"), "/a/c");
         assert_eq!(t.transform("/a//b/./c"), "/a/b/c");
-        assert_eq!(t.transform("a\\b\\c"), "a/b/c");
+        // A backslash is a separator for normalizePathWin alone, as in
+        // ModSecurity
+        assert_eq!(t.transform("a\\b\\c"), "a\\b\\c");
+        assert_eq!(NormalizePathWin.transform("a\\b\\c"), "a/b/c");
     }
 
     #[test]

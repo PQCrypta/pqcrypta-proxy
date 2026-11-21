@@ -190,6 +190,22 @@ impl Default for InterventionBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_lines_escape_as_modsecurity() {
+        let m = super::RuleMessage {
+            rule_id: Some("932300".into()),
+            msg: Some("say \"hi\"".into()),
+            data: Some("\r\nMAIL\u{1}\\\u{e9}".into()),
+            severity: Some(2),
+            ver: None,
+            tags: vec!["a".into()],
+        };
+        assert_eq!(
+            m.log_line(),
+            r#"[id "932300"] [msg "say \"hi\""] [data "\r\nMAIL\x01\\\xc3\xa9"] [severity "2"] [tag "a"]"#
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -237,4 +253,80 @@ mod tests {
         assert!(log.contains("[status 403]"));
         assert!(log.contains("942100"));
     }
+}
+
+/// What a rule that matched says about it, as ModSecurity logs it: its id,
+/// its `msg` and `logdata` with their macros expanded at the match
+/// (`%{MATCHED_VAR}`, `%{TX.0}`), its severity, version and tags. A rule
+/// with `nolog` leaves none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMessage {
+    /// The rule's id (a chain's starter's).
+    pub rule_id: Option<String>,
+    /// `msg`, expanded.
+    pub msg: Option<String>,
+    /// `logdata`, expanded.
+    pub data: Option<String>,
+    /// `severity`.
+    pub severity: Option<u8>,
+    /// `ver`.
+    pub ver: Option<String>,
+    /// `tag`s, in order.
+    pub tags: Vec<String>,
+}
+
+impl RuleMessage {
+    /// The message in ModSecurity's log form:
+    /// `[id "942100"] [msg "..."] [data "..."] [severity "2"] [ver "..."] [tag "..."]`,
+    /// each value escaped as ModSecurity escapes it (`log_escape`).
+    pub fn log_line(&self) -> String {
+        let mut out = String::new();
+        let mut field = |name: &str, value: &str| {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&format!("[{name} \"{}\"]", log_escape(value)));
+        };
+        if let Some(id) = &self.rule_id {
+            field("id", id);
+        }
+        if let Some(msg) = &self.msg {
+            field("msg", msg);
+        }
+        if let Some(data) = &self.data {
+            field("data", data);
+        }
+        if let Some(s) = self.severity {
+            field("severity", &s.to_string());
+        }
+        if let Some(v) = &self.ver {
+            field("ver", v);
+        }
+        for t in &self.tags {
+            field("tag", t);
+        }
+        out
+    }
+}
+
+/// ModSecurity's `log_escape` (`msc_util.c`, with quotes escaped): a log line
+/// stays one line of printable ASCII. `"` and `\\` take a backslash, the C
+/// control escapes stay as they are written in C, and any other byte below
+/// 0x20 or from 0x7f is `\\xHH`.
+fn log_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in crate::bytes::bytes(value) {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            0x00..=0x1f | 0x7f..=0xff => out.push_str(&format!("\\x{b:02x}")),
+            _ => out.push(char::from(b)),
+        }
+    }
+    out
 }

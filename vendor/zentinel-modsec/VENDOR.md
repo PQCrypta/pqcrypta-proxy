@@ -54,10 +54,9 @@ The changes from that commit:
 - **URL decoding as ModSecurity's** (`t:urlDecode`, `t:urlDecodeUni`): on
   bytes, non-strict (an invalid escape kept), and `+` to a space, as v2's
   `urldecode_nonstrict_inplace_ex` / `urldecode_uni_nonstrict_inplace_ex`
-  and v3's `url_decode_uni.cc` do. CRS's corpus has three
-  cases (934160 test 4, 942500 tests 3 and 4) that expect a `%2B` to survive
-  `t:urlDecodeUni`; under ModSecurity's decoding it cannot, and they fail
-  here as they would there.
+  and v3's `url_decode_uni.cc` do; `%uXXXX` through code page 20127 of
+  ModSecurity's `unicode.mapping` (its recommended `SecUnicodeMapFile`),
+  else the low byte, as ModSecurity: `%u2019` is `'` (`src/transformations/unicode_map.rs`).
 - **The path variables as libmodsecurity v3's `processURI` sets them**:
   `REQUEST_URI`, `REQUEST_FILENAME` and `REQUEST_BASENAME` are `%XX`-decoded
   (`uri_decode`: `+` and invalid escapes kept), `REQUEST_URI_RAW`,
@@ -66,6 +65,19 @@ The changes from that commit:
   becomes one private-use character (U+F780..U+F7FF) instead of U+FFFD, in
   every decoder, which `@validateUtf8Encoding` and `@validateByteRange`
   read as the bytes they are; a NUL is valid UTF-8, as in ModSecurity.
+- **`multiMatch`**: the operator at every transformation stage, as
+  ModSecurity runs it.
+- **Braced byte escapes** (`\x{e2}`) in `@rx` are bytes, as in PCRE without
+  UTF mode (CRS 4.31 writes its byte escapes braced).
+- **Macros expand any variable** (`%{ARGS._method}`, `%{REQUEST_METHOD}`).
+- **`t:normalizePath`, `t:normalizePathWin` and `t:escapeSeqDecode`** ported
+  from libmodsecurity v3 (`normalise_path.cc`, `escape_seq_decode.cc`).
+- **`Transaction::set_response_status`**, for an embedding application that
+  runs the response phases.
+- **Rule messages** (`Transaction::messages`, `RuleMessage::log_line`): each
+  matched rule's `msg` and `logdata` with their macros expanded at the match,
+  `nolog` honoured, in ModSecurity's log form and escaping (`log_escape`);
+  `Transaction::request_body_error` gives `REQBODY_ERROR_MSG`.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -73,9 +85,13 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 5066 of 5184 cases pass here, 4947 upstream. Three cases
-upstream passes fail here, by ModSecurity's own URL decoding (below); no
-other. The proxy's CI runs this crate's tests and that
+(CRS 30cb436): all 5225 stages pass here, none skipped, every expectation
+in them (rule IDs, log text, status); upstream passes 4947 and skips the
+rest. The test drives each stage as go-ftw sends it (or its raw
+`encoded_request`), through what Apache, the corpus's reference server,
+makes of it (requests it refuses with 400, RFC 9112 framing, repeated fields
+merged, HTTP/0.9 simple requests), and answers it as the corpus's backend
+(albedo) does, so the response rules are measured too. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).
 
 To move to a newer upstream commit: copy it over this directory (`git archive

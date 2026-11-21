@@ -5,8 +5,9 @@ use std::borrow::Cow;
 
 /// ModSecurity's non-strict URL decoding, on bytes: `%XX` decoded, an
 /// invalid or truncated escape kept as it is, `+` to a space, and with
-/// `unicode`, `%uXXXX` too (full-width ASCII folded to ASCII). `None` when
-/// nothing changed. CRS's rules expect `+` as a space from both (932200
+/// `unicode`, `%uXXXX` as the byte ModSecurity's Unicode map gives it (code
+/// page 20127, its recommended map: `%u2019` is `'`), else its low byte.
+/// `None` when nothing changed. CRS's rules expect `+` as a space from both (932200
 /// reads a command's arguments after `t:urlDecodeUni`).
 fn url_decode(input: &str, unicode: bool) -> Option<String> {
     fn hex(c: u8) -> Option<u8> {
@@ -26,19 +27,18 @@ fn url_decode(input: &str, unicode: bool) -> Option<String> {
                 let code = b[i + 2..i + 6]
                     .iter()
                     .fold(0u32, |acc, &c| acc * 16 + u32::from(hex(c).unwrap_or(0)));
-                // Full-width ASCII (U+FF01..U+FF5E) is the ASCII it imitates
-                let code = if (0xff01..=0xff5e).contains(&code) {
-                    code - 0xfee0
-                } else {
-                    code
-                };
-                match char::from_u32(code) {
-                    Some(c) => {
-                        let mut buf = [0u8; 4];
-                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                    }
-                    None => out.extend_from_slice(&b[i..i + 6]),
-                }
+                // ModSecurity's: the byte the Unicode map (code page 20127,
+                // super::unicode_map) gives the code point, else its low byte;
+                // a full-width ASCII form with no mapping is that ASCII
+                let low = (code & 0xff) as u8;
+                let byte = super::unicode_map::cp20127(code).unwrap_or(
+                    if code >> 8 == 0xff && low > 0 && low < 0x5f {
+                        low + 0x20
+                    } else {
+                        low
+                    },
+                );
+                out.push(byte);
                 i += 6;
                 changed = true;
             }
@@ -359,8 +359,27 @@ mod tests {
             assert_eq!(t.transform(&escaped), char::from(ascii).to_string());
         }
         assert_eq!(t.transform("%UFF21"), "A");
-        assert_eq!(t.transform("%uFF00%uFF5F"), "＀｟");
-        assert_eq!(t.transform("Ａ"), "Ａ");
+        // Outside the map, the low byte, as ModSecurity
+        assert_eq!(t.transform("%uFF00%uFF5F"), "\0_");
+        assert_eq!(t.transform("%u4e2d"), "-");
+        assert_eq!(
+            t.transform("\u{ff21}"),
+            "\u{ff21}",
+            "only escapes are mapped"
+        );
+    }
+
+    /// `%uXXXX` through code page 20127, ModSecurity's recommended map:
+    /// typographic quotes and angle quotes are what they look like
+    #[test]
+    fn url_decode_uni_maps_look_alikes_to_ascii() {
+        let t = UrlDecodeUni;
+        assert_eq!(
+            t.transform("%u2019 or %u2019a%u2019=%u2019a"),
+            "' or 'a'='a"
+        );
+        assert_eq!(t.transform("%u00abscript%u00bb"), "<script>");
+        assert_eq!(t.transform("%u2039script%u203a"), "<script>");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::chain::ChainState;
 use super::control::{CtlDirective, TransactionControls};
-use super::intervention::Intervention;
+use super::intervention::{Intervention, RuleMessage};
 use super::phase::Phase;
 use super::ruleset::{CompiledRule, CompiledRuleset, RuleEngineMode};
 use super::scoring::ANOMALY_SCORE;
@@ -96,6 +96,8 @@ pub struct Transaction {
     allowed: bool,
     /// Matched variables for current rule evaluation.
     matched_vars: Vec<(String, String)>,
+    /// The messages of the rules that matched (`RuleMessage`).
+    messages: Vec<RuleMessage>,
     /// Regex captures from last match.
     captures: Vec<String>,
     /// Per-transaction `ctl:` overrides.
@@ -217,6 +219,7 @@ impl Transaction {
             matched_rules: Vec::new(),
             allowed: false,
             matched_vars: Vec::new(),
+            messages: Vec::new(),
             captures: Vec::new(),
             controls: TransactionControls::default(),
             matched_data: Vec::new(),
@@ -428,6 +431,13 @@ impl Transaction {
         }
     }
 
+    /// Set the response's status code and protocol (`RESPONSE_STATUS`,
+    /// `RESPONSE_PROTOCOL`), before `process_response_headers`.
+    pub fn set_response_status(&mut self, status: u16, protocol: &str) {
+        self.response.set_status(status);
+        self.response.set_protocol(protocol);
+    }
+
     /// Add a response header.
     pub fn add_response_header(&mut self, name: &str, value: &str) -> Result<()> {
         self.response.add_header(name, value);
@@ -486,6 +496,18 @@ impl Transaction {
     /// Check if there's an intervention.
     pub fn has_intervention(&self) -> bool {
         self.intervention.is_some()
+    }
+
+    /// The messages of the rules that matched, in order, as ModSecurity logs
+    /// them (`RuleMessage::log_line`).
+    pub fn messages(&self) -> &[RuleMessage] {
+        &self.messages
+    }
+
+    /// Why the request body processor could not process the body
+    /// (`REQBODY_ERROR_MSG`), if it could not.
+    pub fn request_body_error(&self) -> Option<&str> {
+        self.request.body_error.as_deref()
     }
 
     /// Get matched rule IDs.
@@ -710,7 +732,7 @@ impl Transaction {
                 // has now matched in full. A completed chain keeps the
                 // starter's disruptive action, flow and metadata, and runs the
                 // ctl of every link.
-                let action_result = if chain_state.in_chain {
+                let mut action_result = if chain_state.in_chain {
                     chain_state.reset();
                     if let Some(id) = pending_chain_id.take() {
                         self.matched_rules.push(id);
@@ -730,6 +752,33 @@ impl Transaction {
                     }
                     action_result
                 };
+
+                // The rule's message, its macros expanded now, while
+                // MATCHED_VAR and TX:0 are this match's; the intervention
+                // below carries the same text
+                let meta = &mut action_result.metadata;
+                let expand = |v: Option<String>| {
+                    v.map(|v| {
+                        if v.contains("%{") {
+                            self.expand_operator_macros(&v)
+                        } else {
+                            v
+                        }
+                    })
+                };
+                meta.msg = expand(meta.msg.take());
+                meta.logdata = expand(meta.logdata.take());
+                let meta = &action_result.metadata;
+                if !meta.nolog && (meta.msg.is_some() || meta.logdata.is_some()) {
+                    self.messages.push(RuleMessage {
+                        rule_id: meta.id.clone(),
+                        msg: meta.msg.clone(),
+                        data: meta.logdata.clone(),
+                        severity: meta.severity,
+                        ver: meta.ver.clone(),
+                        tags: meta.tags.clone(),
+                    });
+                }
 
                 // Apply ctl: overrides before the disruptive action below, so
                 // that ctl:ruleEngine=DetectionOnly on the same rule governs
@@ -957,9 +1006,28 @@ impl Transaction {
 
         // Apply transformations and match every value
         let mut matches = Vec::new();
+        let multi_match = rule.multi_match();
         for (name, value) in all_values {
-            let transformed = rule.transformations.apply(&value);
-            let result = operator.execute(&transformed);
+            // multiMatch: the operator at every stage of the pipeline, the
+            // first stage that matches being the match (CRS 930110 finds
+            // `..\` before t:cmdLine deletes the backslash)
+            let (transformed, result) = if multi_match {
+                let stages = rule.transformations.stages(&value);
+                let last = stages.len() - 1;
+                let mut found = None;
+                for (i, stage) in stages.into_iter().enumerate() {
+                    let result = operator.execute(&stage);
+                    if result.matched != rule.operator_negated || i == last {
+                        found = Some((std::borrow::Cow::Owned(stage), result));
+                        break;
+                    }
+                }
+                found.expect("the last stage is always taken")
+            } else {
+                let transformed = rule.transformations.apply(&value);
+                let result = operator.execute(&transformed);
+                (transformed, result)
+            };
 
             let final_match = if rule.operator_negated {
                 !result.matched
@@ -1019,16 +1087,23 @@ impl Transaction {
                     }
                     _ => {}
                 }
-                let (collection, name) = match inner.split_once('.') {
-                    Some((c, n)) => (c.to_ascii_lowercase(), n),
-                    None => ("tx".to_string(), inner),
-                };
-                match collection.as_str() {
-                    "tx" => self
-                        .tx
+                let tx_value = |name: &str| {
+                    self.tx
                         .get(name)
                         .and_then(|v| v.first().map(|s| s.to_string()))
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                };
+                let (collection, name) = match inner.split_once('.') {
+                    Some((c, n)) => (c.to_ascii_lowercase(), n),
+                    // A bare name is a variable (`%{REQUEST_METHOD}`), or
+                    // else a TX key
+                    None => match self.macro_variable(&inner.to_ascii_uppercase()) {
+                        Some(v) => return v,
+                        None => return tx_value(inner),
+                    },
+                };
+                match collection.as_str() {
+                    "tx" => tx_value(name),
                     // CRS 943110: `!@endsWith %{request_headers.host}`.
                     "request_headers" => self
                         .request
@@ -1036,10 +1111,41 @@ impl Transaction {
                         .get(&name.to_ascii_lowercase())
                         .and_then(|v| v.first().map(|s| s.to_string()))
                         .unwrap_or_default(),
-                    _ => String::new(),
+                    // Any other collection member, as ModSecurity expands any
+                    // variable: CRS 920650 compares REQUEST_METHOD with
+                    // `%{ARGS._method}`
+                    other => self
+                        .macro_variable(&format!("{}:{}", other.to_ascii_uppercase(), name))
+                        .unwrap_or_default(),
                 }
             })
             .into_owned()
+    }
+
+    /// The first value of a variable written as a rule target (`ARGS:_method`,
+    /// `REQUEST_METHOD`), for a macro. `None` when the name is not a variable
+    /// this engine resolves.
+    fn macro_variable(&self, target: &str) -> Option<String> {
+        let spec = crate::parser::parse_single_variable(target).ok()?;
+        if !spec.name.is_implemented() {
+            return None;
+        }
+        let resolver = VariableResolver::new(
+            &self.request,
+            &self.response,
+            &self.tx,
+            self.matched_vars.last().map(|(_, value)| value.as_str()),
+            &self.matched_vars,
+            &self.captures,
+        );
+        Some(
+            resolver
+                .resolve(&spec)
+                .into_iter()
+                .next()
+                .map(|(_, v)| v)
+                .unwrap_or_default(),
+        )
     }
 
     /// Publish the captures of a `capture` rule as `TX:0`..`TX:9`.

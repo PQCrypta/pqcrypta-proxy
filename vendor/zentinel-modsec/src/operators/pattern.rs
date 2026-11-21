@@ -96,14 +96,53 @@ impl RxOperator {
 /// A pattern as PCRE compiles it for ModSecurity: bytes, DOTALL; Unicode mode
 /// only for a pattern that cannot be written without it.
 fn compile(pattern: &str) -> std::result::Result<Regex, regex::Error> {
-    let build = |unicode: bool| {
+    let build = |pattern: &str, unicode: bool| {
         RegexBuilder::new(pattern)
             .unicode(unicode)
             .dot_matches_new_line(true)
             .size_limit(64 << 20)
             .build()
     };
-    build(false).or_else(|_| build(true))
+    build(&braced_bytes(pattern), false).or_else(|_| build(pattern, true))
+}
+
+/// `\x{hh}` as `\xhh`. In PCRE without UTF mode both are the byte; in this
+/// crate the braced form is the code point even with Unicode off, so CRS's
+/// `\x{e2}\x80[\x98\x99]` (942430's `’`) looked for U+00E2. Escaped
+/// backslashes are passed over in pairs, so `\\x{41}` stays a backslash
+/// and text. A value above 0xff is left as it is.
+fn braced_bytes(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains("\\x{") {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let rest = &pattern[i + 1..];
+        if let Some(inner) = rest.strip_prefix("x{") {
+            if let Some(end) = inner.find('}') {
+                let hex = &inner[..end];
+                if (1..=2).contains(&hex.len()) && hex.chars().all(|h| h.is_ascii_hexdigit()) {
+                    out.push_str(&format!("\\x{:0>2}", hex));
+                    // past `x{`, the digits and `}`
+                    for _ in 0..(2 + hex.len() + 1) {
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
+        }
+        // Any other escape, an escaped backslash included, as written
+        out.push(c);
+        if let Some((_, next)) = chars.next() {
+            out.push(next);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 impl Operator for RxOperator {
@@ -272,6 +311,20 @@ mod tests {
         // A pattern only Unicode mode can write still works
         assert!(rx(r"\x{2019}", "it\u{2019}s"));
         assert!(rx(r"\p{Greek}", "\u{3b1}"));
+    }
+
+    /// CRS 4.31 writes byte escapes braced: `\x{e2}` is the byte, as in PCRE
+    #[test]
+    fn braced_byte_escapes_are_bytes() {
+        assert!(rx(r"^\x{e2}\x80[\x98\x99]$", "\u{2019}"));
+        assert!(rx(r"\x{c2}\x{b4}", "\u{b4}"));
+        assert_eq!(braced_bytes(r"\x{e2}[\x{9}-\x{d}]"), r"\xe2[\x09-\x0d]");
+        assert_eq!(braced_bytes(r"\\x{41}"), r"\\x{41}", "an escaped backslash");
+        assert_eq!(braced_bytes(r"\x{2019}"), r"\x{2019}", "above a byte");
+        assert!(
+            rx(r"\x{2019}", "\u{2019}"),
+            "still matches, in Unicode mode"
+        );
     }
 
     #[test]

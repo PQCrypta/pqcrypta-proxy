@@ -4,6 +4,7 @@ mod decode;
 mod encode;
 mod normalize;
 mod pipeline;
+mod unicode_map;
 
 pub use decode::*;
 pub use encode::*;

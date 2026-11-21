@@ -66,29 +66,14 @@ use zentinel_modsec::ModSecurity;
 /// change after bumping that commit is worth reading as new tests before
 /// reading it as a regression.
 ///
-/// 4947 upstream at 8ba8099; 5066 in pqcrypta-proxy's copy (VENDOR.md):
-/// libinjection itself and `ctl:ruleRemoveTargetByTag` pass six more cases
-/// (941100 two, 941180 one, 942100 two, 942101 one), request bodies read as
-/// ModSecurity reads them 31 (944100 four, 944110 four, 944120 sixteen,
-/// 944210 six, 920400 one), case-insensitive regex selections 17 (922110),
-/// libmodsecurity v3's multipart processor 18 (920120 sixteen, 920121 one,
-/// 920410 one), and ModSecurity's URL decoding (`+` to a space) 18 (932200
-/// seven, 932205 three, 932206 one, 932207 two, 942101 two, 942210 two,
-/// 942240 one), and the path variables URI-decoded as v3 sets them 28 (one
-/// each in 932125 to 932380 and 933151 to 933153, three in 933160), and bytes
-/// that are not UTF-8 kept as themselves 4 (920250). That
-/// decoding fails three cases upstream passed, each a
-/// `%2B` the test expects to survive `t:urlDecodeUni` as `+` (934160 test 4,
-/// 942500 tests 3 and 4): ModSecurity v2 and v3 turn it into a space too
-/// (msc_util.c `urldecode_uni_nonstrict_inplace_ex`, v3 url_decode_uni.cc),
-/// so the engine keeps their semantics. No other case upstream passes fails
-/// here, compared case file by case file.
-const MIN_PASSING: u32 = 5066;
-
-/// Corpus stages that cannot be driven from here: an `encoded_request` payload,
-/// or an expectation that is not about rule IDs (`status`, `match_regex`).
-/// Reported rather than hidden, so this cap cannot quietly grow.
-const EXPECTED_SKIPS_MAX: u32 = 60;
+/// 4947 upstream at 8ba8099 (rule IDs only); here every stage, and every
+/// expectation in it: rule IDs, log text and status (VENDOR.md lists what it
+/// took). The harness drives each stage as go-ftw sends it (or its raw
+/// `encoded_request`), through what the reference server, Apache, makes of
+/// it (`refused`, RFC 9112 framing, repeated fields merged), and answers it
+/// as the corpus's backend, albedo, does, through the response phases and
+/// logging.
+const MIN_PASSING: u32 = 5225;
 
 // --- corpus schema (only the fields this harness uses) ---------------------
 
@@ -112,8 +97,6 @@ struct Stage {
 #[derive(Deserialize, Default)]
 struct Input {
     #[serde(default)]
-    dest_addr: Option<String>,
-    #[serde(default)]
     method: Option<String>,
     #[serde(default)]
     uri: Option<String>,
@@ -132,13 +115,20 @@ struct Input {
 struct Output {
     #[serde(default)]
     log: Option<Log>,
+    /// The response status the client gets (a value or a list of them).
+    #[serde(default)]
+    status: Option<serde_yaml::Value>,
 }
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct Log {
     #[serde(default)]
     expect_ids: Vec<serde_yaml::Value>,
     #[serde(default)]
     no_expect_ids: Vec<serde_yaml::Value>,
+    #[serde(default)]
+    match_regex: Option<String>,
+    #[serde(default)]
+    no_match_regex: Option<String>,
 }
 
 /// YAML scalars appear as strings or numbers; `data` may be a block sequence.
@@ -203,48 +193,486 @@ fn load(dir: &Path, extra: &str) -> ModSecurity {
     ModSecurity::from_string(&cfg).expect("CRS should load")
 }
 
-/// Drive one corpus stage and return the rule IDs that matched.
-fn run_stage(m: &ModSecurity, input: &Input) -> Vec<String> {
-    let mut tx = m.new_transaction();
-    let uri = input.uri.clone().unwrap_or_else(|| "/".into());
-    let method = input.method.clone().unwrap_or_else(|| "GET".into());
-    let version = input.version.clone().unwrap_or_else(|| "HTTP/1.1".into());
-    if tx.process_uri(&uri, &method, &version).is_err() {
-        return vec![];
+/// A chunked body's data (RFC 9112 section 7.1): each chunk's size line in
+/// hex, its data, to the zero-size chunk. Line endings CRLF or LF.
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(nl) = rest.iter().position(|&c| c == b'\n') {
+        let (line, after) = (&rest[..nl], &rest[nl + 1..]);
+        let line = String::from_utf8_lossy(line);
+        let size = line
+            .trim_end_matches('\r')
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            break;
+        };
+        if size == 0 || after.len() < size {
+            out.extend_from_slice(&after[..size.min(after.len())]);
+            break;
+        }
+        out.extend_from_slice(&after[..size]);
+        rest = &after[size..];
+        if rest.starts_with(b"\r") {
+            rest = &rest[1..];
+        }
+        if rest.starts_with(b"\n") {
+            rest = &rest[1..];
+        }
     }
+    out
+}
 
-    let has = |n: &str| input.headers.keys().any(|k| k.eq_ignore_ascii_case(n));
-    for (k, v) in &input.headers {
-        let _ = tx.add_request_header(k, &scalar(v));
+/// The backend's answer, as the corpus's backend, albedo, gives it, through
+/// the response phases and logging: `POST /reflect` answers with the JSON
+/// body's `status` (200), `headers` and `body` (or base64 `encodedBody`);
+/// anything else with an empty 200. A body without a Content-Type is given
+/// the one Go's net/http sniffs for it.
+fn respond(
+    tx: &mut zentinel_modsec::engine::Transaction,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> u16 {
+    let mut status = 200u16;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
+    if method == "POST" && uri.split('?').next() == Some("/reflect") {
+        if let Ok(spec) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(s) = spec.get("status").and_then(|s| s.as_u64()) {
+                status = u16::try_from(s).unwrap_or(200);
+            }
+            if let Some(h) = spec.get("headers").and_then(|h| h.as_object()) {
+                for (k, v) in h {
+                    headers.push((
+                        k.clone(),
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string()),
+                    ));
+                }
+            }
+            if let Some(b) = spec.get("body").and_then(|b| b.as_str()) {
+                out = b.as_bytes().to_vec();
+            } else if let Some(e) = spec.get("encodedBody").and_then(|b| b.as_str()) {
+                use base64::Engine;
+                out = base64::engine::general_purpose::STANDARD
+                    .decode(e)
+                    .unwrap_or_default();
+            }
+        }
     }
-    let body = input.data.as_ref().map(scalar).unwrap_or_default();
-    // go-ftw fills these in unless a test opts out.
-    if input.autocomplete_headers.unwrap_or(true) {
-        if !has("Host") {
-            let host = input
-                .dest_addr
-                .clone()
-                .unwrap_or_else(|| "localhost".into());
-            let _ = tx.add_request_header("Host", &host);
-        }
-        if !has("User-Agent") {
-            let _ = tx.add_request_header("User-Agent", "go-ftw");
-        }
-        if !has("Accept") {
-            let _ = tx.add_request_header("Accept", "*/*");
-        }
-        if !body.is_empty() && !has("Content-Length") {
-            let _ = tx.add_request_header("Content-Length", &body.len().to_string());
+    if !out.is_empty()
+        && !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+    {
+        headers.push(("Content-Type".into(), sniff(&out).into()));
+    }
+    tx.set_response_status(status, "HTTP/1.1");
+    for (k, v) in &headers {
+        let _ = tx.add_response_header(k, v);
+    }
+    let _ = tx.process_response_headers();
+    if !out.is_empty() {
+        let _ = tx.append_response_body(&out);
+    }
+    let _ = tx.process_response_body();
+    let _ = tx.process_logging();
+    status
+}
+
+/// What Go's `http.DetectContentType` calls a body, in the cases a test
+/// body takes: HTML, XML, text, or bytes.
+fn sniff(body: &[u8]) -> &'static str {
+    let lead: Vec<u8> = body
+        .iter()
+        .skip_while(|c| c.is_ascii_whitespace())
+        .take(14)
+        .map(u8::to_ascii_uppercase)
+        .collect();
+    const HTML: [&[u8]; 17] = [
+        b"<!DOCTYPE HTML",
+        b"<HTML",
+        b"<HEAD",
+        b"<SCRIPT",
+        b"<IFRAME",
+        b"<H1",
+        b"<DIV",
+        b"<FONT",
+        b"<TABLE",
+        b"<A",
+        b"<STYLE",
+        b"<TITLE",
+        b"<B",
+        b"<BODY",
+        b"<BR",
+        b"<P",
+        b"<!--",
+    ];
+    let tag_end = |sig: &[u8]| lead.get(sig.len()).is_none_or(|c| *c == b' ' || *c == b'>');
+    if HTML.iter().any(|sig| lead.starts_with(sig) && tag_end(sig)) {
+        "text/html; charset=utf-8"
+    } else if lead.starts_with(b"<?XML") {
+        "text/xml; charset=utf-8"
+    } else if body
+        .iter()
+        .any(|&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r' | 0x0c | 0x1b))
+    {
+        "application/octet-stream"
+    } else {
+        "text/plain; charset=utf-8"
+    }
+}
+
+/// go-ftw's `methodsWithBodyRegex`, `^POST|PUT|PATCH|DELETE$`, alternation
+/// and all.
+fn body_method(m: &str) -> bool {
+    m.starts_with("POST") || m.contains("PUT") || m.contains("PATCH") || m.contains("DELETE")
+}
+
+/// Go's `url.QueryUnescape`: `%XX` and `+`, `None` on a malformed escape.
+fn query_unescape(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                let (h, l) = (hex(*b.get(i + 1)?)?, hex(*b.get(i + 2)?)?);
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
-    if tx.process_request_headers().is_err() {
-        return tx.matched_rules().to_vec();
+    String::from_utf8(out).ok()
+}
+
+/// Go's `url.QueryEscape`: unreserved characters kept, a space as `+`, every
+/// other byte `%XX`.
+fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &c in s.as_bytes() {
+        match c {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(c as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{c:02X}")),
+        }
     }
-    if !body.is_empty() {
-        let _ = tx.append_request_body(body.as_bytes());
+    out
+}
+
+/// Drive one corpus stage and return the rule IDs that matched.
+/// What a stage leaves: the transaction, if the server let the request
+/// through to the engine, and the status the client gets.
+struct Served {
+    tx: Option<zentinel_modsec::engine::Transaction>,
+    status: u16,
+}
+
+/// What the server's error log holds for the transaction, as ModSecurity 2
+/// (the corpus's reference) writes it: what a stage's `match_regex` is
+/// matched against. A line a rule message, and a multipart body the
+/// processor could not parse as `msc_reqbody.c` logs it.
+fn log_text(tx: &zentinel_modsec::engine::Transaction) -> String {
+    let mut lines: Vec<String> = tx
+        .messages()
+        .iter()
+        .map(|m| format!("ModSecurity: Warning. {}", m.log_line()))
+        .collect();
+    if let Some(e) = tx
+        .request_body_error()
+        .filter(|e| e.starts_with("Multipart:"))
+    {
+        lines.push(format!("ModSecurity: Multipart parsing error: {e}"));
+    }
+    lines.join("\n")
+}
+
+/// One request as it reaches the server: request line, fields, body.
+struct Wire {
+    method: String,
+    uri: String,
+    version: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn has(h: &[(String, String)], n: &str) -> bool {
+    h.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
+}
+
+fn header(h: &[(String, String)], n: &str) -> Option<String> {
+    h.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(n))
+        .map(|(_, v)| v.clone())
+}
+
+/// Drive one corpus stage: the request as it is sent, through the server.
+fn drive_stage(m: &ModSecurity, input: &Input) -> Served {
+    let wire = match &input.encoded_request {
+        Some(encoded) => {
+            use base64::Engine;
+            // The corpus folds long payloads over lines
+            let packed: String = encoded.split_whitespace().collect();
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(packed)
+                .unwrap_or_default();
+            match raw_request(&raw) {
+                Some(w) => w,
+                None => {
+                    return Served {
+                        tx: None,
+                        status: 400,
+                    }
+                }
+            }
+        }
+        None => go_ftw_request(input),
+    };
+    serve(m, wire)
+}
+
+/// The request go-ftw sends for a stage (ftwhttp/request.go: BuildRequest,
+/// encodeDataParameters, AddStandardHeaders). It adds no Host, User-Agent or
+/// Accept: the tests of a missing header (920280, 920300, 920311, 920320)
+/// depend on that.
+fn go_ftw_request(input: &Input) -> Wire {
+    let method = input.method.clone().unwrap_or_else(|| "GET".into());
+    let mut headers: Vec<(String, String)> = input
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), scalar(v)))
+        .collect();
+    let mut body = input.data.as_ref().map(scalar).unwrap_or_default();
+    let autocomplete = input.autocomplete_headers.unwrap_or(true);
+    const FORM: &str = "application/x-www-form-urlencoded";
+    // A body with no type is a form
+    if autocomplete && !body.is_empty() && !has(&headers, "Content-Type") {
+        headers.push(("Content-Type".into(), FORM.into()));
+    }
+    let content_type = header(&headers, "Content-Type").unwrap_or_default();
+    // A form body written unescaped is escaped, key and value
+    if content_type.contains(FORM) && query_unescape(&body).as_deref() == Some(body.as_str()) {
+        body = body
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.split_once('=') {
+                Some((k, v)) => format!("{}={}", query_escape(k), query_escape(v)),
+                None => query_escape(p),
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+    }
+    // A multipart body's line endings are CRLF on the wire
+    if content_type.contains("multipart/form-data;") {
+        body = body.replace('\n', "\r\n");
+    }
+    if autocomplete {
+        if !has(&headers, "Connection") {
+            headers.push(("Connection".into(), "close".into()));
+        }
+        if !has(&headers, "Content-Length") && (!body.is_empty() || body_method(&method)) {
+            headers.push(("Content-Length".into(), body.len().to_string()));
+        }
+    }
+    Wire {
+        method,
+        uri: input.uri.clone().unwrap_or_else(|| "/".into()),
+        version: input.version.clone().unwrap_or_else(|| "HTTP/1.1".into()),
+        headers,
+        body: body.into_bytes(),
+    }
+}
+
+/// A raw HTTP/1 request (an `encoded_request` stage, sent as it is): the
+/// request line, the fields to the blank line, the rest the body.
+fn raw_request(raw: &[u8]) -> Option<Wire> {
+    let (head, body) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => (&raw[..i], &raw[i + 4..]),
+        None => match raw.windows(2).position(|w| w == b"\n\n") {
+            Some(i) => (&raw[..i], &raw[i + 2..]),
+            None => (raw, &[][..]),
+        },
+    };
+    let head = String::from_utf8_lossy(head);
+    let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let mut line = lines.next()?.splitn(3, ' ');
+    let (method, uri) = (line.next()?.to_string(), line.next()?.to_string());
+    let version = line.next().unwrap_or("").to_string();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.to_string(), v.trim_start().to_string()))
+        .collect();
+    Some(Wire {
+        method,
+        uri,
+        version,
+        headers,
+        body: body.to_vec(),
+    })
+}
+
+/// Whether the server answers 400 before any module sees the request, as
+/// Apache, the corpus's reference, does under `HttpProtocolOptions Strict`
+/// (its default; RFC 9112 sections 3, 5 and 6, RFC 9110 section 7.2): a
+/// method that is not a token; a request target that is not one word in
+/// origin form, absolute form, `*`, or for CONNECT `host:port`, or that holds
+/// a fragment; a version not `HTTP/` digit `.` digit from 1.0; a field name
+/// that is not a token, or a value holding a control character but HTAB
+/// (CR or LF in a field would end it on the wire); a Content-Length that is
+/// not digits; a Host that is not a host name or address (`fix_hostname`),
+/// or from HTTP/1.1 on, none (`ap_check_request_header`). A request line
+/// without a version is an HTTP/0.9 simple request, which Apache serves
+/// (`Allow0.9`, its default) for GET alone.
+fn refused(w: &Wire) -> bool {
+    let tchar = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+    let token = |s: &str| !s.is_empty() && s.bytes().all(tchar);
+    let t = w.uri.as_bytes();
+    let one_word = !t.is_empty() && t.iter().all(|&c| c > b' ' && c != 0x7f);
+    let host_port = |s: &str| {
+        let (host, port) = match s.strip_prefix('[') {
+            Some(v6) => match v6.split_once(']') {
+                Some((addr, rest))
+                    if addr
+                        .bytes()
+                        .all(|c| c.is_ascii_hexdigit() || c == b':' || c == b'.') =>
+                {
+                    (
+                        addr,
+                        rest.strip_prefix(':')
+                            .map(Some)
+                            .unwrap_or((!rest.is_empty()).then_some("x")),
+                    )
+                }
+                _ => return None,
+            },
+            None => match s.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (s, None),
+            },
+        };
+        let host_ok = !host.is_empty()
+            && (s.starts_with('[')
+                || host
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)));
+        let port_ok = port.is_none_or(|p| p.bytes().all(|c| c.is_ascii_digit()));
+        (host_ok && port_ok).then_some(port.is_some())
+    };
+    let form = if w.method == "CONNECT" {
+        host_port(&w.uri) == Some(true)
+    } else {
+        t.first() == Some(&b'/') || w.uri == "*" || w.uri.contains("://")
+    };
+    let v = w.version.as_bytes();
+    let version = (v.is_empty() && w.method == "GET")
+        || (v.len() == 8
+            && v.starts_with(b"HTTP/")
+            && (b'1'..=b'9').contains(&v[5])
+            && v[6] == b'.'
+            && v[7].is_ascii_digit());
+    let from_1_1 = v.len() == 8 && (v[5] > b'1' || v[7] >= b'1');
+    let fields = w
+        .headers
+        .iter()
+        .all(|(k, val)| token(k) && val.bytes().all(|c| c == b'\t' || (c >= b' ' && c != 0x7f)));
+    let length = header(&w.headers, "Content-Length")
+        .is_none_or(|l| !l.is_empty() && l.bytes().all(|c| c.is_ascii_digit()));
+    let host = match header(&w.headers, "Host") {
+        Some(h) if !h.is_empty() => host_port(&h).is_some(),
+        _ => !from_1_1,
+    };
+    !(token(&w.method)
+        && one_word
+        && !w.uri.contains('#')
+        && form
+        && version
+        && fields
+        && length
+        && host)
+}
+
+/// What the server makes of a request before any module sees it: `refused`,
+/// then RFC 9112 framing (as Apache and pqcrypta-proxy's HTTP stack both
+/// apply it): chunked framing drops Content-Length and the body is
+/// de-chunked; with neither, an HTTP/1 request has no body. Then the engine's
+/// phases, and the backend's answer, or the engine's.
+fn serve(m: &ModSecurity, mut w: Wire) -> Served {
+    if refused(&w) {
+        return Served {
+            tx: None,
+            status: 400,
+        };
+    }
+    // A simple request: the server reads no fields and no body
+    if w.version.is_empty() {
+        w.version = "HTTP/0.9".into();
+        w.headers.clear();
+        w.body.clear();
+    }
+    // Repeated fields are one, their values joined (Apache's
+    // apr_table_compress with APR_OVERLAP_TABLES_MERGE)
+    let mut merged: Vec<(String, String)> = Vec::with_capacity(w.headers.len());
+    for (k, v) in std::mem::take(&mut w.headers) {
+        match merged.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&k)) {
+            Some((_, joined)) => {
+                joined.push_str(", ");
+                joined.push_str(&v);
+            }
+            None => merged.push((k, v)),
+        }
+    }
+    w.headers = merged;
+    let mut tx = m.new_transaction();
+    if tx.process_uri(&w.uri, &w.method, &w.version).is_err() {
+        return Served {
+            tx: None,
+            status: 400,
+        };
+    }
+    let chunked = header(&w.headers, "Transfer-Encoding")
+        .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"));
+    if chunked {
+        w.headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("Content-Length"));
+        w.body = dechunk(&w.body);
+    } else if !has(&w.headers, "Content-Length") && !w.version.starts_with("HTTP/2") {
+        w.body.clear();
+    }
+    for (k, v) in &w.headers {
+        let _ = tx.add_request_header(k, v);
+    }
+    let _ = tx.process_request_headers();
+    if !w.body.is_empty() {
+        let _ = tx.append_request_body(&w.body);
     }
     let _ = tx.process_request_body();
-    tx.matched_rules().to_vec()
+    let answered = respond(
+        &mut tx,
+        &w.method,
+        &w.uri,
+        &String::from_utf8_lossy(&w.body),
+    );
+    let status = tx.intervention().map_or(answered, |i| i.status);
+    Served {
+        tx: Some(tx),
+        status,
+    }
 }
 
 // --- the gate --------------------------------------------------------------
@@ -289,19 +717,52 @@ fn crs_regression_corpus() {
 
         for t in &parsed.tests {
             for stage in &t.stages {
-                let Some(log) = &stage.output.log else {
-                    skipped += 1;
-                    continue;
-                };
-                if stage.input.encoded_request.is_some()
-                    || (log.expect_ids.is_empty() && log.no_expect_ids.is_empty())
+                let empty = Log::default();
+                let log = stage.output.log.as_ref().unwrap_or(&empty);
+                if log.expect_ids.is_empty()
+                    && log.no_expect_ids.is_empty()
+                    && log.match_regex.is_none()
+                    && log.no_match_regex.is_none()
+                    && stage.output.status.is_none()
                 {
                     skipped += 1;
                     continue;
                 }
 
-                let got = run_stage(&m, &stage.input);
+                let served = drive_stage(&m, &stage.input);
+                let got: Vec<String> = served
+                    .tx
+                    .as_ref()
+                    .map(|tx| tx.matched_rules().to_vec())
+                    .unwrap_or_default();
+                let text = served.tx.as_ref().map(log_text).unwrap_or_default();
                 let mut ok = true;
+                if let Some(want) = &stage.output.status {
+                    let statuses: Vec<String> = match want {
+                        serde_yaml::Value::Sequence(v) => v.iter().map(scalar).collect(),
+                        v => vec![scalar(v)],
+                    };
+                    if !statuses.contains(&served.status.to_string()) {
+                        ok = false;
+                        *missing
+                            .entry(format!("status {statuses:?}, got {}", served.status))
+                            .or_default() += 1;
+                    }
+                }
+                for (pattern, want) in [(&log.match_regex, true), (&log.no_match_regex, false)] {
+                    if let Some(p) = pattern {
+                        let re = regex::Regex::new(p).expect("the stage's log regex");
+                        if re.is_match(&text) != want {
+                            ok = false;
+                            *missing
+                                .entry(format!(
+                                    "log {}matching {p:?}",
+                                    if want { "" } else { "not " }
+                                ))
+                                .or_default() += 1;
+                        }
+                    }
+                }
                 for id in log.expect_ids.iter().map(scalar) {
                     if !got.contains(&id) {
                         ok = false;
@@ -318,21 +779,37 @@ fn crs_regression_corpus() {
                     pass += 1;
                 } else {
                     if list_failures {
+                        let ids =
+                            |v: &Vec<serde_yaml::Value>| v.iter().map(scalar).collect::<Vec<_>>();
+                        let (want, not) = (ids(&log.expect_ids), ids(&log.no_expect_ids));
+                        // The matched rules of the families the stage is about
+                        let fam: Vec<&str> = want
+                            .iter()
+                            .chain(&not)
+                            .map(|i| &i[..3.min(i.len())])
+                            .collect();
+                        let near: Vec<&String> = got
+                            .iter()
+                            .filter(|g| fam.iter().any(|f| g.starts_with(f)))
+                            .collect();
+                        let ct = stage
+                            .input
+                            .headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                            .map(|(_, v)| scalar(v))
+                            .unwrap_or_default();
+                        let data = stage.input.data.as_ref().map(scalar).unwrap_or_default();
+                        let cut = |s: &str, n: usize| {
+                            s.chars().take(n).collect::<String>().replace('\n', "\\n")
+                        };
                         println!(
-                            "FAILING {fname} test {} (expected {:?}, not {:?}; got {:?})",
+                            "FAILING {fname} test {} want {want:?} not {not:?} got {near:?} | {} {} | ct={} | data={}",
                             t.test_id.unwrap_or_default(),
-                            log.expect_ids.iter().map(scalar).collect::<Vec<_>>(),
-                            log.no_expect_ids.iter().map(scalar).collect::<Vec<_>>(),
-                            got.iter()
-                                .filter(|id| !id.ends_with("011")
-                                    && !id.ends_with("012")
-                                    && !id.ends_with("013")
-                                    && !id.ends_with("014")
-                                    && !id.ends_with("015")
-                                    && !id.ends_with("016")
-                                    && !id.ends_with("017")
-                                    && !id.ends_with("018"))
-                                .collect::<Vec<_>>(),
+                            stage.input.method.as_deref().unwrap_or("GET"),
+                            cut(stage.input.uri.as_deref().unwrap_or("/"), 90),
+                            cut(&ct, 40),
+                            cut(&data, 90),
                         );
                     }
                     fail += 1;
@@ -369,10 +846,12 @@ fn crs_regression_corpus() {
     top("rules that should have fired", missing);
     top("rules that fired but must not", spurious);
 
-    assert!(
-        skipped <= EXPECTED_SKIPS_MAX,
-        "{skipped} corpus stages were skipped, more than the {EXPECTED_SKIPS_MAX} expected. \
-         Silently skipping cases reads as coverage that is not there — find out what changed."
+    // A stage with nothing this harness checks (no rule IDs, log regex or
+    // status): none at 30cb436, so one that appears is reported, never
+    // counted as coverage.
+    assert_eq!(
+        skipped, 0,
+        "{skipped} corpus stages assert nothing this harness checks — find out what changed."
     );
     assert!(
         pass >= MIN_PASSING,
@@ -536,4 +1015,49 @@ fn stock_crs_blocks_attacks_and_passes_ordinary_traffic() {
         "stock CRS behaved wrongly:\n  {}",
         wrong.join("\n  ")
     );
+}
+
+/// One corpus case, for looking at it: `CRS_CASE=942430.yaml#3` (and
+/// `CRS_RULES=942430,942431`, the rules to show) runs that test's stages and
+/// prints what the rules matched: variable, value after transformations, and
+/// the portion the operator hit.
+#[test]
+#[ignore]
+fn crs_case() {
+    let Some(dir) = crs_dir() else { return };
+    let case = std::env::var("CRS_CASE").expect("CRS_CASE=<file>#<test id>");
+    let (file, id) = case.split_once('#').expect("<file>#<test id>");
+    let id: u32 = id.parse().expect("a test id");
+    let rules: Vec<String> = std::env::var("CRS_RULES")
+        .map(|r| r.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let m = load(&dir, FTW_SETUP);
+    let path = walkdir::WalkDir::new(dir.join("tests/regression/tests"))
+        .into_iter()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy() == file)
+        .expect("the test file")
+        .into_path();
+    let parsed: TestFile = serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for t in parsed.tests.iter().filter(|t| t.test_id == Some(id)) {
+        for stage in &t.stages {
+            let served = drive_stage(&m, &stage.input);
+            println!("status {}", served.status);
+            let Some(tx) = served.tx else {
+                println!("refused by the server");
+                continue;
+            };
+            println!("matched: {:?}", tx.matched_rules());
+            println!("{}", log_text(&tx));
+            for d in tx.matched_data() {
+                let rid = d.rule_id.clone().unwrap_or_default();
+                if rules.is_empty() || rules.contains(&rid) {
+                    println!(
+                        "  {rid} {} = {:?} (hit {:?})",
+                        d.variable, d.value, d.matched_portion
+                    );
+                }
+            }
+        }
+    }
 }
