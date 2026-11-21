@@ -66,6 +66,22 @@ impl TransformationPipeline {
         current
     }
 
+    /// The value at each stage `multiMatch` runs the operator on, as
+    /// ModSecurity runs it: the value before any transformation, then after
+    /// each transformation that changed it.
+    pub fn stages(&self, input: &str) -> Vec<String> {
+        let mut out = vec![input.to_string()];
+        for t in &self.transformations {
+            let last = out.last().expect("one stage at least");
+            if let Cow::Owned(next) = t.transform(last) {
+                if next != *last {
+                    out.push(next);
+                }
+            }
+        }
+        out
+    }
+
     /// Check if the pipeline is empty.
     pub fn is_empty(&self) -> bool {
         self.transformations.is_empty()

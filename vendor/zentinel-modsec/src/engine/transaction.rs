@@ -957,9 +957,28 @@ impl Transaction {
 
         // Apply transformations and match every value
         let mut matches = Vec::new();
+        let multi_match = rule.multi_match();
         for (name, value) in all_values {
-            let transformed = rule.transformations.apply(&value);
-            let result = operator.execute(&transformed);
+            // multiMatch: the operator at every stage of the pipeline, the
+            // first stage that matches being the match (CRS 930110 finds
+            // `..\` before t:cmdLine deletes the backslash)
+            let (transformed, result) = if multi_match {
+                let stages = rule.transformations.stages(&value);
+                let last = stages.len() - 1;
+                let mut found = None;
+                for (i, stage) in stages.into_iter().enumerate() {
+                    let result = operator.execute(&stage);
+                    if result.matched != rule.operator_negated || i == last {
+                        found = Some((std::borrow::Cow::Owned(stage), result));
+                        break;
+                    }
+                }
+                found.expect("the last stage is always taken")
+            } else {
+                let transformed = rule.transformations.apply(&value);
+                let result = operator.execute(&transformed);
+                (transformed, result)
+            };
 
             let final_match = if rule.operator_negated {
                 !result.matched

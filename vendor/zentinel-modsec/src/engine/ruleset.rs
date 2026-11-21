@@ -39,6 +39,14 @@ pub struct CompiledRule {
 }
 
 impl CompiledRule {
+    /// Whether the rule runs its operator at every transformation stage
+    /// (`multiMatch`) rather than on the transformed value alone.
+    pub fn multi_match(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|a| matches!(a, Action::Flow(crate::parser::FlowAction::MultiMatch)))
+    }
+
     /// Whether the rule carries this tag (`tag:'...'`), compared exactly.
     pub fn has_tag(&self, tag: &str) -> bool {
         self.actions
