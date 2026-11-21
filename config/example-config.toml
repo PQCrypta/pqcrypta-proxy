@@ -783,9 +783,11 @@ custom_patterns = []
 
 # Per-path rule exclusions, for tuning a false positive without switching a
 # category off site-wide. `path` is a regex; name rule identifiers in `rules`
-# and/or whole categories in `categories`.
+# and/or whole categories in `categories`; `host`, a regex matched against the
+# request's host without its port, limits one to a site (every host without).
 # [[waf.exclusions]]
 # path = "^/regex/"
+# host = "^www\.example\.com$"
 # categories = ["xss"]
 
 # The OWASP Core Rule Set beside the native rules (README: WAF Configuration).

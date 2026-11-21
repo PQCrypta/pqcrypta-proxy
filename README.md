@@ -1117,7 +1117,7 @@ control characters in header values, `TRACE`/`TRACK`/`DEBUG`, excessive header
 counts, and a `Host` containing a path, space or userinfo marker.
 
 **Per-path exclusions.** Tune a false positive without switching a category off
-site-wide:
+site-wide, on one site of the many a node may serve:
 
 ```toml
 [[waf.exclusions]]
@@ -1127,7 +1127,15 @@ categories = ["xss"]       # whole categories to suppress
 [[waf.exclusions]]
 path = "^/api/graphql"
 rules = ["PQW-NOSQL-001"]  # or individual rule identifiers
+
+[[waf.exclusions]]
+path = "^/encrypt$"
+host = "^api\\.example\\.com$"   # only on this host (authority or Host, no port)
+categories = ["sqli", "xss"]
 ```
+
+An exclusion without `host` applies on every host. One whose `host` does not
+compile applies nowhere.
 
 **Metrics.** The Prometheus endpoint exports `pqcrypta_waf_requests_total`,
 `pqcrypta_waf_allowed_total`, `pqcrypta_waf_blocked_total`,

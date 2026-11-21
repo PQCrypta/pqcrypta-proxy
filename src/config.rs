@@ -514,7 +514,8 @@ impl Default for WafCrsConfig {
     }
 }
 
-/// Suppress specific WAF rules or categories on paths matching a regex.
+/// Suppress specific WAF rules or categories on paths matching a regex, on
+/// every host or on the hosts `host` matches.
 ///
 /// Tuning used to mean switching a whole category off globally: a single
 /// false positive on one endpoint cost the protection everywhere.
@@ -522,6 +523,12 @@ impl Default for WafCrsConfig {
 pub struct WafExclusion {
     /// Regex matched against the request path
     pub path: String,
+    /// Regex matched against the request's host (its authority over HTTP/2
+    /// and HTTP/3, its Host header over HTTP/1.1, without a port); every
+    /// host when absent. A node serves many sites, and an endpoint's path
+    /// alone may name another site's page.
+    #[serde(default)]
+    pub host: Option<String>,
     /// Rule identifiers to suppress, e.g. "PQW-NOSQL-001"
     #[serde(default)]
     pub rules: Vec<String>,
