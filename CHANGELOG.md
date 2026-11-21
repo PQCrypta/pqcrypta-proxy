@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.18.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.3...v0.18.0) (2026-11-21)
+
+
+### Features
+
+* **waf:** the OWASP Core Rule Set beside the native rules ([waf.crs]) ([e076ffd](https://github.com/PQCrypta/pqcrypta-proxy/commit/e076ffd99aae45d22779b6a2b14f4924ad450bc5))
+
+
+### Bug Fixes
+
+* **config:** the watcher follows the CRS directory across reloads (a rule set turned on after start was not watched) ([26aae60](https://github.com/PQCrypta/pqcrypta-proxy/commit/26aae60f28f72f32d85b44d03639520990255213))
+* **load-balancer:** reserve capacity atomically; canary rollback on responses ([63c7ca9](https://github.com/PQCrypta/pqcrypta-proxy/commit/63c7ca98d53cd4260d28d79166699de96ddf1c01))
+* **pentests:** the integrity preflight queries with the sealed DB credential and checks every API instance ([8fecea8](https://github.com/PQCrypta/pqcrypta-proxy/commit/8fecea8cf296d4592fd5151e6eb895870cf61e1b))
+* **rate-limit:** rolling windows in Redis and on each node ([1d294df](https://github.com/PQCrypta/pqcrypta-proxy/commit/1d294df7bda585d39c63704fdd2452963c96f758))
+* **waf:** `@rx` matched as PCRE matches for ModSecurity: bytes, ASCII classes and case, DOTALL ([b3ed78d](https://github.com/PQCrypta/pqcrypta-proxy/commit/b3ed78de2efc22f761f97a08ab80f41d69a7abc4))
+* **waf:** bytes that are not UTF-8 kept as themselves, so `@validateUtf8Encoding` and `@validateByteRange` judge the request's bytes ([47c23b7](https://github.com/PQCrypta/pqcrypta-proxy/commit/47c23b793c04e64735ad6c89c1384995a3b290af))
+* **waf:** CRS verdicts name the variables that matched (names, never values); ctl:ruleRemoveTargetById takes a regular expression ([5077f6c](https://github.com/PQCrypta/pqcrypta-proxy/commit/5077f6c5a86118c47c916759efb177c98fab8874))
+* **waf:** ctl:ruleRemoveTargetByTag in the CRS engine (CRS 941010's XSS path exclusion) ([5ca1238](https://github.com/PQCrypta/pqcrypta-proxy/commit/5ca1238fce7e71fd20427dfcf04500ac978e0d2c))
+* **waf:** regular-expression selections compare keys case-insensitively (CRS 922110 never fired) ([9c92ab3](https://github.com/PQCrypta/pqcrypta-proxy/commit/9c92ab3d47f783c9dc6bd8b60a4959b726819355))
+* **waf:** request bodies as ModSecurity reads them (XML in the XML collection, REQUEST_BODY after URLENCODED/JSON or when forced, REQBODY_PROCESSOR from the head), ctl:forceRequestBodyVariable, ctl:ruleRemoveByTag, UNIQUE_ID ([9518f23](https://github.com/PQCrypta/pqcrypta-proxy/commit/9518f23b0b0a8e9256e8aba190aa925f93bc3914))
+* **waf:** REQUEST_URI, REQUEST_FILENAME and REQUEST_BASENAME URI-decoded, as libmodsecurity v3 sets them ([9eb3d35](https://github.com/PQCrypta/pqcrypta-proxy/commit/9eb3d356d058786f808574b3bfc3012ffacfff83))
+* **waf:** the multipart processor as libmodsecurity v3's (strict checks, MULTIPART_* flags, FILES_SIZES, FILES_COMBINED_SIZE, bytes not text) ([de7b726](https://github.com/PQCrypta/pqcrypta-proxy/commit/de7b7261abd317a280db302c767800ec7c392922))
+* **waf:** URL decoding as ModSecurity's (+ to a space, non-strict escapes, on bytes) ([61f2181](https://github.com/PQCrypta/pqcrypta-proxy/commit/61f218183f66366f1a52350f5bcd39be5bee0758))
+
 ## [0.17.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.2...v0.17.3) (2026-11-18)
 
 
