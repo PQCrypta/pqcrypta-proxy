@@ -82,7 +82,9 @@ pub(crate) async fn divert(
     if !active() {
         return Some(stream);
     }
-    let Some(route) = extract_sni_from_client_hello(peeked).and_then(|sni| route_for(&sni)) else {
+    let Some(route) =
+        crate::tls_acceptor::client_hello_server_name(peeked).and_then(|sni| route_for(&sni))
+    else {
         return Some(stream);
     };
     let Some((metrics, shutdown)) = RUNTIME.get() else {
@@ -170,127 +172,9 @@ async fn relay(
     }
 }
 
-/// Extract SNI from TLS ClientHello
-pub(crate) fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
-    // TLS record header: type (1) + version (2) + length (2)
-    if data.len() < 5 {
-        return None;
-    }
-
-    // Check it's a handshake record (0x16)
-    if data[0] != 0x16 {
-        return None;
-    }
-
-    // Skip record header
-    let handshake = &data[5..];
-
-    // Handshake header: type (1) + length (3)
-    if handshake.len() < 4 {
-        return None;
-    }
-
-    // Check it's a ClientHello (0x01)
-    if handshake[0] != 0x01 {
-        return None;
-    }
-
-    // Parse ClientHello
-    let client_hello = &handshake[4..];
-    if client_hello.len() < 38 {
-        return None;
-    }
-
-    // Skip version (2) + random (32) = 34 bytes
-    let mut offset = 34;
-
-    // Session ID length
-    if offset >= client_hello.len() {
-        return None;
-    }
-    let session_id_len = client_hello[offset] as usize;
-    offset += 1 + session_id_len;
-
-    // Cipher suites length (2 bytes)
-    if offset + 2 > client_hello.len() {
-        return None;
-    }
-    let cipher_suites_len =
-        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
-    offset += 2 + cipher_suites_len;
-
-    // Compression methods length
-    if offset >= client_hello.len() {
-        return None;
-    }
-    let compression_len = client_hello[offset] as usize;
-    offset += 1 + compression_len;
-
-    // Extensions length (2 bytes)
-    if offset + 2 > client_hello.len() {
-        return None;
-    }
-    let extensions_len =
-        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
-    offset += 2;
-
-    let extensions_end = offset + extensions_len;
-    if extensions_end > client_hello.len() {
-        return None;
-    }
-
-    // Parse extensions to find SNI (type 0x0000)
-    while offset + 4 <= extensions_end {
-        let ext_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
-        let ext_len =
-            u16::from_be_bytes([client_hello[offset + 2], client_hello[offset + 3]]) as usize;
-        offset += 4;
-
-        if ext_type == 0x0000 {
-            // SNI extension
-            if offset + ext_len > client_hello.len() {
-                return None;
-            }
-
-            let sni_data = &client_hello[offset..offset + ext_len];
-
-            // SNI list length (2 bytes)
-            if sni_data.len() < 2 {
-                return None;
-            }
-
-            let mut sni_offset = 2; // Skip list length
-
-            // Parse SNI entries
-            while sni_offset + 3 <= sni_data.len() {
-                let name_type = sni_data[sni_offset];
-                let name_len =
-                    u16::from_be_bytes([sni_data[sni_offset + 1], sni_data[sni_offset + 2]])
-                        as usize;
-                sni_offset += 3;
-
-                if name_type == 0x00 && sni_offset + name_len <= sni_data.len() {
-                    // Host name
-                    if let Ok(hostname) =
-                        std::str::from_utf8(&sni_data[sni_offset..sni_offset + name_len])
-                    {
-                        return Some(hostname.to_string());
-                    }
-                }
-
-                sni_offset += name_len;
-            }
-        }
-
-        offset += ext_len;
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::tls_acceptor::client_hello_server_name;
 
     /// The passthrough listener reads the SNI of a ClientHello it never
     /// terminates; with panic = "abort" a panic here ends the process.
@@ -300,7 +184,7 @@ mod tests {
             &build_client_hello_with_sni("example.com"),
             200_000,
             |m| {
-                let _ = extract_sni_from_client_hello(m);
+                let _ = client_hello_server_name(m);
             },
         );
     }
@@ -389,14 +273,14 @@ mod tests {
     #[test]
     fn test_sni_extraction_simple() {
         let data = build_client_hello_with_sni("example.com");
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, Some("example.com".to_string()));
     }
 
     #[test]
     fn test_sni_extraction_subdomain() {
         let data = build_client_hello_with_sni("api.pqcrypta.com");
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, Some("api.pqcrypta.com".to_string()));
     }
 
@@ -404,7 +288,7 @@ mod tests {
     fn test_sni_extraction_long_hostname() {
         let hostname = "very-long-subdomain.another-subdomain.example.domain.com";
         let data = build_client_hello_with_sni(hostname);
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, Some(hostname.to_string()));
     }
 
@@ -412,20 +296,20 @@ mod tests {
     fn test_sni_extraction_with_port_like_name() {
         // Some hostnames might look unusual
         let data = build_client_hello_with_sni("server-443.internal.local");
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, Some("server-443.internal.local".to_string()));
     }
 
     #[test]
     fn test_sni_extraction_empty_data() {
-        let sni = extract_sni_from_client_hello(&[]);
+        let sni = client_hello_server_name(&[]);
         assert_eq!(sni, None);
     }
 
     #[test]
     fn test_sni_extraction_too_short() {
         // Less than 5 bytes (TLS record header)
-        let sni = extract_sni_from_client_hello(&[0x16, 0x03, 0x01]);
+        let sni = client_hello_server_name(&[0x16, 0x03, 0x01]);
         assert_eq!(sni, None);
     }
 
@@ -433,7 +317,7 @@ mod tests {
     fn test_sni_extraction_not_handshake() {
         // Application data record (0x17) instead of handshake (0x16)
         let data = [0x17, 0x03, 0x03, 0x00, 0x10, 0x00, 0x00, 0x00];
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, None);
     }
 
@@ -444,7 +328,7 @@ mod tests {
             0x16, 0x03, 0x03, 0x00, 0x05, // TLS record header
             0x02, 0x00, 0x00, 0x01, 0x00, // ServerHello header
         ];
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, None);
     }
 
@@ -455,7 +339,7 @@ mod tests {
             0x16, 0x03, 0x03, 0x00, 0x02, // TLS record header (claims 2 bytes)
             0x01, 0x00, // Truncated ClientHello
         ];
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, None);
     }
 
@@ -509,7 +393,7 @@ mod tests {
             u8::try_from((client_hello_len >> 8) & 0xFF).unwrap_or(u8::MAX);
         data[handshake_len_pos + 2] = u8::try_from(client_hello_len & 0xFF).unwrap_or(u8::MAX);
 
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, None);
     }
 
@@ -594,7 +478,7 @@ mod tests {
         );
         record.extend(handshake);
 
-        let sni = extract_sni_from_client_hello(&record);
+        let sni = client_hello_server_name(&record);
         assert_eq!(sni, Some(hostname.to_string()));
     }
 
@@ -669,7 +553,7 @@ mod tests {
         );
         record.extend(handshake);
 
-        let sni = extract_sni_from_client_hello(&record);
+        let sni = client_hello_server_name(&record);
         assert_eq!(sni, Some(hostname.to_string()));
     }
 
@@ -678,7 +562,7 @@ mod tests {
         // International domain name in ASCII-compatible encoding
         let hostname = "xn--n3h.example.com"; // Contains emoji in punycode
         let data = build_client_hello_with_sni(hostname);
-        let sni = extract_sni_from_client_hello(&data);
+        let sni = client_hello_server_name(&data);
         assert_eq!(sni, Some(hostname.to_string()));
     }
 }

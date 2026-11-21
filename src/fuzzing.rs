@@ -27,15 +27,19 @@ pub fn client_hello(data: &[u8]) {
         crate::tls_acceptor::FingerprintingTlsAcceptor::client_hello_has_early_data_extension(data);
     let _ = crate::http_listener::client_hello_needs(data, data.len());
 
-    // Two readers of the same field: the passthrough router sends a
-    // connection on by the name it reads, the acceptor fingerprints and
-    // answers by the name it reads. Where both read one, it is the same name.
-    let acceptor = crate::tls_acceptor::FingerprintingTlsAcceptor::extract_sni(data);
-    let router = crate::http_listener::passthrough::extract_sni_from_client_hello(data);
-    if let (Some(a), Some(r)) = (&acceptor, &router) {
-        assert!(
-            a.eq_ignore_ascii_case(r),
-            "the acceptor reads SNI {a:?} where the passthrough router reads {r:?}"
+    // The name everything before the handshake reads (passthrough routing,
+    // the HTTP/1.1-only acceptor) is the name the handshake reads: rustls's own
+    // parse of the same record, where it takes the record as a ClientHello.
+    // Only a record holding one whole ClientHello is compared; rustls would
+    // join one split over records, which nothing before it reads.
+    let ours = crate::tls_acceptor::client_hello_server_name(data);
+    if let crate::tls_acceptor::HandshakeReads::ServerName(theirs) =
+        crate::tls_acceptor::handshake_server_name(data)
+    {
+        assert_eq!(
+            ours.as_deref(),
+            theirs.as_deref(),
+            "the proxy reads SNI {ours:?} where the handshake reads {theirs:?}"
         );
     }
 
