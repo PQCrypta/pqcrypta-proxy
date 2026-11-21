@@ -7,11 +7,10 @@
 //! recommended rule 200003). The body is bytes: a file part is never decoded
 //! as text to be split.
 //!
-//! Two departures, both where ModSecurity's behaviour is a gap rather than a
-//! semantic: an empty boundary (`boundary=`) is an error here, where v3 stops
-//! without one and leaves the body uninspected; and the file limit
-//! (`MULTIPART_FILE_LIMIT_EXCEEDED`) is never reached, because v3 checks it
-//! only when it writes uploads to disk, which this engine never does.
+//! Two departures: an empty boundary (`boundary=`) is an error here; and the
+//! file limit (`MULTIPART_FILE_LIMIT_EXCEEDED`) is never reached, because v3
+//! checks it only when it writes uploads to disk, which this engine never
+//! does.
 
 /// What the strict checks found, each backing a `MULTIPART_*` variable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

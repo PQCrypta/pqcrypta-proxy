@@ -1,8 +1,8 @@
 //! `@validateUtf8Encoding` and `@validateByteRange` on the request's bytes.
 //!
-//! Values are `String`s, and the decoders replaced every byte that was not
-//! UTF-8 with U+FFFD, so CRS's 920250 could never see an overlong `%c0%af`
-//! (`/`) or a truncated sequence, and flagged a NUL, which is valid UTF-8.
+//! Values are `String`s; a byte that is not UTF-8 is kept as itself
+//! (crate::bytes), so CRS's 920250 sees an overlong `%c0%af` (`/`) or a
+//! truncated sequence, and a NUL, valid UTF-8, passes.
 
 use zentinel_modsec::ModSecurity;
 
