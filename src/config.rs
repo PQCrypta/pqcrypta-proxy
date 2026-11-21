@@ -4352,10 +4352,16 @@ fn is_crs_file(dir: &Path, path: &Path) -> bool {
 impl ConfigManager {
     // re-open for remaining methods
 
-    /// Manually reload configuration
+    /// Manually reload configuration. The file is read and parsed on the
+    /// blocking pool, never on a runtime worker.
     pub async fn reload(&self) -> anyhow::Result<()> {
         let overrides = self.overrides.read().clone();
-        match Self::load_effective(&self.config_path, &overrides) {
+        let path = self.config_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || Self::load_effective(&path, &overrides))
+            .await
+            .map_err(|e| anyhow::anyhow!("the configuration load task failed: {e}"))
+            .and_then(|loaded| loaded);
+        match loaded {
             Ok(new_config) => {
                 let new_config = Arc::new(new_config);
                 self.config.store(new_config.clone());
