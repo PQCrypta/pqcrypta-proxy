@@ -203,6 +203,54 @@ fn load(dir: &Path, extra: &str) -> ModSecurity {
     ModSecurity::from_string(&cfg).expect("CRS should load")
 }
 
+/// go-ftw's `methodsWithBodyRegex`, `^POST|PUT|PATCH|DELETE$`, alternation
+/// and all.
+fn body_method(m: &str) -> bool {
+    m.starts_with("POST") || m.contains("PUT") || m.contains("PATCH") || m.contains("DELETE")
+}
+
+/// Go's `url.QueryUnescape`: `%XX` and `+`, `None` on a malformed escape.
+fn query_unescape(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                let (h, l) = (hex(*b.get(i + 1)?)?, hex(*b.get(i + 2)?)?);
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Go's `url.QueryEscape`: unreserved characters kept, a space as `+`, every
+/// other byte `%XX`.
+fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &c in s.as_bytes() {
+        match c {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(c as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{c:02X}")),
+        }
+    }
+    out
+}
+
 /// Drive one corpus stage and return the rule IDs that matched.
 fn run_stage(m: &ModSecurity, input: &Input) -> Vec<String> {
     let mut tx = m.new_transaction();
@@ -213,29 +261,55 @@ fn run_stage(m: &ModSecurity, input: &Input) -> Vec<String> {
         return vec![];
     }
 
-    let has = |n: &str| input.headers.keys().any(|k| k.eq_ignore_ascii_case(n));
-    for (k, v) in &input.headers {
-        let _ = tx.add_request_header(k, &scalar(v));
+    // The request go-ftw sends for this stage (ftwhttp/request.go:
+    // BuildRequest, encodeDataParameters, AddStandardHeaders). It adds no
+    // Host, User-Agent or Accept: the tests of a missing header (920280,
+    // 920300, 920311, 920320) depend on that.
+    let mut headers: Vec<(String, String)> = input
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), scalar(v)))
+        .collect();
+    let has = |h: &[(String, String)], n: &str| h.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
+    let header = |h: &[(String, String)], n: &str| {
+        h.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.clone())
+    };
+    let mut body = input.data.as_ref().map(scalar).unwrap_or_default();
+    let autocomplete = input.autocomplete_headers.unwrap_or(true);
+    const FORM: &str = "application/x-www-form-urlencoded";
+    // A body with no type is a form
+    if autocomplete && !body.is_empty() && !has(&headers, "Content-Type") {
+        headers.push(("Content-Type".into(), FORM.into()));
     }
-    let body = input.data.as_ref().map(scalar).unwrap_or_default();
-    // go-ftw fills these in unless a test opts out.
-    if input.autocomplete_headers.unwrap_or(true) {
-        if !has("Host") {
-            let host = input
-                .dest_addr
-                .clone()
-                .unwrap_or_else(|| "localhost".into());
-            let _ = tx.add_request_header("Host", &host);
+    let content_type = header(&headers, "Content-Type").unwrap_or_default();
+    // A form body written unescaped is escaped, key and value
+    if content_type.contains(FORM) && query_unescape(&body).as_deref() == Some(body.as_str()) {
+        body = body
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.split_once('=') {
+                Some((k, v)) => format!("{}={}", query_escape(k), query_escape(v)),
+                None => query_escape(p),
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+    }
+    // A multipart body's line endings are CRLF on the wire
+    if content_type.contains("multipart/form-data;") {
+        body = body.replace('\n', "\r\n");
+    }
+    if autocomplete {
+        if !has(&headers, "Connection") {
+            headers.push(("Connection".into(), "close".into()));
         }
-        if !has("User-Agent") {
-            let _ = tx.add_request_header("User-Agent", "go-ftw");
+        if !has(&headers, "Content-Length") && (!body.is_empty() || body_method(&method)) {
+            headers.push(("Content-Length".into(), body.len().to_string()));
         }
-        if !has("Accept") {
-            let _ = tx.add_request_header("Accept", "*/*");
-        }
-        if !body.is_empty() && !has("Content-Length") {
-            let _ = tx.add_request_header("Content-Length", &body.len().to_string());
-        }
+    }
+    for (k, v) in &headers {
+        let _ = tx.add_request_header(k, v);
     }
     if tx.process_request_headers().is_err() {
         return tx.matched_rules().to_vec();
