@@ -228,6 +228,102 @@ fn dechunk(body: &str) -> String {
     out
 }
 
+/// The backend's answer, as the corpus's backend, albedo, gives it, through
+/// the response phases and logging: `POST /reflect` answers with the JSON
+/// body's `status` (200), `headers` and `body` (or base64 `encodedBody`);
+/// anything else with an empty 200. A body without a Content-Type is given
+/// the one Go's net/http sniffs for it.
+fn respond(tx: &mut zentinel_modsec::engine::Transaction, method: &str, uri: &str, body: &str) {
+    let mut status = 200u16;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
+    if method == "POST" && uri.split('?').next() == Some("/reflect") {
+        if let Ok(spec) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(s) = spec.get("status").and_then(|s| s.as_u64()) {
+                status = u16::try_from(s).unwrap_or(200);
+            }
+            if let Some(h) = spec.get("headers").and_then(|h| h.as_object()) {
+                for (k, v) in h {
+                    headers.push((
+                        k.clone(),
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string()),
+                    ));
+                }
+            }
+            if let Some(b) = spec.get("body").and_then(|b| b.as_str()) {
+                out = b.as_bytes().to_vec();
+            } else if let Some(e) = spec.get("encodedBody").and_then(|b| b.as_str()) {
+                use base64::Engine;
+                out = base64::engine::general_purpose::STANDARD
+                    .decode(e)
+                    .unwrap_or_default();
+            }
+        }
+    }
+    if !out.is_empty()
+        && !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+    {
+        headers.push(("Content-Type".into(), sniff(&out).into()));
+    }
+    tx.set_response_status(status, "HTTP/1.1");
+    for (k, v) in &headers {
+        let _ = tx.add_response_header(k, v);
+    }
+    let _ = tx.process_response_headers();
+    if !out.is_empty() {
+        let _ = tx.append_response_body(&out);
+    }
+    let _ = tx.process_response_body();
+    let _ = tx.process_logging();
+}
+
+/// What Go's `http.DetectContentType` calls a body, in the cases a test
+/// body takes: HTML, XML, text, or bytes.
+fn sniff(body: &[u8]) -> &'static str {
+    let lead: Vec<u8> = body
+        .iter()
+        .skip_while(|c| c.is_ascii_whitespace())
+        .take(14)
+        .map(u8::to_ascii_uppercase)
+        .collect();
+    const HTML: [&[u8]; 17] = [
+        b"<!DOCTYPE HTML",
+        b"<HTML",
+        b"<HEAD",
+        b"<SCRIPT",
+        b"<IFRAME",
+        b"<H1",
+        b"<DIV",
+        b"<FONT",
+        b"<TABLE",
+        b"<A",
+        b"<STYLE",
+        b"<TITLE",
+        b"<B",
+        b"<BODY",
+        b"<BR",
+        b"<P",
+        b"<!--",
+    ];
+    let tag_end = |sig: &[u8]| lead.get(sig.len()).is_none_or(|c| *c == b' ' || *c == b'>');
+    if HTML.iter().any(|sig| lead.starts_with(sig) && tag_end(sig)) {
+        "text/html; charset=utf-8"
+    } else if lead.starts_with(b"<?XML") {
+        "text/xml; charset=utf-8"
+    } else if body
+        .iter()
+        .any(|&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r' | 0x0c | 0x1b))
+    {
+        "application/octet-stream"
+    } else {
+        "text/plain; charset=utf-8"
+    }
+}
+
 /// go-ftw's `methodsWithBodyRegex`, `^POST|PUT|PATCH|DELETE$`, alternation
 /// and all.
 fn body_method(m: &str) -> bool {
@@ -367,6 +463,7 @@ fn drive_stage(m: &ModSecurity, input: &Input) -> zentinel_modsec::engine::Trans
         let _ = tx.append_request_body(body.as_bytes());
     }
     let _ = tx.process_request_body();
+    respond(&mut tx, &method, &uri, &body);
     tx
 }
 

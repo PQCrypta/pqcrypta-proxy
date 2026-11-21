@@ -428,6 +428,13 @@ impl Transaction {
         }
     }
 
+    /// Set the response's status code and protocol (`RESPONSE_STATUS`,
+    /// `RESPONSE_PROTOCOL`), before `process_response_headers`.
+    pub fn set_response_status(&mut self, status: u16, protocol: &str) {
+        self.response.set_status(status);
+        self.response.set_protocol(protocol);
+    }
+
     /// Add a response header.
     pub fn add_response_header(&mut self, name: &str, value: &str) -> Result<()> {
         self.response.add_header(name, value);
