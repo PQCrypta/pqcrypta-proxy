@@ -112,8 +112,6 @@ struct Stage {
 #[derive(Deserialize, Default)]
 struct Input {
     #[serde(default)]
-    dest_addr: Option<String>,
-    #[serde(default)]
     method: Option<String>,
     #[serde(default)]
     uri: Option<String>,
@@ -208,10 +206,7 @@ fn load(dir: &Path, extra: &str) -> ModSecurity {
 fn dechunk(body: &str) -> String {
     let mut out = String::new();
     let mut rest = body;
-    loop {
-        let Some((line, after)) = rest.split_once('\n') else {
-            break;
-        };
+    while let Some((line, after)) = rest.split_once('\n') {
         let size = line
             .trim_end_matches('\r')
             .split(';')
@@ -710,7 +705,7 @@ fn crs_case() {
             println!("matched: {:?}", tx.matched_rules());
             for d in tx.matched_data() {
                 let rid = d.rule_id.clone().unwrap_or_default();
-                if rules.is_empty() || rules.iter().any(|r| rid == *r) {
+                if rules.is_empty() || rules.contains(&rid) {
                     println!(
                         "  {rid} {} = {:?} (hit {:?})",
                         d.variable, d.value, d.matched_portion
