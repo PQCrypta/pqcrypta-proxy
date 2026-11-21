@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::chain::ChainState;
 use super::control::{CtlDirective, TransactionControls};
-use super::intervention::Intervention;
+use super::intervention::{Intervention, RuleMessage};
 use super::phase::Phase;
 use super::ruleset::{CompiledRule, CompiledRuleset, RuleEngineMode};
 use super::scoring::ANOMALY_SCORE;
@@ -96,6 +96,8 @@ pub struct Transaction {
     allowed: bool,
     /// Matched variables for current rule evaluation.
     matched_vars: Vec<(String, String)>,
+    /// The messages of the rules that matched (`RuleMessage`).
+    messages: Vec<RuleMessage>,
     /// Regex captures from last match.
     captures: Vec<String>,
     /// Per-transaction `ctl:` overrides.
@@ -217,6 +219,7 @@ impl Transaction {
             matched_rules: Vec::new(),
             allowed: false,
             matched_vars: Vec::new(),
+            messages: Vec::new(),
             captures: Vec::new(),
             controls: TransactionControls::default(),
             matched_data: Vec::new(),
@@ -495,6 +498,18 @@ impl Transaction {
         self.intervention.is_some()
     }
 
+    /// The messages of the rules that matched, in order, as ModSecurity logs
+    /// them (`RuleMessage::log_line`).
+    pub fn messages(&self) -> &[RuleMessage] {
+        &self.messages
+    }
+
+    /// Why the request body processor could not process the body
+    /// (`REQBODY_ERROR_MSG`), if it could not.
+    pub fn request_body_error(&self) -> Option<&str> {
+        self.request.body_error.as_deref()
+    }
+
     /// Get matched rule IDs.
     pub fn matched_rules(&self) -> &[String] {
         &self.matched_rules
@@ -717,7 +732,7 @@ impl Transaction {
                 // has now matched in full. A completed chain keeps the
                 // starter's disruptive action, flow and metadata, and runs the
                 // ctl of every link.
-                let action_result = if chain_state.in_chain {
+                let mut action_result = if chain_state.in_chain {
                     chain_state.reset();
                     if let Some(id) = pending_chain_id.take() {
                         self.matched_rules.push(id);
@@ -737,6 +752,33 @@ impl Transaction {
                     }
                     action_result
                 };
+
+                // The rule's message, its macros expanded now, while
+                // MATCHED_VAR and TX:0 are this match's; the intervention
+                // below carries the same text
+                let meta = &mut action_result.metadata;
+                let expand = |v: Option<String>| {
+                    v.map(|v| {
+                        if v.contains("%{") {
+                            self.expand_operator_macros(&v)
+                        } else {
+                            v
+                        }
+                    })
+                };
+                meta.msg = expand(meta.msg.take());
+                meta.logdata = expand(meta.logdata.take());
+                let meta = &action_result.metadata;
+                if !meta.nolog && (meta.msg.is_some() || meta.logdata.is_some()) {
+                    self.messages.push(RuleMessage {
+                        rule_id: meta.id.clone(),
+                        msg: meta.msg.clone(),
+                        data: meta.logdata.clone(),
+                        severity: meta.severity,
+                        ver: meta.ver.clone(),
+                        tags: meta.tags.clone(),
+                    });
+                }
 
                 // Apply ctl: overrides before the disruptive action below, so
                 // that ctl:ruleEngine=DetectionOnly on the same rule governs
