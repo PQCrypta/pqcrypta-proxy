@@ -318,21 +318,37 @@ fn crs_regression_corpus() {
                     pass += 1;
                 } else {
                     if list_failures {
+                        let ids =
+                            |v: &Vec<serde_yaml::Value>| v.iter().map(scalar).collect::<Vec<_>>();
+                        let (want, not) = (ids(&log.expect_ids), ids(&log.no_expect_ids));
+                        // The matched rules of the families the stage is about
+                        let fam: Vec<&str> = want
+                            .iter()
+                            .chain(&not)
+                            .map(|i| &i[..3.min(i.len())])
+                            .collect();
+                        let near: Vec<&String> = got
+                            .iter()
+                            .filter(|g| fam.iter().any(|f| g.starts_with(f)))
+                            .collect();
+                        let ct = stage
+                            .input
+                            .headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                            .map(|(_, v)| scalar(v))
+                            .unwrap_or_default();
+                        let data = stage.input.data.as_ref().map(scalar).unwrap_or_default();
+                        let cut = |s: &str, n: usize| {
+                            s.chars().take(n).collect::<String>().replace('\n', "\\n")
+                        };
                         println!(
-                            "FAILING {fname} test {} (expected {:?}, not {:?}; got {:?})",
+                            "FAILING {fname} test {} want {want:?} not {not:?} got {near:?} | {} {} | ct={} | data={}",
                             t.test_id.unwrap_or_default(),
-                            log.expect_ids.iter().map(scalar).collect::<Vec<_>>(),
-                            log.no_expect_ids.iter().map(scalar).collect::<Vec<_>>(),
-                            got.iter()
-                                .filter(|id| !id.ends_with("011")
-                                    && !id.ends_with("012")
-                                    && !id.ends_with("013")
-                                    && !id.ends_with("014")
-                                    && !id.ends_with("015")
-                                    && !id.ends_with("016")
-                                    && !id.ends_with("017")
-                                    && !id.ends_with("018"))
-                                .collect::<Vec<_>>(),
+                            stage.input.method.as_deref().unwrap_or("GET"),
+                            cut(stage.input.uri.as_deref().unwrap_or("/"), 90),
+                            cut(&ct, 40),
+                            cut(&data, 90),
                         );
                     }
                     fail += 1;
