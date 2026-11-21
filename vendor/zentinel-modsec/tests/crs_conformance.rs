@@ -253,12 +253,17 @@ fn query_escape(s: &str) -> String {
 
 /// Drive one corpus stage and return the rule IDs that matched.
 fn run_stage(m: &ModSecurity, input: &Input) -> Vec<String> {
+    drive_stage(m, input).matched_rules().to_vec()
+}
+
+/// Drive one corpus stage through a transaction, and return it.
+fn drive_stage(m: &ModSecurity, input: &Input) -> zentinel_modsec::engine::Transaction {
     let mut tx = m.new_transaction();
     let uri = input.uri.clone().unwrap_or_else(|| "/".into());
     let method = input.method.clone().unwrap_or_else(|| "GET".into());
     let version = input.version.clone().unwrap_or_else(|| "HTTP/1.1".into());
     if tx.process_uri(&uri, &method, &version).is_err() {
-        return vec![];
+        return tx;
     }
 
     // The request go-ftw sends for this stage (ftwhttp/request.go:
@@ -312,13 +317,13 @@ fn run_stage(m: &ModSecurity, input: &Input) -> Vec<String> {
         let _ = tx.add_request_header(k, v);
     }
     if tx.process_request_headers().is_err() {
-        return tx.matched_rules().to_vec();
+        return tx;
     }
     if !body.is_empty() {
         let _ = tx.append_request_body(body.as_bytes());
     }
     let _ = tx.process_request_body();
-    tx.matched_rules().to_vec()
+    tx
 }
 
 // --- the gate --------------------------------------------------------------
@@ -626,4 +631,43 @@ fn stock_crs_blocks_attacks_and_passes_ordinary_traffic() {
         "stock CRS behaved wrongly:\n  {}",
         wrong.join("\n  ")
     );
+}
+
+/// One corpus case, for looking at it: `CRS_CASE=942430.yaml#3` (and
+/// `CRS_RULES=942430,942431`, the rules to show) runs that test's stages and
+/// prints what the rules matched: variable, value after transformations, and
+/// the portion the operator hit.
+#[test]
+#[ignore]
+fn crs_case() {
+    let Some(dir) = crs_dir() else { return };
+    let case = std::env::var("CRS_CASE").expect("CRS_CASE=<file>#<test id>");
+    let (file, id) = case.split_once('#').expect("<file>#<test id>");
+    let id: u32 = id.parse().expect("a test id");
+    let rules: Vec<String> = std::env::var("CRS_RULES")
+        .map(|r| r.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let m = load(&dir, FTW_SETUP);
+    let path = walkdir::WalkDir::new(dir.join("tests/regression/tests"))
+        .into_iter()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy() == file)
+        .expect("the test file")
+        .into_path();
+    let parsed: TestFile = serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for t in parsed.tests.iter().filter(|t| t.test_id == Some(id)) {
+        for stage in &t.stages {
+            let tx = drive_stage(&m, &stage.input);
+            println!("matched: {:?}", tx.matched_rules());
+            for d in tx.matched_data() {
+                let rid = d.rule_id.clone().unwrap_or_default();
+                if rules.is_empty() || rules.iter().any(|r| rid == *r) {
+                    println!(
+                        "  {rid} {} = {:?} (hit {:?})",
+                        d.variable, d.value, d.matched_portion
+                    );
+                }
+            }
+        }
+    }
 }
