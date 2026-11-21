@@ -3434,10 +3434,13 @@ async fn proxy_handler(
                     None,
                 );
             };
+            // The first block of the allowance, so a download it cannot
+            // start is refused before any byte; the rest is drawn as the
+            // bytes are sent.
             let allowance = match crate::speedtest_budget::reserve(
                 client,
                 crate::speedtest_budget::Direction::Download,
-                bytes_to_send,
+                bytes_to_send.min(crate::speedtest_budget::DRAW_BLOCK),
             ) {
                 Ok(reservation) => reservation,
                 Err(r) => {
@@ -3469,9 +3472,10 @@ async fn proxy_handler(
                         return None;
                     }
                     let n = usize::try_from(rem.min(CHUNK as u64)).unwrap_or(CHUNK);
+                    // A download that spends the allowance ends there
+                    allowance.draw(n as u64).ok()?;
                     let data = chunk.slice(..n);
                     rem -= n as u64;
-                    allowance.use_bytes(n as u64);
                     Some((
                         Ok::<bytes::Bytes, std::io::Error>(data),
                         (rem, chunk, allowance, slot),
