@@ -85,6 +85,8 @@ RUN cargo build --release && rm -rf src target/release/deps/pqcrypta*
 # Copy actual source
 COPY src ./src
 COPY tests ./tests
+# The built-in fingerprint table, compiled in (src/fingerprint.rs include_str!)
+COPY data/fingerprints ./data/fingerprints
 # build.rs names the commit in `--version`; the context has no .git, so CI
 # passes it (docker build --build-arg PQCRYPTA_GIT_COMMIT=<sha>). Without it
 # the version reads "unknown" rather than failing the build.
