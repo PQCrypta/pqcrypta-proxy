@@ -51,7 +51,7 @@ use instant_acme::{
 ///   - Empty string
 ///
 /// Returns the domain unchanged if it passes validation, or an error message.
-fn validate_domain_for_path(domain: &str) -> Result<String, &'static str> {
+pub(crate) fn validate_domain_for_path(domain: &str) -> Result<String, &'static str> {
     if domain.is_empty() {
         return Err("domain is empty");
     }

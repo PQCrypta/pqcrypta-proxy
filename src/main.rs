@@ -135,6 +135,13 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     socket_unit: Option<PathBuf>,
 
+    /// Write self-signed certificates for testing into DIR and exit: for each
+    /// host the routes name and localhost, an ECDSA P-256 certificate and an
+    /// ML-DSA-87 companion, in the certificate directory's layout. No client
+    /// trusts them; a file already there is never replaced
+    #[arg(long, value_name = "DIR")]
+    test_certificates: Option<PathBuf>,
+
     /// Merge fingerprint corpora into one and write it here: observed.json of
     /// either version, or a published directory's full.json (`--from`)
     #[arg(long, value_name = "OUT")]
@@ -500,6 +507,14 @@ async fn run() -> anyhow::Result<()> {
     }
 
     info!("Configuration validated successfully");
+
+    if let Some(dir) = &args.test_certificates {
+        let hosts = pqcrypta_proxy::test_certificate::hosts(&config);
+        for path in pqcrypta_proxy::test_certificate::write(dir, &hosts)? {
+            info!("Test certificate written: {}", path.display());
+        }
+        return Ok(());
+    }
 
     if let Some(out) = &args.socket_unit {
         let unit = config.socket_unit(&args.config.to_string_lossy());

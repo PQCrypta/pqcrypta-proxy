@@ -383,6 +383,12 @@
     "blocked_ips": [],
     "blocked_regions": [],
     "blocklist_dir": "/var/lib/pqcrypta-proxy/blocklists",
+    "challenge": {
+      "enabled": false,
+      "max_number": 100000,
+      "pass_ttl_secs": 3600,
+      "secret": null
+    },
     "connection_timeout_secs": 30,
     "crawler_published_ranges": true,
     "dos_protection": true,

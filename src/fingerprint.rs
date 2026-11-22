@@ -130,6 +130,22 @@ pub struct KnownFingerprints {
     api_clients: DashMap<String, String>,
 }
 
+/// The built-in table: fingerprints observed by running each client against
+/// this proxy (curl, Wget, Python requests, `openssl s_client`, nmap,
+/// Chromium and Firefox through Playwright), and browser fingerprints from
+/// the observed corpus that agree with them in structure and carry one
+/// browser's User-Agent on at least 97% of many thousands of requests. Each
+/// entry says which. The format is the operator database's
+/// (`fingerprint_db_path`), which is consulted first.
+const BUILTIN: &str = include_str!("../data/fingerprints/builtin.json");
+
+#[derive(serde::Deserialize)]
+struct BuiltinEntry {
+    hash: String,
+    classification: String,
+    description: String,
+}
+
 impl Default for KnownFingerprints {
     fn default() -> Self {
         let db = Self {
@@ -139,97 +155,19 @@ impl Default for KnownFingerprints {
             scanners: DashMap::new(),
             api_clients: DashMap::new(),
         };
-
-        // Known browser fingerprints (these are real JA3 hashes)
-        // Chrome 120+
-        db.browsers.insert(
-            "cd08e31494f9531f560d64c695473da9".to_string(),
-            "Chrome/120+".to_string(),
-        );
-        db.browsers.insert(
-            "b32309a26951912be7dba376398abc3b".to_string(),
-            "Chrome/100-119".to_string(),
-        );
-        // Firefox
-        db.browsers.insert(
-            "47eca2446b260fac53c5cc2dd4aba2ba".to_string(),
-            "Firefox/120+".to_string(),
-        );
-        db.browsers.insert(
-            "e7d705a3286e19ea42f587b344ee6865".to_string(),
-            "Firefox/90-119".to_string(),
-        );
-        // Safari
-        db.browsers.insert(
-            "773906b0efdefa24a7f2b8eb6985bf37".to_string(),
-            "Safari/17+".to_string(),
-        );
-        // Edge
-        db.browsers.insert(
-            "9e10692f1b7f78228b2d4e424db3a98c".to_string(),
-            "Edge/120+".to_string(),
-        );
-
-        // Known legitimate bots
-        db.legitimate_bots.insert(
-            "4d7a28d6f2f7e9c8b5a3c1d0e2f6a9b8".to_string(),
-            "Googlebot".to_string(),
-        );
-        db.legitimate_bots.insert(
-            "3b5074b1b5d032e5620f69f9f700ff0e".to_string(),
-            "Bingbot".to_string(),
-        );
-        db.legitimate_bots.insert(
-            "5b5074b1b5d032e5620f69f9f700ff0a".to_string(),
-            "Cloudflare-Bot".to_string(),
-        );
-
-        // Known malicious fingerprints
-        db.malicious.insert(
-            "e960427dc851bc6c8a87ad68e9e2aa72".to_string(),
-            "SQLMap".to_string(),
-        );
-        db.malicious.insert(
-            "51c64c77e60f3980eea90869b68c58a8".to_string(),
-            "Exploit Kit".to_string(),
-        );
-
-        // Known scanners
-        db.scanners.insert(
-            "72f4b0e61f7f6a1b2c3d4e5f6a7b8c9d".to_string(),
-            "Nmap".to_string(),
-        );
-        db.scanners.insert(
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".to_string(),
-            "Nikto".to_string(),
-        );
-        db.scanners.insert(
-            "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7".to_string(),
-            "Burp Suite".to_string(),
-        );
-
-        // Known API clients
-        db.api_clients.insert(
-            "1be3ecebe5aa9d3654e6e703d24b6052".to_string(),
-            "curl".to_string(),
-        );
-        db.api_clients.insert(
-            "555c5c77e60f3980eea90869b68c58a8".to_string(),
-            "wget".to_string(),
-        );
-        db.api_clients.insert(
-            "2bfc4b8b995e5d37a9a9d05b58655b40".to_string(),
-            "Python-requests".to_string(),
-        );
-        db.api_clients.insert(
-            "6734f37431670b3ab4292b8f60f29984".to_string(),
-            "Go-http-client".to_string(),
-        );
-        db.api_clients.insert(
-            "28a2c9bd18a11de089ef85a160da0c8b".to_string(),
-            "Node.js-axios".to_string(),
-        );
-
+        let entries: Vec<BuiltinEntry> = serde_json::from_str(BUILTIN)
+            .expect("data/fingerprints/builtin.json is a list of entries");
+        for e in entries {
+            let table = match e.classification.as_str() {
+                "browser" => &db.browsers,
+                "legitimate_bot" => &db.legitimate_bots,
+                "malicious" => &db.malicious,
+                "scanner" => &db.scanners,
+                "api_client" => &db.api_clients,
+                other => panic!("builtin.json: {} has classification {other:?}", e.hash),
+            };
+            table.insert(e.hash.to_ascii_lowercase(), e.description);
+        }
         db
     }
 }
@@ -1010,7 +948,10 @@ impl FingerprintExtractor {
                                 BlockReason::SuspiciousFingerprint,
                                 Some(Duration::from_secs(config.suspicious_block_duration_secs)),
                             );
-                            false
+                            // With the challenge on, the connection stays: its
+                            // page loads get the interstitial in place of the
+                            // block, everything else the block (challenge.rs)
+                            security.config.read().challenge.enabled
                         } else {
                             true
                         }
@@ -1772,8 +1713,8 @@ mod tests {
     fn test_known_fingerprints() {
         let db = KnownFingerprints::default();
 
-        // Test browser detection
-        let (class, name) = db.classify("e7d705a3286e19ea42f587b344ee6865");
+        // Test browser detection: Firefox 155 over TCP, as observed
+        let (class, name) = db.classify("t13d1517h2_8daaf6152771_3cbfd9057e0d");
         assert_eq!(class, FingerprintClass::Browser);
         assert!(name.is_some());
 
@@ -2455,56 +2396,84 @@ mod tests {
     #[test]
     fn test_classify_browser_fingerprints() {
         let db = KnownFingerprints::default();
-
-        // Chrome
-        let (class, name) = db.classify("cd08e31494f9531f560d64c695473da9");
-        assert_eq!(class, FingerprintClass::Browser);
-        assert!(name.unwrap().contains("Chrome"));
-
-        // Firefox
-        let (class, name) = db.classify("47eca2446b260fac53c5cc2dd4aba2ba");
-        assert_eq!(class, FingerprintClass::Browser);
-        assert!(name.unwrap().contains("Firefox"));
-
-        // Safari
-        let (class, name) = db.classify("773906b0efdefa24a7f2b8eb6985bf37");
-        assert_eq!(class, FingerprintClass::Browser);
-        assert!(name.unwrap().contains("Safari"));
+        for (ja4, browser) in [
+            ("t13d1516h2_8daaf6152771_7876f607db57", "Chromium"),
+            ("q13d0311h3_55b375c5d22e_653d80c3fe9d", "Chromium"),
+            ("t13d1517h2_8daaf6152771_3cbfd9057e0d", "Firefox"),
+            ("q13d0313h3_55b375c5d22e_4fd40913cea1", "Firefox"),
+            ("t13d2013h2_a09f3c656075_7f0f34a4126d", "Safari"),
+        ] {
+            let (class, name) = db.classify(ja4);
+            assert_eq!(class, FingerprintClass::Browser, "{ja4}");
+            assert!(name.unwrap().contains(browser), "{ja4}");
+        }
     }
 
+    /// Crawlers are recognised by their operators' addresses
+    /// (crawler_verify.rs), never by a fingerprint anyone can present, and no
+    /// fingerprint is condemned as malicious without having been seen doing
+    /// harm: the operator's database says that. The OpenSSL default client's
+    /// JA3, which sqlmap shares with every Python and curl client, is a client.
     #[test]
-    fn test_classify_bot_fingerprints() {
+    fn test_builtin_names_no_crawler_and_condemns_no_fingerprint() {
         let db = KnownFingerprints::default();
-
-        let (class, name) = db.classify("4d7a28d6f2f7e9c8b5a3c1d0e2f6a9b8");
-        assert_eq!(class, FingerprintClass::LegitimateBot);
-        assert!(name.unwrap().contains("Googlebot"));
-    }
-
-    #[test]
-    fn test_classify_malicious_fingerprints() {
-        let db = KnownFingerprints::default();
-
-        let (class, name) = db.classify("e960427dc851bc6c8a87ad68e9e2aa72");
-        assert_eq!(class, FingerprintClass::Malicious);
-        assert!(name.unwrap().contains("SQLMap"));
+        assert!(db.legitimate_bots.is_empty());
+        assert!(db.malicious.is_empty());
+        let (class, _) = db.classify("32e4b8812cda0c0d50783b438492a769");
+        assert_eq!(class, FingerprintClass::ApiClient);
     }
 
     #[test]
     fn test_classify_scanner_fingerprints() {
         let db = KnownFingerprints::default();
-
-        let (class, name) = db.classify("72f4b0e61f7f6a1b2c3d4e5f6a7b8c9d");
+        let (class, name) = db.classify("t12d640400_e31a90cd0803_3549fbaf615c");
         assert_eq!(class, FingerprintClass::Scanner);
-        assert!(name.unwrap().contains("Nmap"));
+        assert!(name.unwrap().contains("nmap"));
     }
 
     #[test]
     fn test_classify_api_client_fingerprints() {
         let db = KnownFingerprints::default();
-
-        let (class, name) = db.classify("1be3ecebe5aa9d3654e6e703d24b6052");
+        let (class, name) = db.classify("t13d3013h2_1d37bd780c83_8537cf56674e");
         assert_eq!(class, FingerprintClass::ApiClient);
         assert!(name.unwrap().contains("curl"));
+    }
+
+    /// Every built-in entry is a JA3 (32 hex digits) or a JA4, appears once,
+    /// and says how it was observed: by running the client, or in the corpus.
+    #[test]
+    fn every_builtin_entry_is_observed_and_well_formed() {
+        let entries: Vec<BuiltinEntry> = serde_json::from_str(BUILTIN).unwrap();
+        let ja4 = regex::Regex::new(r"^[tqd]1[0-3][di]\d{4}[0-9a-z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$")
+            .unwrap();
+        let mut seen = HashSet::new();
+        for e in &entries {
+            let ja3 = e.hash.len() == 32 && e.hash.bytes().all(|b| b.is_ascii_hexdigit());
+            assert!(
+                ja3 || ja4.is_match(&e.hash),
+                "{} is neither JA3 nor JA4",
+                e.hash
+            );
+            assert!(seen.insert(e.hash.clone()), "{} twice", e.hash);
+            assert!(
+                e.description.contains("observed") || e.description.contains("corpus:"),
+                "{} does not say where it was seen",
+                e.hash
+            );
+            assert!(
+                [
+                    "browser",
+                    "api_client",
+                    "scanner",
+                    "legitimate_bot",
+                    "malicious"
+                ]
+                .contains(&e.classification.as_str()),
+                "{}: {}",
+                e.hash,
+                e.classification
+            );
+        }
+        assert!(entries.len() >= 20);
     }
 }

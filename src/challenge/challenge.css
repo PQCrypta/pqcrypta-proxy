@@ -1,0 +1,60 @@
+/* The challenge interstitial (src/challenge.rs) */
+:root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --fg: #1b1f24;
+    --muted: #57606a;
+    --card: #ffffff;
+    --edge: #d0d7de;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0d1117;
+        --fg: #e6edf3;
+        --muted: #8b949e;
+        --card: #161b22;
+        --edge: #30363d;
+    }
+}
+
+html,
+body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+    box-sizing: border-box;
+    max-width: 34rem;
+    margin: 12vh auto 0;
+    padding: 2rem 1.5rem;
+    background: var(--card);
+    border: 1px solid var(--edge);
+    border-radius: 12px;
+}
+
+@media (max-width: 36rem) {
+    main {
+        margin: 1rem;
+    }
+}
+
+h1 {
+    margin: 0 0 0.75rem;
+    font-size: 1.35rem;
+}
+
+p {
+    margin: 0 0 0.75rem;
+    color: var(--muted);
+}
+
+#pqc-status {
+    margin: 1.25rem 0 0;
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
+}

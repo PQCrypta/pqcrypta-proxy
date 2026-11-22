@@ -852,6 +852,49 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
         );
     }
 
+    // Proof-of-work challenges (challenge.rs): issued, solved, refused
+    if let Some(security) = state.security.as_ref() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &security.challenger;
+        output.push_str(
+            "\n# HELP pqcrypta_challenges_total Proof-of-work challenges issued, and solutions passed or failed\n",
+        );
+        output.push_str("# TYPE pqcrypta_challenges_total counter\n");
+        for (outcome, n) in [
+            ("issued", c.issued.load(Relaxed)),
+            ("passed", c.passed.load(Relaxed)),
+            ("failed", c.failed.load(Relaxed)),
+        ] {
+            let _ = writeln!(
+                output,
+                "pqcrypta_challenges_total{{outcome=\"{outcome}\"}} {n}"
+            );
+        }
+    }
+
+    // When each served certificate expires: a renewal that has not happened
+    // shows here first
+    let expiries = state.tls_provider.resolver.expiries();
+    if !expiries.is_empty() {
+        output.push_str(
+            "\n# HELP pqcrypta_certificate_not_after_seconds When each served certificate expires (Unix time)\n",
+        );
+        output.push_str("# TYPE pqcrypta_certificate_not_after_seconds gauge\n");
+        for e in expiries {
+            let _ = writeln!(
+                output,
+                "pqcrypta_certificate_not_after_seconds{{domain=\"{}\",kind=\"{}\"}} {}",
+                e.domain, e.kind, e.not_after
+            );
+        }
+    }
+
+    // Requests by country and declared body size (traffic_shape.rs), which
+    // the deployment's collector baselines
+    if let Some(security) = state.security.as_ref() {
+        security.traffic.export(&mut output);
+    }
+
     // WAF counters. The engine holds its own atomics because SecurityState is
     // built from config and has no metrics handle; this is where they surface.
     if let Some(waf) = state.security.as_ref().and_then(|s| s.waf()) {
@@ -903,7 +946,19 @@ async fn metrics_handler() -> StatusCode {
 async fn metrics_json_handler(
     State(state): State<Arc<AdminState>>,
 ) -> Json<crate::metrics::MetricsSnapshot> {
-    Json(state.metrics.snapshot())
+    let mut snapshot = state.metrics.snapshot();
+    snapshot.certificates = state.tls_provider.resolver.expiries();
+    if let Some(security) = state.security.as_ref() {
+        use std::sync::atomic::Ordering::Relaxed;
+        snapshot.traffic = Some(security.traffic.snapshot());
+        let c = &security.challenger;
+        snapshot.challenges = Some(crate::metrics::ChallengeCounts {
+            issued: c.issued.load(Relaxed),
+            passed: c.passed.load(Relaxed),
+            failed: c.failed.load(Relaxed),
+        });
+    }
+    Json(snapshot)
 }
 
 /// Query parameters for the errors endpoint

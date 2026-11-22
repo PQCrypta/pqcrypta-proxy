@@ -325,7 +325,7 @@ Each request's `x-tls-library` header names the library that completed its hands
 
 ## Secrets
 
-Every secret setting -- `[admin] auth_token`, `hmac_secret` and `metrics_token`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[acme] eab_hmac_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
+Every secret setting -- `[admin] auth_token`, `hmac_secret` and `metrics_token`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[security.challenge] secret`, `[acme] eab_hmac_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
 
 ```toml
 [admin]
@@ -626,6 +626,21 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `error_window_secs` | u64 | `60` | Error tracking sliding window (1 minute) |
 | `pentest_bypass_ips` | array[string] | `[]` | Authorised test sources: inspected by the WAF but never rate-limited or auto-banned. An entry is an address or a host name standing for the addresses it resolves to |
 | `host_resolver` | socket address? | `null` | A validating resolver, reached over TCP, for the host names in `pentest_bypass_ips`. Only an answer it authenticates (AD bit) counts, refreshed every minute; without one, a name matches nothing |
+
+### Proof-of-Work Challenge
+
+```toml
+[security.challenge]
+```
+
+A page load (a navigation, or a GET that accepts HTML) from an address a heuristic blocked -- request rate, error rate, a fingerprint seen too often -- gets an interstitial instead of a 403: the browser finds the number that solves an [ALTCHA](https://altcha.org) proof of work (about a second of SHA-256) and is given a pass, a `__Host-` cookie bound to its network and User-Agent, that lets it through those blocks. Other requests from the address are refused as before; a block an operator or the database made stands. A route with `[routes.security] challenge = true` asks every page load for a pass. The page, its script and worker are served by the proxy at `/.well-known/pqcrypta-challenge/`, under a policy that admits no inline code.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Off: a heuristic block refuses every request |
+| `max_number` | u64 | `100000` | The challenge's range; a browser computes on average half this many SHA-256 digests |
+| `pass_ttl_secs` | u64 | `3600` | How long a pass lets its browser through |
+| `secret` | string? | `null` | The key challenges and passes are signed with, shared by nodes that honour each other's passes (at least 32 characters). Unset: the process's own, so passes lapse on restart |
 
 ---
 
@@ -1004,35 +1019,34 @@ Route configuration for request matching and forwarding.
 
 ## Environment Variables
 
-All configuration can be overridden via environment variables:
+Seven command-line options can be given by environment variable instead; the
+configuration file itself is read only from the file (and its `--env`
+overlay).
 
-| Variable | Description |
-|----------|-------------|
-| `PQCRYPTA_CONFIG` | Configuration file path |
-| `PQCRYPTA_UDP_PORT` | Override UDP port |
-| `PQCRYPTA_ADMIN_PORT` | Override admin API port |
-| `PQCRYPTA_LOG_LEVEL` | Log level |
-| `PQCRYPTA_JSON_LOGS` | Enable JSON logging |
+| Variable | Option | Description |
+|----------|--------|-------------|
+| `PQCRYPTA_CONFIG` | `--config` | Configuration file path |
+| `PQCRYPTA_UDP_PORT` | `--udp-port` | Override the QUIC listener's UDP port |
+| `PQCRYPTA_ADMIN_PORT` | `--admin-port` | Override the admin API's port |
+| `PQCRYPTA_LOG_LEVEL` | `--log-level` | Log level; unset, `[logging] level`, then `info` |
+| `PQCRYPTA_JSON_LOGS` | `--json-logs` | JSON logs (`true`/`false`); unset, `[logging] format`, then text |
+| `PQCRYPTA_WATCH_CONFIG` | `--watch-config` | Reload when the file changes (default `true`) |
+| `PQCRYPTA_ENV` | `--env` | The overlay `<config-stem>.<env>.toml` merged over the file |
+
+`PQCRYPTA_CREDENTIALS_DIRECTORY` is where a command run outside the service
+(`--admin`, a script) finds the credentials a secret setting names, when it has
+no `$CREDENTIALS_DIRECTORY` of its own (see [Secrets](#secrets)).
+`PQCRYPTA_GIT_COMMIT` names the commit in `--version` at build time.
 
 ---
 
 ## CLI Arguments
 
-```
-pqcrypta-proxy [OPTIONS]
-
-Options:
-  -c, --config <PATH>       Configuration file [default: /etc/pqcrypta/config.toml]
-      --udp-port <PORT>     Override UDP port for QUIC
-      --admin-port <PORT>   Override admin API port
-      --log-level <LEVEL>   Log level [default: info]
-      --json-logs           Enable JSON log format
-      --no-pqc              Disable PQC hybrid key exchange
-      --watch-config        Watch config file for changes [default: true]
-      --validate            Validate configuration only
-  -h, --help                Print help
-  -V, --version             Print version
-```
+The options are `pqcrypta-proxy --help`, printed whole in the README's
+[CLI Arguments](../README.md#cli-arguments), which `tests/docs.rs` holds to the
+binary. An option on the command line wins over its environment variable
+(`PQCRYPTA_*`, named there), which wins over the file's setting where there is
+one (`[logging] level` and `format`), which wins over the built-in default.
 
 ---
 

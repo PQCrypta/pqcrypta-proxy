@@ -63,6 +63,24 @@ where
     Ok(())
 }
 
+/// [`respond_and_finish`] with a body.
+async fn respond_with_body_and_finish<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    response: http::Response<()>,
+    body: String,
+) -> anyhow::Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    stream.send_response(response).await?;
+    if !body.is_empty() {
+        stream.send_data(Bytes::from(body)).await?;
+    }
+    while let Ok(Some(_)) = stream.recv_data().await {}
+    stream.finish().await?;
+    Ok(())
+}
+
 /// The headers this proxy derives from the connection rather than taking
 /// from the client -- the fingerprint, the client certificate, early data, the
 /// protocol and the key exchange -- set on `h` once any copy the client sent
@@ -523,7 +541,13 @@ impl QuicListener {
                         builder = builder.header(k, v);
                     }
                     let response = builder.body(())?;
-                    respond_and_finish(&mut stream, response).await?;
+                    // The challenge's page and resources are the response
+                    // itself; every other refusal is its status
+                    if rendering.carries_body && method != "HEAD" {
+                        respond_with_body_and_finish(&mut stream, response, rendering.body).await?;
+                    } else {
+                        respond_and_finish(&mut stream, response).await?;
+                    }
                     return Ok(());
                 }
             }

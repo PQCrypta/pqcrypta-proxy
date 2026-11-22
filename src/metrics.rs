@@ -176,6 +176,9 @@ impl MetricsRegistry {
             rate_limiter: self.rate_limiter.snapshot(),
             tls: self.tls.snapshot(),
             memory: crate::memory_pressure::snapshot(),
+            traffic: None,
+            challenges: None,
+            certificates: Vec::new(),
         }
     }
 }
@@ -257,6 +260,25 @@ pub struct MetricsSnapshot {
     pub rate_limiter: RateLimiterMetricsSnapshot,
     pub tls: TlsMetricsSnapshot,
     pub memory: crate::memory_pressure::MemorySnapshot,
+    /// Requests by country and declared body size (traffic_shape.rs), which
+    /// the admin API fills in from the security layer
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<crate::traffic_shape::TrafficSnapshot>,
+    /// Proof-of-work challenges issued, passed and failed (challenge.rs),
+    /// filled in the same way
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenges: Option<ChallengeCounts>,
+    /// When each served certificate expires (`tls::MultiDomainCertResolver::expiries`)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<crate::tls::CertificateExpiry>,
+}
+
+/// [`MetricsSnapshot::challenges`]
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ChallengeCounts {
+    pub issued: u64,
+    pub passed: u64,
+    pub failed: u64,
 }
 
 // ============================================================================
