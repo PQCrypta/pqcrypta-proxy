@@ -2477,13 +2477,16 @@ fn openssl_ech_status(ech_held: bool) -> &'static str {
     }
 }
 
-/// The rustls acceptor the OpenSSL listener hands ECH connections to, and
-/// the config ids it holds keys for.
+/// The rustls acceptor the OpenSSL listener hands the ClientHellos it cannot
+/// serve to (an ECH offer, a signature_algorithms_cert it would refuse), the
+/// config ids it holds ECH keys for (none on a node without keys), and the
+/// certificates rustls serves, which judge the second.
 #[cfg(feature = "pqc")]
 #[derive(Clone)]
 struct EchRoute {
     acceptor: Arc<FingerprintingTlsAcceptor>,
     config_ids: Arc<[u8]>,
+    resolver: std::sync::Arc<crate::tls::MultiDomainCertResolver>,
 }
 
 /// The ECH route for the configs now on disk: none when there are none; else
@@ -2501,12 +2504,17 @@ fn current_ech_route(
     if !config.pqc.provider.ech_to_rustls() {
         return Ok(None);
     }
-    let config_ids: Arc<[u8]> = crate::ech_config::config_ids().into();
-    if config_ids.is_empty() || crate::ech_config::load().is_none() {
-        if previous.is_some() {
-            info!("🔏 ECH over TCP: no ECH configs any more; every ClientHello stays on OpenSSL");
-        }
-        return Ok(None);
+    // Without ECH keys the route still takes what OpenSSL would refuse for
+    // its signature_algorithms_cert; ECH offers then stay on OpenSSL
+    let config_ids: Arc<[u8]> = if crate::ech_config::load().is_some() {
+        crate::ech_config::config_ids().into()
+    } else {
+        Arc::from([])
+    };
+    if config_ids.is_empty() && previous.is_some_and(|r| !r.config_ids.is_empty()) {
+        info!(
+            "🔏 ECH over TCP: no ECH configs any more; ClientHellos offering ECH stay on OpenSSL"
+        );
     }
     let acceptor = match previous {
         Some(route) => {
@@ -2521,7 +2529,7 @@ fn current_ech_route(
             security_state.clone(),
         )?),
     };
-    if previous.map(|r| &*r.config_ids) != Some(&*config_ids) {
+    if !config_ids.is_empty() && previous.map(|r| &*r.config_ids) != Some(&*config_ids) {
         info!(
             "🔏 ECH over TCP: ClientHellos offering ECH are served by rustls (config(s) {:02x?} held; any other answered with retry_configs)",
             config_ids
@@ -2530,6 +2538,7 @@ fn current_ech_route(
     Ok(Some(EchRoute {
         acceptor,
         config_ids,
+        resolver: std::sync::Arc::clone(resolver),
     }))
 }
 
@@ -2640,7 +2649,8 @@ async fn wait_for_record(
 async fn handle_pqc_fingerprinted_connection<S>(
     stream: TcpStream,
     remote_addr: SocketAddr,
-    // Where a ClientHello offering this server's ECH goes; None without ECH keys
+    // Where a ClientHello OpenSSL cannot serve goes (an ECH offer, a
+    // signature_algorithms_cert it would refuse); None with pqc.provider = "openssl"
     ech_route: Option<EchRoute>,
     ssl_context: Arc<openssl::ssl::SslContext>,
     fingerprint_extractor: Arc<FingerprintExtractor>,
@@ -2698,9 +2708,18 @@ async fn handle_pqc_fingerprinted_connection<S>(
     // client fell back to a cleartext ClientHello. A GREASE client ignores
     // the retry_configs (section 6.2), and costs no decryption: only the
     // config an offer names is tried.
-    let ech_held = ech_route.is_some();
+    //
+    // And a ClientHello whose signature_algorithms_cert lists no signature on
+    // any certificate this server could answer it with: RFC 8446 section
+    // 4.4.2.2 asks the server to send a chain of its choice, which rustls does
+    // and OpenSSL refuses (handshake_failure), so one client got a handshake
+    // or a refusal depending on the path it took.
+    let ech_held = ech_route.as_ref().is_some_and(|r| !r.config_ids.is_empty());
     if let Some(route) = ech_route {
-        if crate::ech_config::offered_config_id(&peek_buf[..peek_len]).is_some() {
+        let hello = &peek_buf[..peek_len];
+        let ech =
+            !route.config_ids.is_empty() && crate::ech_config::offered_config_id(hello).is_some();
+        if ech || route.resolver.refused_for_cert_signatures(hello) {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             handle_fingerprinted_connection(
                 stream,

@@ -603,7 +603,7 @@ challenge and the client's network (an IPv4 /24, an IPv6 /48), so a solution is
 worth nothing from elsewhere. Each solution is spent once. The pass is an HMAC
 over the network, a digest of the User-Agent and its expiry. The page, its
 script and its worker are served by the proxy itself at
-`/.well-known/pqcrypta-challenge/`, on every host and transport, under a
+`/.well-known/pqcrypta-challenge/` with its icon, on every host and transport, under a
 Content-Security-Policy that admits no inline code and nothing from elsewhere;
 verified search-engine crawlers and `pentest_bypass_ips` are never asked.
 `pqcrypta_challenges_total{outcome}` counts challenges issued and solutions
@@ -1926,7 +1926,8 @@ src/
 ├── cache.rs                # HTTP response cache (RFC 9111)
 ├── cert_compression.rs     # RFC 8879 certificate compression policy
 ├── challenge.rs            # A proof-of-work challenge in place of a heuristic block ([security.challenge])
-├── challenge/              # The challenge page's script, worker and stylesheet, served by the proxy
+├── challenge/              # The challenge page's script, worker, stylesheet and icon, served by the proxy
+├── client_hello.rs         # A peeked ClientHello's extensions, which route a TCP connection to the TLS stack that can serve it
 ├── compression.rs          # Response compression middleware
 ├── config.rs               # Configuration module with TOML parsing and hot-reload support
 ├── conformance/            # HTTP/3 and QUIC **client** conformance suite
@@ -2049,7 +2050,7 @@ systemctl enable --now delegated-credential-cert.timer
 ```toml
 [pqc]
 enabled = true
-provider = "auto"              # OpenSSL on TCP, ECH offers to rustls; "rustls" or "openssl" picks one
+provider = "auto"              # OpenSSL on TCP; ECH offers, and hellos OpenSSL would refuse for their signature_algorithms_cert, to rustls; "rustls" or "openssl" picks one
 preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true   # offer P-384, P-256, X25519 so non-ML-KEM clients can connect
 require_pqc_provider = true    # refuse to start if our own PQC provider is broken

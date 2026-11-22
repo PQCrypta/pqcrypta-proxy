@@ -260,57 +260,11 @@ fn config_ids_from(dir: &Path) -> Vec<u8> {
 /// socket. None for a ClientHello without ECH, an inner one, or bytes that
 /// are not a whole ClientHello record.
 pub fn offered_config_id(record: &[u8]) -> Option<u8> {
-    fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-        if b.len() < n {
-            return None;
-        }
-        let (head, rest) = b.split_at(n);
-        *b = rest;
-        Some(head)
-    }
-    fn u8_len<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
-        let n = *take(b, 1)?.first()? as usize;
-        take(b, n)
-    }
-    fn u16_len<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
-        let h = take(b, 2)?;
-        take(b, u16::from_be_bytes([h[0], h[1]]) as usize)
-    }
-
-    let mut b = record;
-    // Record: handshake (22), version, length
-    if *take(&mut b, 1)?.first()? != 22 {
-        return None;
-    }
-    take(&mut b, 2)?;
-    let mut hs = u16_len(&mut b)?;
-    // Handshake: client_hello (1), 24-bit length
-    if *take(&mut hs, 1)?.first()? != 1 {
-        return None;
-    }
-    let len = take(&mut hs, 3)?;
-    let mut body = take(
-        &mut hs,
-        u32::from_be_bytes([0, len[0], len[1], len[2]]) as usize,
-    )?;
-    take(&mut body, 2 + 32)?; // legacy_version, random
-    u8_len(&mut body)?; // legacy_session_id
-    u16_len(&mut body)?; // cipher_suites
-    u8_len(&mut body)?; // legacy_compression_methods
-    let mut exts = u16_len(&mut body)?;
-    while !exts.is_empty() {
-        let kind = take(&mut exts, 2)?;
-        let mut data = u16_len(&mut exts)?;
-        if u16::from_be_bytes([kind[0], kind[1]]) == 0xfe0d {
-            // ECHClientHello: type (0 = outer), cipher suite (kdf, aead), config_id
-            if *take(&mut data, 1)?.first()? != 0 {
-                return None;
-            }
-            take(&mut data, 4)?;
-            return take(&mut data, 1)?.first().copied();
-        }
-    }
-    None
+    // ECHClientHello: type (0 = outer), cipher suite (kdf, aead), config_id
+    let data = crate::client_hello::extension(record, 0xfe0d)?;
+    (*data.first()? == 0)
+        .then(|| data.get(5).copied())
+        .flatten()
 }
 
 #[cfg(test)]

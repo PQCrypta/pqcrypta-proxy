@@ -654,6 +654,84 @@ impl MultiDomainCertResolver {
     }
 }
 
+/// The TLS SignatureSchemes a certificate's own signature (its issuer's)
+/// counts as, matched as OpenSSL matches `signature_algorithms_cert`: by the
+/// hash and the key type, whatever the curve. Empty for a signature none
+/// names.
+fn certificate_signature_schemes(der: &[u8]) -> &'static [u16] {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return &[];
+    };
+    match cert.signature_algorithm.algorithm.to_id_string().as_str() {
+        "1.2.840.10045.4.3.2" => &[0x0403],
+        "1.2.840.10045.4.3.3" => &[0x0503],
+        "1.2.840.10045.4.3.4" => &[0x0603],
+        "1.2.840.113549.1.1.11" => &[0x0401],
+        "1.2.840.113549.1.1.12" => &[0x0501],
+        "1.2.840.113549.1.1.13" => &[0x0601],
+        "1.2.840.113549.1.1.10" => &[0x0804, 0x0805, 0x0806, 0x0809, 0x080a, 0x080b],
+        "1.3.101.112" => &[0x0807],
+        "1.3.101.113" => &[0x0808],
+        "2.16.840.1.101.3.4.3.17" => &[0x0904],
+        "2.16.840.1.101.3.4.3.18" => &[0x0905],
+        "2.16.840.1.101.3.4.3.19" => &[0x0906],
+        _ => &[],
+    }
+}
+
+impl MultiDomainCertResolver {
+    /// Whether OpenSSL would refuse this ClientHello for its
+    /// signature_algorithms_cert alone, where rustls serves it.
+    ///
+    /// RFC 8446 section 4.4.2.2: a server that cannot produce a chain signed
+    /// only with the algorithms the client lists there "SHOULD continue the
+    /// handshake by sending the client a certificate chain of its choice".
+    /// rustls does; OpenSSL refuses (handshake_failure) when no certificate's
+    /// own signature is on the list (openssl/openssl#32222), so one client got
+    /// a handshake on the ECH (rustls) path and a refusal on the OpenSSL one.
+    /// True when the hello
+    /// carries the extension, some certificate this resolver serves for its
+    /// name can sign with a scheme the client offers, and none of those has a
+    /// signature on the list: the TCP listener then hands it to rustls.
+    pub fn refused_for_cert_signatures(&self, record: &[u8]) -> bool {
+        use crate::client_hello::{extension, server_name, u16_list};
+        let Some(listed) = extension(record, 0x0032).and_then(u16_list) else {
+            return false;
+        };
+        let offered: Vec<rustls::SignatureScheme> = extension(record, 0x000d)
+            .and_then(u16_list)
+            .unwrap_or_default()
+            .into_iter()
+            .map(rustls::SignatureScheme::from)
+            .collect();
+        let certs = self.certs.read();
+        let domain = match server_name(record) {
+            Some(sni) => covering_name(&certs.by_name, &sni),
+            None => certs
+                .by_address
+                .as_deref()
+                .or(self.default_domain.as_deref())
+                .and_then(|d| certs.by_name.get(d)),
+        };
+        let Some(domain) = domain else {
+            return false;
+        };
+        let signers: Vec<&Arc<rustls::sign::CertifiedKey>> = std::iter::once(&domain.primary)
+            .chain(domain.post_quantum.as_ref())
+            .filter(|key| key.key.choose_scheme(&offered).is_some())
+            .collect();
+        !signers.is_empty()
+            && !signers.iter().any(|key| {
+                key.cert.first().is_some_and(|leaf| {
+                    certificate_signature_schemes(leaf)
+                        .iter()
+                        .any(|s| listed.contains(s))
+                })
+            })
+    }
+}
+
 impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
     fn resolve(
         &self,
