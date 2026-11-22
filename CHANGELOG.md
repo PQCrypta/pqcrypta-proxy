@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.19.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.18.0...v0.19.0) (2026-11-22)
+
+
+### Features
+
+* --test-certificates writes self-signed ECDSA P-256 and ML-DSA-87 certificates for testing ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
+* **metrics:** requests by country and declared body size, and each served certificate's expiry ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
+* **security:** a proof-of-work challenge in place of a heuristic block for page loads ([security.challenge], [routes.security] challenge) ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
+* **waf:** an exclusion may name the host it applies on ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
+
+
+### Bug Fixes
+
+* **config:** a manual reload reads and parses the file on the blocking pool ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
+* **config:** a reload that moves the CRS watch no longer deadlocks with the watcher ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
+* **fingerprint:** the built-in table holds only observed fingerprints ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
+* **speedtest:** the stream limit fits the page's QUIC upload pool, and transfers draw their allowance as the bytes move ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
+* **tls:** one server_name reader before the handshake, read as rustls reads it for the handshake ([28f21b5](https://github.com/PQCrypta/pqcrypta-proxy/commit/28f21b5c6aa14e948114ecac1cf59b5223285936))
+* **waf:** %uXXXX in t:urlDecodeUni through ModSecurity's Unicode map (code page 20127), else the low byte ([bb01bf8](https://github.com/PQCrypta/pqcrypta-proxy/commit/bb01bf80486128588973ecf20a740c4aebac6344))
+* **waf:** a body CRS reads is inspected off the async worker from 16 KiB, its cost following its arguments, not its bytes ([af51eb6](https://github.com/PQCrypta/pqcrypta-proxy/commit/af51eb64d1377e318f962bda064539991ef24249))
+* **waf:** braced byte escapes (\x{e2}) are bytes, as in PCRE without UTF mode ([470dbd2](https://github.com/PQCrypta/pqcrypta-proxy/commit/470dbd205ce9ef9e27aae6c39e19d4bbca2abd04))
+* **waf:** key-selection regexes compiled once and matched as ModSecurity v3 does (bytes, ASCII case folding), never cloned per value ([a0ce085](https://github.com/PQCrypta/pqcrypta-proxy/commit/a0ce085fdfd8d55f517a025b86916627dc14ddc0))
+* **waf:** macros expand any variable (%{ARGS._method}); crs_conformance: the server's HTTP/1 framing (CR/LF in a field refused, chunked de-chunked, no length no body) ([76b984a](https://github.com/PQCrypta/pqcrypta-proxy/commit/76b984a41c98af00b373bf085ec978f00c96a320))
+* **waf:** multiMatch runs the operator at every transformation stage, as ModSecurity ([c8f743d](https://github.com/PQCrypta/pqcrypta-proxy/commit/c8f743d7c46e7f174ab96cfa4a38676b18826dc6))
+* **waf:** rule messages as ModSecurity logs them; the CRS corpus's every stage and expectation ([5ada641](https://github.com/PQCrypta/pqcrypta-proxy/commit/5ada6414e1b36277263059cdce863d69738d82b3))
+* **waf:** t:normalizePath(Win) and t:escapeSeqDecode ported from libmodsecurity v3 ([172f9ec](https://github.com/PQCrypta/pqcrypta-proxy/commit/172f9ec6b276ec3e35bf4fa167c8792e738602ca))
+
 ## [0.18.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.3...v0.18.0) (2026-11-21)
 
 
