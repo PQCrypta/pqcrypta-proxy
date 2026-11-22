@@ -6,45 +6,17 @@
 ### Features
 
 * --test-certificates writes self-signed ECDSA P-256 and ML-DSA-87 certificates for testing ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
-* --test-certificates writes self-signed ECDSA P-256 and ML-DSA-87 certificates for testing ([3630706](https://github.com/PQCrypta/pqcrypta-proxy/commit/36307069b86e812e4e15d2c759e37c6d8bb17d0c))
-* --test-certificates writes self-signed ECDSA P-256 and ML-DSA-87 certificates for testing ([1398662](https://github.com/PQCrypta/pqcrypta-proxy/commit/1398662b6b371c26cdeabbdb7b98d33f4862083b))
-* --test-certificates writes self-signed ECDSA P-256 and ML-DSA-87 certificates for testing ([089d1cf](https://github.com/PQCrypta/pqcrypta-proxy/commit/089d1cf48b6d17b5e5024682be8baff7d454ec1c))
 * **metrics:** requests by country and declared body size, and each served certificate's expiry ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
-* **metrics:** requests by country and declared body size, and each served certificate's expiry ([3630706](https://github.com/PQCrypta/pqcrypta-proxy/commit/36307069b86e812e4e15d2c759e37c6d8bb17d0c))
-* **metrics:** requests by country and declared body size, and each served certificate's expiry ([1398662](https://github.com/PQCrypta/pqcrypta-proxy/commit/1398662b6b371c26cdeabbdb7b98d33f4862083b))
-* **metrics:** requests by country and declared body size, and each served certificate's expiry ([089d1cf](https://github.com/PQCrypta/pqcrypta-proxy/commit/089d1cf48b6d17b5e5024682be8baff7d454ec1c))
 * **security:** a proof-of-work challenge in place of a heuristic block for page loads ([security.challenge], [routes.security] challenge) ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
-* **security:** a proof-of-work challenge in place of a heuristic block for page loads ([security.challenge], [routes.security] challenge) ([3630706](https://github.com/PQCrypta/pqcrypta-proxy/commit/36307069b86e812e4e15d2c759e37c6d8bb17d0c))
-* **security:** a proof-of-work challenge in place of a heuristic block for page loads ([security.challenge], [routes.security] challenge) ([1398662](https://github.com/PQCrypta/pqcrypta-proxy/commit/1398662b6b371c26cdeabbdb7b98d33f4862083b))
-* **security:** a proof-of-work challenge in place of a heuristic block for page loads ([security.challenge], [routes.security] challenge) ([089d1cf](https://github.com/PQCrypta/pqcrypta-proxy/commit/089d1cf48b6d17b5e5024682be8baff7d454ec1c))
 * **waf:** an exclusion may name the host it applies on ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
-* **waf:** an exclusion may name the host it applies on ([6ced515](https://github.com/PQCrypta/pqcrypta-proxy/commit/6ced5150ff62ca917f8402c465a4a21e4fcf049b))
-* **waf:** an exclusion may name the host it applies on ([7b0169e](https://github.com/PQCrypta/pqcrypta-proxy/commit/7b0169ea7d56e200d0d1cda993b97a8e322728ac))
-* **waf:** an exclusion may name the host it applies on ([64094fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/64094fa6985acbdb4b623ac22c947743cfcba8ca))
-* **waf:** an exclusion may name the host it applies on ([35618f9](https://github.com/PQCrypta/pqcrypta-proxy/commit/35618f95909a315f9dbcf6235801716f97348c56))
 
 
 ### Bug Fixes
 
 * **config:** a manual reload reads and parses the file on the blocking pool ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
-* **config:** a manual reload reads and parses the file on the blocking pool ([6ced515](https://github.com/PQCrypta/pqcrypta-proxy/commit/6ced5150ff62ca917f8402c465a4a21e4fcf049b))
-* **config:** a manual reload reads and parses the file on the blocking pool ([7b0169e](https://github.com/PQCrypta/pqcrypta-proxy/commit/7b0169ea7d56e200d0d1cda993b97a8e322728ac))
-* **config:** a manual reload reads and parses the file on the blocking pool ([64094fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/64094fa6985acbdb4b623ac22c947743cfcba8ca))
-* **config:** a manual reload reads and parses the file on the blocking pool ([35618f9](https://github.com/PQCrypta/pqcrypta-proxy/commit/35618f95909a315f9dbcf6235801716f97348c56))
 * **config:** a reload that moves the CRS watch no longer deadlocks with the watcher ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
-* **config:** a reload that moves the CRS watch no longer deadlocks with the watcher ([6ced515](https://github.com/PQCrypta/pqcrypta-proxy/commit/6ced5150ff62ca917f8402c465a4a21e4fcf049b))
-* **config:** a reload that moves the CRS watch no longer deadlocks with the watcher ([7b0169e](https://github.com/PQCrypta/pqcrypta-proxy/commit/7b0169ea7d56e200d0d1cda993b97a8e322728ac))
-* **config:** a reload that moves the CRS watch no longer deadlocks with the watcher ([64094fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/64094fa6985acbdb4b623ac22c947743cfcba8ca))
-* **config:** a reload that moves the CRS watch no longer deadlocks with the watcher ([35618f9](https://github.com/PQCrypta/pqcrypta-proxy/commit/35618f95909a315f9dbcf6235801716f97348c56))
 * **fingerprint:** the built-in table holds only observed fingerprints ([deeaf66](https://github.com/PQCrypta/pqcrypta-proxy/commit/deeaf66e7fb7c0a8a921a8c24ae2212df6e09a3e))
-* **fingerprint:** the built-in table holds only observed fingerprints ([3630706](https://github.com/PQCrypta/pqcrypta-proxy/commit/36307069b86e812e4e15d2c759e37c6d8bb17d0c))
-* **fingerprint:** the built-in table holds only observed fingerprints ([1398662](https://github.com/PQCrypta/pqcrypta-proxy/commit/1398662b6b371c26cdeabbdb7b98d33f4862083b))
-* **fingerprint:** the built-in table holds only observed fingerprints ([089d1cf](https://github.com/PQCrypta/pqcrypta-proxy/commit/089d1cf48b6d17b5e5024682be8baff7d454ec1c))
 * **speedtest:** the stream limit fits the page's QUIC upload pool, and transfers draw their allowance as the bytes move ([99d3226](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d32260c96faeaf562d81e975dc6bef586f7b7e))
-* **speedtest:** the stream limit fits the page's QUIC upload pool, and transfers draw their allowance as the bytes move ([6ced515](https://github.com/PQCrypta/pqcrypta-proxy/commit/6ced5150ff62ca917f8402c465a4a21e4fcf049b))
-* **speedtest:** the stream limit fits the page's QUIC upload pool, and transfers draw their allowance as the bytes move ([7b0169e](https://github.com/PQCrypta/pqcrypta-proxy/commit/7b0169ea7d56e200d0d1cda993b97a8e322728ac))
-* **speedtest:** the stream limit fits the page's QUIC upload pool, and transfers draw their allowance as the bytes move ([64094fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/64094fa6985acbdb4b623ac22c947743cfcba8ca))
-* **speedtest:** the stream limit fits the page's QUIC upload pool, and transfers draw their allowance as the bytes move ([35618f9](https://github.com/PQCrypta/pqcrypta-proxy/commit/35618f95909a315f9dbcf6235801716f97348c56))
 * **tls:** one server_name reader before the handshake, read as rustls reads it for the handshake ([28f21b5](https://github.com/PQCrypta/pqcrypta-proxy/commit/28f21b5c6aa14e948114ecac1cf59b5223285936))
 * **waf:** %uXXXX in t:urlDecodeUni through ModSecurity's Unicode map (code page 20127), else the low byte ([bb01bf8](https://github.com/PQCrypta/pqcrypta-proxy/commit/bb01bf80486128588973ecf20a740c4aebac6344))
 * **waf:** a body CRS reads is inspected off the async worker from 16 KiB, its cost following its arguments, not its bytes ([af51eb6](https://github.com/PQCrypta/pqcrypta-proxy/commit/af51eb64d1377e318f962bda064539991ef24249))
@@ -380,19 +352,15 @@
 ### Features
 
 * **acme:** certificates for IP addresses, renewal by ARI, CT logs from the log list ([481c7d0](https://github.com/PQCrypta/pqcrypta-proxy/commit/481c7d0bcd6cc90a2c65b1acc525204d1eba79bb))
-* **acme:** certificates for IP addresses, renewal by ARI, CT logs from the log list ([38ac27c](https://github.com/PQCrypta/pqcrypta-proxy/commit/38ac27c6c3e8fc97d15319160614e207b1273b2e))
 * **acme:** dns-01 and dns-account-01 by TSIG-signed DNS UPDATE ([8566013](https://github.com/PQCrypta/pqcrypta-proxy/commit/8566013c656bf1b45b817fa0b46063b81ed1ae1e))
-* **acme:** dns-01 and dns-account-01 by TSIG-signed DNS UPDATE ([79015cd](https://github.com/PQCrypta/pqcrypta-proxy/commit/79015cd60307c967c8d5d19046506d9e68681b31))
 
 
 ### Bug Fixes
 
 * **deps:** crypto-bigint 0.7.6 (RUSTSEC-2026-0387), inout 0.2.5 (0.2.3 yanked) ([20b3474](https://github.com/PQCrypta/pqcrypta-proxy/commit/20b3474e6ac944222a5e397ec30354060ff51cd1))
 * **h3:** the GREASE frame goes ahead of the response, not last on the stream ([def5204](https://github.com/PQCrypta/pqcrypta-proxy/commit/def52043274385a77ce55e293f5004b377b7d398))
-* **h3:** the GREASE frame goes ahead of the response, not last on the stream ([8e7fa4c](https://github.com/PQCrypta/pqcrypta-proxy/commit/8e7fa4c377b9101bb842073f1f2b57653cb85199))
 * name_end is a test-only import in doh.rs (release builds deny unused imports) ([cba161e](https://github.com/PQCrypta/pqcrypta-proxy/commit/cba161e4f617bcbde75681a9dd6b432e43517eba))
 * **tls:** an address sent as the server name gets the certificate naming the address ([3b998ea](https://github.com/PQCrypta/pqcrypta-proxy/commit/3b998ea7fdbeb32dd3cb2768d6c7bd40c10fcee8))
-* **tls:** an address sent as the server name gets the certificate naming the address ([20fc4e6](https://github.com/PQCrypta/pqcrypta-proxy/commit/20fc4e6f40d58ecf613c2fe1a4fd3de0ca846646))
 
 ## [0.4.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.4.0...v0.4.1) (2026-10-23)
 
