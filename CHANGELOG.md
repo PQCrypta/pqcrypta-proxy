@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.19.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.19.0...v0.19.1) (2026-11-22)
+
+
+### Bug Fixes
+
+* **deps:** url 2.5.9 (RUSTSEC-2026-0592, a stack overflow in Url::origin on nested blob: URLs) ([4f84442](https://github.com/PQCrypta/pqcrypta-proxy/commit/4f844420895396ed8065ea94a93f05e091649ad7))
+* **security:** the challenge page names its own icon, so a browser asks for nothing its policy refuses ([8e8cd13](https://github.com/PQCrypta/pqcrypta-proxy/commit/8e8cd13fba036410182c2d04ae9bb801fb5b8ee2))
+* **tls:** a ClientHello OpenSSL would refuse for its signature_algorithms_cert is served by rustls, which sends a chain of its choice (RFC 8446 section 4.4.2.2) ([bf9c736](https://github.com/PQCrypta/pqcrypta-proxy/commit/bf9c736840a4bdb7d0c2dbd6152b4b8983e09307))
+
 ## [0.19.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.18.0...v0.19.0) (2026-11-22)
 
 
