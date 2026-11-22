@@ -20,8 +20,8 @@
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal timed by the CA's renewal information (ARI, RFC 9773), IP address identifiers (RFC 8738) so a client connecting by address can authenticate it, and Certificate Transparency log submission
 - **OCSP Stapling**: verified responses for every served certificate, stapled on every listener
 - **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, backends, and WAF blocks
-- **WAF**: Pattern-based request inspection for injection and traversal attacks (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode — covers OWASP A01/A03/A08/A10 attack patterns; categories requiring architectural or supply-chain controls (A02, A04, A05, A06, A09) are handled at other layers. Scanner/reconnaissance probe paths (`.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, etc.) are blocked at path level before pattern scanning, preventing automated scanner traffic from reaching backends and polluting error-rate metrics
-- **Advanced Security**: JA3/JA4 fingerprinting on TCP *and* QUIC with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
+- **WAF**: Pattern-based request inspection for injection and traversal attacks (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode, and beside it the OWASP Core Rule Set itself, run in-process by a pure-Rust SecLang engine that passes every stage of CRS's own regression corpus ([`[waf.crs]`](#waf-configuration)); false positives tuned by path and host — covers OWASP A01/A03/A08/A10 attack patterns; categories requiring architectural or supply-chain controls (A02, A04, A05, A06, A09) are handled at other layers. Scanner/reconnaissance probe paths (`.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, etc.) are blocked at path level before pattern scanning, preventing automated scanner traffic from reaching backends and polluting error-rate metrics
+- **Advanced Security**: JA3/JA4 fingerprinting on TCP *and* QUIC with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection, a proof-of-work challenge in place of a heuristic block
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 11 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
@@ -61,7 +61,7 @@
 | Custom Header Injection | ✅ | Inject arbitrary headers per route before forwarding to backends |
 | Multiple Listener Ports | ✅ | Primary port plus any number of additional ports via `additional_ports` |
 | WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping/speedtest); QUIC-native speed test server with datagram RTT probing, stream throughput download/upload, packet-loss measurement, MTR-based hop traceroute with GeoIP annotation, and per-client info lookup |
-| **WAF** | ✅ | Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; covers OWASP A01/A03/A08/A10 attack patterns. Scanner probe blocking: path-level block for `.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, and 40+ other reconnaissance targets |
+| **WAF** | ✅ | Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; covers OWASP A01/A03/A08/A10 attack patterns. The OWASP Core Rule Set beside it (`[waf.crs]`), run by a pure-Rust SecLang engine, its verdict joining the native one. Exclusions by path, and optionally host, per category or rule. Scanner probe blocking: path-level block for `.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files and the other reconnaissance targets of its `PQW-PROBE-*` rules |
 | **Audit Logger** | ✅ | Structured JSON audit log, one line an event: admin actions and refused admin requests, WAF blocks and detections, address blocks, rate-limit refusals and classical handshakes (each once per address in an interval), configuration and TLS reloads. A bounded queue and one writer thread: under a flood the events it cannot keep are counted and the count is written (`events_dropped`). The file is created `0640` and reopened after a rotation |
 | **JA3/JA4 Replay Detection** | ✅ | One fingerprint that is not a browser's or a known crawler's arriving from `replay_min_networks` client networks (IPv4 /24, IPv6 /48) within `replay_window_secs`: warned and audited once a window; `replay_action = "block"` also blocks each address |
 | **JA3/JA4 Drift Detection** | ✅ | One client network presenting a different JA4 on most of its connections (distinct fingerprints / connections ≥ `drift_threshold` after `drift_min_connections`): a client rotating its fingerprint. A browser keeps one JA4 per transport, so a NAT of many people scores low. `drift_action` as above |
@@ -128,7 +128,8 @@
 | **Certificate Compression** | ✅ | RFC 8879 on both stacks: zlib over TCP via OpenSSL's `SSL_CTX_compress_certs`, brotli or zlib over QUIC/HTTP-3 where rustls builds the list from crate features. `certificate_compression = "auto" \| "off"` in `[tls]`, default `auto`. Worth 1,051 bytes off every full handshake on a four-certificate Let's Encrypt chain |
 | **PQC Session Tickets** | ✅ | Each TLS 1.3 ticket carries its own ML-KEM-1024 encapsulation; the resumption state is sealed with an AES-256-GCM key derived from it via HKDF-SHA384 (`pqc_session_tickets`, `session_ticket_lifetime_secs`) |
 | **TLS Key Permission Checks** | ✅ | Validates private key file permissions at startup; configurable strict mode aborts on insecure permissions |
-| **Malicious Fingerprint Blocking** | ✅ | Classification consults the operator database at `fingerprint_db_path` first, then the built-in table, matching JA3 then JA4 (`block_malicious`, `block_scanners`). Authorised `pentest_bypass_ips` are classified but never banned |
+| **Malicious Fingerprint Blocking** | ✅ | Classification consults the operator database at `fingerprint_db_path` first, then the built-in table of observed fingerprints (`data/fingerprints/builtin.json`), matching JA3 then JA4 (`block_malicious`, `block_scanners`). Authorised `pentest_bypass_ips` are classified but never banned |
+| **Proof-of-Work Challenge** | ✅ | `[security.challenge]`: a page load from an address a heuristic blocked gets an ALTCHA proof-of-work interstitial instead of a 403, and the pass it earns (a `__Host-` cookie bound to the browser's network and User-Agent) lets it through; operator and database blocks stand; `[routes.security] challenge = true` asks every page load on a route |
 | **Server-Timing Header** | ✅ | Per-request `Server-Timing` header with proxy latency breakdown for performance visibility |
 | **Accept-CH Header** | ✅ | `Accept-CH` client hints advertisement for adaptive content delivery |
 | **Graceful Shutdown Drain** | ✅ | Configurable drain timeout polls active connections at 100 ms intervals; exits as soon as connections reach zero |
@@ -137,7 +138,7 @@
 | **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **RFC 9111 Response Cache** | ✅ | Full Cache-Control parsing (max-age, s-maxage, no-cache, no-store, private, public); ETag/If-None-Match → 304; Last-Modified/If-Modified-Since → 304; Vary header support; TTL-based expiry; a store bounded by size (keys and headers counted with bodies) with S3-FIFO eviction and a periodic expiry sweep — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **Hop-by-Hop Header Stripping** | ✅ | HTTP/1.1 connection-specific headers (`Transfer-Encoding`, `Connection`, `Keep-Alive`, `Proxy-Connection`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authenticate`, `Proxy-Authorization`) stripped from backend responses before caching and forwarding — compliant with RFC 9113 §8.2.2 and RFC 9114 §4.2; prevents `ERR_QUIC_PROTOCOL_ERROR` on HTTP/3/QUIC and stream errors on HTTP/2 |
-| **OpenTelemetry Distributed Tracing** | ✅ | W3C TraceContext (`traceparent`/`tracestate`, RFC 9543) + B3 multi-header + B3 single-header extraction and injection; composite propagator on all transports (HTTP/1.1, HTTP/2, HTTP/3/QUIC, WebTransport); OTLP HTTP/JSON export; `ParentBased(TraceIdRatioBased)` sampler; trace IDs in access-log lines |
+| **OpenTelemetry Distributed Tracing** | ✅ | W3C TraceContext (`traceparent`/`tracestate`, the W3C Trace Context Recommendation) + B3 multi-header + B3 single-header extraction and injection; composite propagator on all transports (HTTP/1.1, HTTP/2, HTTP/3/QUIC, WebTransport); OTLP HTTP/JSON export; `ParentBased(TraceIdRatioBased)` sampler; trace IDs in access-log lines |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
@@ -169,7 +170,7 @@
 - **Path Canonicalisation**: `/x/../dev/`, `/%2e/dev/` and `//dev/` route as `/dev/` on HTTP/1.1, HTTP/2, HTTP/3 and WebTransport alike, so a route guarding the canonical path cannot be stepped around by spelling it differently. `resolve_dot_segments` and `merge_slashes` in `[server]` (both on by default) are independent of `normalize_paths` (lowercasing); the WAF and HMAC proof-of-possession see the raw request
 
 ### Security
-- **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; covers OWASP A01/A03/A08/A10 attack patterns; `X-Forwarded-For` headers scanned without SSRF patterns (localhost/RFC1918 IPs in XFF are legitimate proxy hops, not SSRF — prevents false positives for clients behind local reverse proxies)
+- **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; the OWASP Core Rule Set beside the native rules (`[waf.crs]`); exclusions by path and host; covers OWASP A01/A03/A08/A10 attack patterns; `X-Forwarded-For` headers scanned without SSRF patterns (localhost/RFC1918 IPs in XFF are legitimate proxy hops, not SSRF — prevents false positives for clients behind local reverse proxies)
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
 - **JA3/JA4 Replay Detection**: one tool's fingerprint (not a browser's) from many client networks at once — a distributed campaign
 - **JA3/JA4 Drift Detection**: one client network rotating its TLS fingerprint across its connections — fingerprint evasion
@@ -237,7 +238,7 @@
 - **Request Coalescing**: identical cache misses wait for one fetch and are answered from the cache it fills
 - **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` so every listener advertises its actual address, and **the same on every transport**: over TCP and over QUIC the value lists h3 on every UDP port that serves it, since each Alt-Svc header replaces a client's cached alternatives (RFC 7838 section 3). `alt_svc_ports` in `[server]` replaces the derived list outright, for the case where a bound port does not serve HTTP/3 — a provider filtering inbound UDP/443 upstream, or a port handed to the WebTransport server — since advertising one costs every visitor a QUIC attempt that can only time out. An empty list advertises no HTTP/3 at all, which is the truthful value for a node that serves none. `tcp_only_hosts` in `[server]` sends `Alt-Svc: clear` for designated TCP-only origins (and answers `421 Misdirected Request` to any request for one that arrives over HTTP/3, so the browser retries it over TCP), as do `alt_svc_clear_user_agents` (case-insensitive User-Agent substrings: search crawlers and TLS scanners by default) and `alt_svc_clear_cidrs` (source networks: Cloudflare's published ranges by default, since Cloudflare Radar sends a generic Chrome UA); `alt_svc_max_age_secs` sets `ma` on every advertisement (default 86400). With nothing advertised, `x-webtransport-port` is not sent either; `http11_only_hosts` in `[server]` suppresses `h2` ALPN entirely so browsers open an independent TCP connection per stream (required for parallel TCP speed tests)
 - **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
-- **Server-Timing**: Performance metrics header for browser DevTools (RFC 6797)
+- **Server-Timing**: Performance metrics header for browser DevTools (W3C Server Timing)
 - **NEL (Network Error Logging)**: Client-side error reporting with configurable policy
 - **Report-To**: Endpoint configuration for NEL and Reporting API
 - **Accept-CH**: Client Hints for responsive content delivery (DPR, Viewport-Width, ECT)
@@ -316,6 +317,19 @@ request is served.
 
 Classification consults the operator database at `fingerprint.fingerprint_db_path`
 first, then the built-in table. Entries are matched by **JA3, then JA4**.
+
+The built-in table (`data/fingerprints/builtin.json`, in the operator
+database's format) holds only fingerprints that were observed: each client run
+against this proxy and its fingerprint read back (curl, GNU Wget, Python
+requests, `openssl s_client`, nmap's ssl-enum-ciphers, and Chromium and Firefox
+through Playwright, over TCP and QUIC), and browser JA4s from the observed
+corpus that share those browsers' structure and carried one browser's
+User-Agent on at least 97% of thousands of requests (Chrome, Firefox and Apple's
+WebKit). Each entry's description says which. It names no crawler, since
+crawlers are recognised by their operators' addresses (`crawler_verify`)
+rather than by a fingerprint anyone can present, and condemns no fingerprint
+as malicious: sqlmap's JA3 is the OpenSSL default client's, which every
+Python and curl client shares, so that judgement is the operator's database's.
 
 Prefer JA4 when adding a scanner. JA3 hashes the raw cipher/extension order, so a
 tool that varies its cipher list between probes produces a different JA3 every
@@ -552,6 +566,49 @@ error_pages_path_prefix = "/error_pages/"           # default: "" (nothing exemp
 ```
 
 None of these name a site by default; each deployment names its own.
+
+### Proof-of-work challenge
+
+```toml
+[security.challenge]
+enabled = true          # default false
+max_number = 100000     # a browser computes on average half this many SHA-256 digests
+pass_ttl_secs = 3600    # how long a pass lets its browser through
+# secret = { credential = "proxy-challenge" }   # shared by nodes that honour each other's passes
+
+[[routes]]
+name = "signup"
+path_prefix = "/signup"
+backend = "app"
+[routes.security]
+challenge = true        # every page load needs a pass, blocked or not
+```
+
+A block a heuristic made -- a request or connection rate over its limit, an
+error rate, a TLS fingerprint seen too often -- is a guess, and refusing every
+request until it lapses refuses the person behind the same NAT as the client
+that tripped it. With the challenge on, a page load from such an address (a
+navigation by `Sec-Fetch-Mode`, or a GET that accepts HTML) is answered with an
+interstitial: the browser finds the number that solves an
+[ALTCHA](https://altcha.org) proof of work, about a second of SHA-256 in a
+worker, and the proxy hands it a pass, a `__Host-` cookie that lets that
+browser through the heuristic blocks for `pass_ttl_secs`. Its other requests
+are refused as before until it has the pass, and a block an operator or the
+database made stands whatever a browser solves. A suspicious fingerprint over
+its rate keeps its connection, so its page loads can reach the interstitial.
+
+Nothing is stored when a challenge is issued: the expiry travels in the salt,
+which the challenge hash covers, and the signature is an HMAC over the
+challenge and the client's network (an IPv4 /24, an IPv6 /48), so a solution is
+worth nothing from elsewhere. Each solution is spent once. The pass is an HMAC
+over the network, a digest of the User-Agent and its expiry. The page, its
+script and its worker are served by the proxy itself at
+`/.well-known/pqcrypta-challenge/`, on every host and transport, under a
+Content-Security-Policy that admits no inline code and nothing from elsewhere;
+verified search-engine crawlers and `pentest_bypass_ips` are never asked.
+`pqcrypta_challenges_total{outcome}` counts challenges issued and solutions
+passed or failed, and each solution is an audit event (`challenge_passed`,
+`challenge_failed`).
 
 ### JA3/JA4 Fingerprint Database
 
@@ -1069,8 +1126,16 @@ again when one did. With `--watch-config`, a change in the entry's directory
 reload.
 `tests/crs_regression.rs` measures both engines against CRS's own regression
 suite (`scripts/crs-cases.py` turns its go-ftw tests into cases): on CRS
-4.30, blocking at paranoia level 1, the native rules block 18.7% of the
-level-1 attack cases and CRS 96.1%.
+4.30, blocking at paranoia level 1, of the 2,290 level-1 attack cases aimed at
+a request (the response-phase ones aside) the native rules block 18.7% and
+CRS 97.9%. The engine itself is held to that corpus case by case:
+`vendor/zentinel-modsec/tests/crs_conformance.rs` replays every stage of it as
+go-ftw sends them, through the HTTP framing of Apache, its reference server,
+and all 5,225 pass with none skipped (`vendor/zentinel-modsec/VENDOR.md`).
+CRS runs each of its rules over every argument a body holds, so a body CRS
+reads is inspected with its worker thread handed to the runtime's other tasks
+from 16 KiB (the native rules alone, from 1 MiB), and the connections that
+worker serves are not held while it reads.
 
 **Rule identifiers.** Every rule has a stable identifier of the form
 `PQW-<CATEGORY>-<NNN>`, and verdicts are reported as `category:identifier` —
@@ -1764,6 +1829,7 @@ Options:
       --env <ENV>                      Environment name for per-env config overlay. When set, loads <config-dir>/<config-stem>.<env>.toml and merges it over the base config. Example: --env prod loads /etc/pqcrypta/config.prod.toml [env: PQCRYPTA_ENV=]
       --validate                       Run configuration validation only (don't start server)
       --socket-unit <FILE>             Write the systemd socket unit for this configuration's listeners (pqcrypta-proxy.socket) to FILE and exit: with it, the service manager holds the listening sockets across a restart. A file, not standard output, which the proxy's own log may share
+      --test-certificates <DIR>        Write self-signed certificates for testing into DIR and exit: for each host the routes name and localhost, an ECDSA P-256 certificate and an ML-DSA-87 companion, in the certificate directory's layout. No client trusts them; a file already there is never replaced
       --merge-fingerprints <OUT>       Merge fingerprint corpora into one and write it here: observed.json of either version, or a published directory's full.json (`--from`)
       --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
       --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration names (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
@@ -1859,6 +1925,8 @@ src/
 ├── bounded.rs              # Ceilings for the tables a request can add to
 ├── cache.rs                # HTTP response cache (RFC 9111)
 ├── cert_compression.rs     # RFC 8879 certificate compression policy
+├── challenge.rs            # A proof-of-work challenge in place of a heuristic block ([security.challenge])
+├── challenge/              # The challenge page's script, worker and stylesheet, served by the proxy
 ├── compression.rs          # Response compression middleware
 ├── config.rs               # Configuration module with TOML parsing and hot-reload support
 ├── conformance/            # HTTP/3 and QUIC **client** conformance suite
@@ -1912,8 +1980,10 @@ src/
 ├── staged_file.rs          # Files written beside their destination and renamed in place; private ones mode 0600 from creation
 ├── startup_verify.rs       # Startup verification of the cryptographic runtime
 ├── telemetry.rs            # WebTransport Telemetry Wall — native handler for the /telemetry path
+├── test_certificate.rs     # Self-signed ECDSA and ML-DSA-87 certificates for testing (--test-certificates)
 ├── tls.rs                  # TLS configuration with Post-Quantum Cryptography (PQC) support
 ├── tls_acceptor.rs         # Custom TLS Acceptor with ClientHello Capture
+├── traffic_shape.rs        # Requests by country and declared body size, exported for baselining
 ├── waf.rs                  # Web Application Firewall (WAF) module
 ├── waf_crs.rs              # The OWASP Core Rule Set beside the native WAF rules ([waf.crs])
 ├── webtransport_server.rs  # The dedicated WebTransport server, on webtransport_port, with ALPN negotiation
@@ -2450,24 +2520,42 @@ results/run_20260522_153000/
 
 Latency percentiles are computed from a **double-buffered 5-minute sliding window** rather than a cumulative histogram. The active buffer accumulates request durations; every 2.5 minutes the buffers rotate, so reported percentiles always reflect the last 2.5–5 minutes of live traffic. Historical outliers from startup or past load spikes do not pollute current readings.
 
-Percentiles are interpolated using **Prometheus-style linear interpolation** within each bucket. The histogram uses 18 fine-grained buckets with boundaries chosen to match SLO thresholds: 5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000 ms, and +Inf. This eliminates the step-function snapping seen with coarse bucket boundaries (e.g., a p99 of 1001 ms being reported as 2500 ms).
+Percentiles are interpolated using **Prometheus-style linear interpolation** within each bucket. The histogram uses 19 buckets with boundaries chosen to match SLO thresholds: 1, 5, 10, 25, 50, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 2500, 5000, 10000, 30000 ms, and +Inf. This avoids the step-function snapping seen with coarse bucket boundaries (a p99 of 1001 ms reported as 2500 ms).
 
-### Health Check Traffic Exclusion
+### Traffic, Challenges and Certificates
 
-Requests that carry the `x-health-check-bypass: 1` request header are excluded from **all** metrics counters and the latency histogram:
+Beside the request, connection, TLS, rate-limit and WAF families, `/metrics`
+(and `/metrics/json`) carries:
 
-- Not counted in `total_requests`, `successful_requests`, `failed_requests`
-- Not added to the latency histogram (no impact on p50/p95/p99)
-- Not tracked in `in_progress` connections
-- Not recorded as endpoint errors
+| Metric | Type | What it counts |
+|--------|------|----------------|
+| `pqcrypta_requests_by_country_total{country}` | counter | Requests judged, by the client's country in the GeoIP database (`ZZ` where it has none); a country appears once it has a request |
+| `pqcrypta_request_body_bytes` | histogram | Request bodies by declared size (`Content-Length`), in power-of-four buckets from 256 B to 64 MiB |
+| `pqcrypta_challenges_total{outcome}` | counter | Proof-of-work challenges `issued`, and solutions `passed` or `failed` |
+| `pqcrypta_certificate_not_after_seconds{domain,kind}` | gauge | When each served certificate expires, the primary and the ML-DSA companion |
 
-This prevents the health check cron's synthetic cryptographic workflows (which generate intentional 500s during wrong-key rejection tests) from appearing as real errors or skewing production latency percentiles.
+The first two are what a baseline of the traffic needs to see a change no
+per-request rule does: one country's share rising far above its usual share for
+that hour of the week, or bodies far larger than usual. The last is what an
+alert on a renewal that has not happened reads.
 
-The API server's `tower_http::TraceLayer` is also configured with `.on_failure(())` on all three router layers, suppressing the default `ERROR`-level log entries that would otherwise be emitted for every health-check-bypass 500. Genuine non-bypass 5xx responses are still logged as `ERROR` by the metrics middleware, which checks the `x-health-check-bypass` header before deciding whether to emit the log entry.
+### Health Checks and the Metrics
+
+Every request the proxy serves counts in its metrics and its latency
+histogram. `x-health-check-bypass` is a header only the proxy may set
+(`PROXY_ONLY_HEADERS`, with `x-webtransport-proxy`): one a client sends is
+stripped on every listener before anything reads it. It used to keep requests
+out of these figures for anyone who sent it, and to walk a scanner past the
+bad-bot rules. A synthetic check that must not count reaches its backend
+directly, not through the proxy.
 
 ### WAF Blocked Requests
 
-Requests rejected by the security IP-blocklist or bot-blocklist receive an `x-waf-block: 1` response header. The collector tracks these separately in `waf_blocked_requests` (distinct from `failed_requests`) so that bot attack traffic cannot inflate error-rate SLOs or depress domain health scores.
+A request the WAF refuses (its own rules or CRS, in block mode) is answered
+`403` with `x-waf-block: 1`, on every transport, so whatever reads the
+responses -- a backend's middleware, a monitor -- can tell a refusal for what
+the request carried from a failure. A refusal of the address itself (the
+blocklist, its location, a rate limit) carries no such header.
 
 ## OpenTelemetry Distributed Tracing
 
@@ -2477,7 +2565,7 @@ PQCrypta Proxy supports end-to-end distributed tracing via the OpenTelemetry SDK
 
 | Format | Headers | Notes |
 |--------|---------|-------|
-| W3C TraceContext (RFC 9543) | `traceparent`, `tracestate` | Extracted first; highest priority |
+| W3C Trace Context (W3C Recommendation) | `traceparent`, `tracestate` | Extracted first; highest priority |
 | B3 Multi-header | `x-b3-traceid`, `x-b3-spanid`, `x-b3-sampled` | Fallback extract; always injected |
 | B3 Single-header | `b3` | `{traceId}-{spanId}-{flag}` compact form; also injected |
 
