@@ -134,6 +134,7 @@ pub mod bounded;
 pub mod cache;
 pub mod cert_compression;
 pub mod challenge;
+pub mod client_hello;
 pub mod compression;
 pub mod config;
 pub mod conformance;

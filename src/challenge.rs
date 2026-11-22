@@ -63,10 +63,15 @@ const SCRIPT: &str = include_str!("challenge/challenge.js");
 const WORKER: &str = include_str!("challenge/worker.js");
 /// The page's stylesheet.
 const STYLE: &str = include_str!("challenge/challenge.css");
+/// The page's icon: named in the page, so a browser asks for it rather than
+/// for the site's `/favicon.ico`, which an address the page stands in front
+/// of is refused.
+const ICON: &str = include_str!("challenge/icon.svg");
 
 /// The interstitial's Content-Security-Policy.
 const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; worker-src 'self'; \
-     style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+     style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
 
 /// What a request under [`PREFIX`] asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +79,7 @@ pub enum Endpoint {
     Script,
     Worker,
     Style,
+    Icon,
     Pass,
 }
 
@@ -84,6 +90,7 @@ impl Endpoint {
             "challenge.js" => Some(Self::Script),
             "worker.js" => Some(Self::Worker),
             "challenge.css" => Some(Self::Style),
+            "icon.svg" => Some(Self::Icon),
             "pass" => Some(Self::Pass),
             _ => None,
         }
@@ -95,6 +102,7 @@ impl Endpoint {
             Self::Script => Some(("text/javascript; charset=utf-8", SCRIPT)),
             Self::Worker => Some(("text/javascript; charset=utf-8", WORKER)),
             Self::Style => Some(("text/css; charset=utf-8", STYLE)),
+            Self::Icon => Some(("image/svg+xml", ICON)),
             Self::Pass => None,
         }
     }
@@ -399,6 +407,7 @@ pub fn page(issued: &Issued) -> String {
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"robots\" content=\"noindex\">\n<title>Checking your browser</title>\n\
+         <link rel=\"icon\" href=\"{PREFIX}icon.svg\" type=\"image/svg+xml\">\n\
          <link rel=\"stylesheet\" href=\"{PREFIX}challenge.css\">\n\
          <script src=\"{PREFIX}challenge.js\" defer></script>\n</head>\n<body>\n\
          <main id=\"pqc-challenge\" data-challenge=\"{}\">\n\
@@ -652,5 +661,13 @@ mod tests {
             Some(Endpoint::Pass)
         );
         assert_eq!(Endpoint::of("/.well-known/pqcrypta-challenge/x"), None);
+        assert_eq!(
+            Endpoint::of("/.well-known/pqcrypta-challenge/icon.svg")
+                .and_then(Endpoint::asset)
+                .map(|a| a.0),
+            Some("image/svg+xml")
+        );
+        assert!(html.contains("icon.svg"), "the page names its own icon");
+        assert!(page_csp().contains("img-src 'self'"));
     }
 }

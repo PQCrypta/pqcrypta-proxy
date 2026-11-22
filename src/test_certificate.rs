@@ -160,6 +160,52 @@ mod tests {
         }
     }
 
+    /// Which ClientHellos OpenSSL would refuse for their
+    /// signature_algorithms_cert alone, and the TCP listener hands to rustls:
+    /// the list names no served certificate's own signature, while one of
+    /// them could still sign for the client.
+    #[test]
+    fn openssl_refusals_for_cert_signatures_are_told_apart() {
+        use crate::client_hello::tests::{client_hello, list, sni};
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &["served.example".to_string()]).unwrap();
+        let resolver = crate::tls::MultiDomainCertResolver::new(dir.path()).unwrap();
+        // ECDSA P-256 primary (signed ecdsa-with-SHA256), ML-DSA-87 companion
+        let hello = |offered: &[u16], cert: Option<&[u16]>, name: &str| {
+            let mut exts = vec![(0x0000, sni(name)), (0x000d, list(offered))];
+            if let Some(cert) = cert {
+                exts.push((0x0032, list(cert)));
+            }
+            client_hello(&exts)
+        };
+        let refused = |h: Vec<u8>| resolver.refused_for_cert_signatures(&h);
+        let (p256, rsa_pss, mldsa87) = (0x0403, 0x0804, 0x0906);
+        assert!(
+            !refused(hello(&[p256], None, "served.example")),
+            "no list, nothing to refuse"
+        );
+        assert!(
+            !refused(hello(&[p256], Some(&[p256]), "served.example")),
+            "the list names the chain's signature"
+        );
+        assert!(
+            refused(hello(&[p256, mldsa87], Some(&[rsa_pss]), "served.example")),
+            "a chain of its choice is owed"
+        );
+        assert!(
+            !refused(hello(&[p256, mldsa87], Some(&[mldsa87]), "served.example")),
+            "OpenSSL serves the ML-DSA companion, whose signature is listed"
+        );
+        assert!(
+            !refused(hello(&[rsa_pss], Some(&[rsa_pss]), "served.example")),
+            "nothing can sign for it anywhere"
+        );
+        assert!(
+            !refused(hello(&[p256], Some(&[rsa_pss]), "other.example")),
+            "a name this server has no certificate for"
+        );
+    }
+
     #[test]
     fn a_host_that_could_leave_the_directory_is_refused() {
         let dir = tempfile::tempdir().unwrap();

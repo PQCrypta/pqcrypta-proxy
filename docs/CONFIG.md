@@ -315,9 +315,11 @@ runs a loaded OpenSSL provider's KEM through `provider_kx`).
 
 | Provider | TCP served by | ECH over TCP | When to choose it |
 |----------|---------------|--------------|-------------------|
-| `auto` | OpenSSL; a ClientHello offering ECH is handed to rustls | Yes | The default: each connection gets the library that can serve what it offers |
+| `auto` | OpenSSL; a ClientHello offering ECH, or one whose `signature_algorithms_cert` OpenSSL would refuse, is handed to rustls | Yes | The default: each connection gets the library that can serve what it offers |
 | `rustls` | rustls (aws-lc-rs) | Yes | One memory-safe TLS stack on every transport, no C TLS library on any connection |
 | `openssl` | OpenSSL, every ClientHello | No (QUIC only) | OpenSSL's own handshake for every TCP client; refused at startup when its post-quantum key exchange is not usable |
+
+A ClientHello whose `signature_algorithms_cert` lists no signature on any certificate the server could answer it with is owed a chain of the server's choice (RFC 8446 section 4.4.2.2); rustls sends one, OpenSSL refuses the handshake, so under `auto` such a hello goes to rustls and gets the same answer on either path.
 
 Each request's `x-tls-library` header names the library that completed its handshake.
 
