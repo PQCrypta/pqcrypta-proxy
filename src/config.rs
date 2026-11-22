@@ -637,6 +637,10 @@ pub struct RouteSecurityPolicy {
     pub waf_enabled: Option<bool>,
     /// WAF mode for this route: "detect" | "block"
     pub waf_mode: Option<String>,
+    /// Every page load on this route needs a challenge pass
+    /// (`[security.challenge]`), blocked address or not; other requests are
+    /// unaffected.
+    pub challenge: Option<bool>,
     /// HMAC-SHA256 secret for per-request signing on this route.
     /// When set, requests must carry `X-Request-Signature`,
     /// `X-Request-Timestamp` and `X-Request-Nonce` (8 to 128 characters).
@@ -2947,6 +2951,10 @@ pub struct SecurityConfig {
     /// Request hygiene limits, checked before the WAF on every transport.
     #[serde(default)]
     pub validation: RequestValidationConfig,
+    /// A proof-of-work challenge in place of a heuristic block for page loads
+    /// (see challenge.rs).
+    #[serde(default)]
+    pub challenge: ChallengeConfig,
     /// When non-empty, only these countries (ISO 3166-1 alpha-2) are served;
     /// an address with no country in the database is not refused by it.
     #[serde(default)]
@@ -3049,6 +3057,43 @@ pub struct RequestValidationConfig {
     pub allowed_methods: Vec<String>,
     /// Refuse a NUL byte, raw or percent-encoded, in the path or query (400).
     pub reject_null_bytes: bool,
+}
+
+/// `[security.challenge]`: a proof of work in place of a heuristic block.
+///
+/// A page load from an address a heuristic has blocked (request or error
+/// rate, a fingerprint seen too often) gets an interstitial instead of a
+/// refusal, and the pass it earns lets that browser through those blocks
+/// (see challenge.rs). Blocks an operator or the database made stand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChallengeConfig {
+    /// Off by default: a heuristic block refuses every request.
+    pub enabled: bool,
+    /// The challenge's range: the browser computes on average half this
+    /// many SHA-256 digests (ALTCHA's `maxnumber`). 100,000 is about a
+    /// second in a current browser.
+    pub max_number: u64,
+    /// How long a pass lets its browser through, in seconds.
+    pub pass_ttl_secs: u64,
+    /// The key challenges and passes are signed with, shared by the nodes
+    /// that should honour each other's passes. Unset: one of the process's
+    /// own, so passes lapse when it restarts. A string, or where it is
+    /// (`{ credential = "name" }`, `{ file = "/path" }`, see
+    /// `secret_source`); at least [`MIN_SECRET_CHARS`] characters.
+    #[serde(deserialize_with = "crate::secret_source::optional")]
+    pub secret: Option<String>,
+}
+
+impl Default for ChallengeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_number: 100_000,
+            pass_ttl_secs: 3600,
+            secret: None,
+        }
+    }
 }
 
 impl Default for RequestValidationConfig {
@@ -3162,6 +3207,7 @@ impl Default for SecurityConfig {
             geo_block_redirect_url: default_geo_block_redirect_url(),
             error_pages_path_prefix: default_error_pages_path_prefix(),
             validation: RequestValidationConfig::default(),
+            challenge: ChallengeConfig::default(),
             allowed_countries: Vec::new(),
             blocked_regions: Vec::new(),
             blocked_asns: Vec::new(),
@@ -5191,6 +5237,35 @@ impl ProxyConfig {
             return Err(anyhow::anyhow!(
                 "pqc.provider \"openssl\": this build has no OpenSSL (the pqc feature)"
             ));
+        }
+
+        // The key challenges and passes are signed with, held to the same floor
+        if let Some(secret) = self.security.challenge.secret.as_ref() {
+            if secret.len() < MIN_SECRET_CHARS {
+                return Err(anyhow::anyhow!(
+                    "security.challenge.secret is too short ({} characters): it must be at least \
+                     {MIN_SECRET_CHARS}. Generate one with: openssl rand -base64 48",
+                    secret.len()
+                ));
+            }
+        }
+        if self.security.challenge.enabled && self.security.challenge.pass_ttl_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "security.challenge.pass_ttl_secs is 0: a pass would lapse as it is issued"
+            ));
+        }
+        if !self.security.challenge.enabled {
+            if let Some(route) = self
+                .routes
+                .iter()
+                .find(|r| r.security.as_ref().and_then(|s| s.challenge) == Some(true))
+            {
+                return Err(anyhow::anyhow!(
+                    "route {:?} sets security.challenge, but [security.challenge] is not enabled: \
+                     its page loads would not be asked for a pass",
+                    route.name.as_deref().unwrap_or("")
+                ));
+            }
         }
 
         // Validate routes reference existing backends or backend_pools (unless they're redirect routes)

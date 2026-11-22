@@ -697,9 +697,17 @@ error_window_secs = 60             # Sliding window duration (seconds)
 auto_block_threshold = 10          # Suspicious patterns before auto-block
 auto_block_duration_secs = 300     # Block duration (seconds)
 
-# =============================
-# TLS Fingerprint Detection (JA3/JA4)
-# =============================
+# A page load from an address a heuristic blocked (request or error rate, a
+# fingerprint seen too often) gets a proof-of-work interstitial instead of a
+# 403; solving it earns that browser a pass through those blocks. Operator and
+# database blocks stand. A route asks every page load with
+# [routes.security] challenge = true.
+[security.challenge]
+enabled = false
+max_number = 100000      # about a second of SHA-256 in a browser
+pass_ttl_secs = 3600
+# secret = { credential = "proxy-challenge" }   # shared by nodes that honour each other's passes
+
 # =============================================================================
 # Web Application Firewall
 # =============================================================================
@@ -798,6 +806,9 @@ custom_patterns = []
 # mode = "detect"
 # entry = "/etc/pqcrypta/crs/main.conf"
 
+# =============================
+# TLS Fingerprint Detection (JA3/JA4)
+# =============================
 [fingerprint]
 # Enable TLS fingerprint detection
 enabled = true

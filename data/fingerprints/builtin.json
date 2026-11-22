@@ -1,0 +1,212 @@
+[
+  {
+    "hash": "t13d1516h2_8daaf6152771_7876f607db57",
+    "classification": "browser",
+    "description": "Chromium 153 over TCP (observed 2026-11-22)"
+  },
+  {
+    "hash": "q13d0311h3_55b375c5d22e_653d80c3fe9d",
+    "classification": "browser",
+    "description": "Chromium 153 over QUIC (observed 2026-11-22)"
+  },
+  {
+    "hash": "t13d1517h2_8daaf6152771_3cbfd9057e0d",
+    "classification": "browser",
+    "description": "Firefox 155 over TCP, with or without ECH (observed 2026-11-22)"
+  },
+  {
+    "hash": "q13d0313h3_55b375c5d22e_4fd40913cea1",
+    "classification": "browser",
+    "description": "Firefox 155 over QUIC (observed 2026-11-22)"
+  },
+  {
+    "hash": "32e4b8812cda0c0d50783b438492a769",
+    "classification": "api_client",
+    "description": "OpenSSL 3.x default client: curl 8.18, Python requests 2.32 (JA3; observed 2026-11-22)"
+  },
+  {
+    "hash": "t13d3013h2_1d37bd780c83_8537cf56674e",
+    "classification": "api_client",
+    "description": "curl 8.18 on OpenSSL 3.5 (observed 2026-11-22)"
+  },
+  {
+    "hash": "t13d3013h1_1d37bd780c83_8537cf56674e",
+    "classification": "api_client",
+    "description": "Python requests 2.32 on OpenSSL 3.5 (observed 2026-11-22)"
+  },
+  {
+    "hash": "99b95fea9ec66a507fa005680ab9f0e0",
+    "classification": "api_client",
+    "description": "GNU Wget 1.25 (JA3; observed 2026-11-22)"
+  },
+  {
+    "hash": "t13d291300_723694b0fccc_74a6a6dea387",
+    "classification": "api_client",
+    "description": "GNU Wget 1.25 (observed 2026-11-22)"
+  },
+  {
+    "hash": "5cfbaea088a6084eefed5c5e8c3972ec",
+    "classification": "api_client",
+    "description": "GNU Wget (observed 2026-07-31)"
+  },
+  {
+    "hash": "88f1fd7a4ad8bf2abd56176f5455424b",
+    "classification": "api_client",
+    "description": "OpenSSL s_client (observed 2026-07-31)"
+  },
+  {
+    "hash": "t10d640300_13a2a23d501b_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t10d640300_67f0ca237a44_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t10d640300_a3acda31d846_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t10d640300_e31a90cd0803_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t10d640300_e7b476f9520b_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t10d640300_f559eb9565fd_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t11d640300_13a2a23d501b_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t11d640300_67f0ca237a44_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t11d640300_a3acda31d846_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t11d640300_e31a90cd0803_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t11d640300_e7b476f9520b_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t11d640300_f559eb9565fd_6bf8f498b543",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d190600_9c2f387b437f_82b0993b6ad8",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d640400_13a2a23d501b_3549fbaf615c",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d640400_67f0ca237a44_3549fbaf615c",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d640400_a3acda31d846_3549fbaf615c",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d640400_e31a90cd0803_3549fbaf615c",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d640400_e7b476f9520b_3549fbaf615c",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t12d640400_f559eb9565fd_3549fbaf615c",
+    "classification": "scanner",
+    "description": "nmap ssl-enum-ciphers, JA4 (stable across runs; observed 2026-07-31)"
+  },
+  {
+    "hash": "t13d1517h2_8daaf6152771_dcad5a053991",
+    "classification": "browser",
+    "description": "Chrome over TCP (corpus: 96,586 requests, 97% Chrome User-Agents, 2026-09-03 to 2026-11-22)"
+  },
+  {
+    "hash": "q13d0313h3_55b375c5d22e_b0954bf1abdf",
+    "classification": "browser",
+    "description": "Chrome over QUIC (corpus: 71,941 requests, 100% Chrome User-Agents, 2026-09-03 to 2026-11-22)"
+  },
+  {
+    "hash": "t13d1516h2_8daaf6152771_806a8c22fdea",
+    "classification": "browser",
+    "description": "Chrome over TCP (corpus: 14,891 requests, 97% Chrome User-Agents, 2026-09-03 to 2026-11-22)"
+  },
+  {
+    "hash": "q13d0312h3_55b375c5d22e_178839b6cec1",
+    "classification": "browser",
+    "description": "Chrome over QUIC (corpus: 23,383 requests, 100% Chrome User-Agents, 2026-09-03 to 2026-11-22)"
+  },
+  {
+    "hash": "q13d0315h3_55b375c5d22e_dc5437974b47",
+    "classification": "browser",
+    "description": "Firefox over QUIC (corpus: 12,092 requests, 100% Firefox User-Agents, 2026-09-03 to 2026-11-22)"
+  },
+  {
+    "hash": "t13d1517h2_8daaf6152771_e6dcd7ae0a9e",
+    "classification": "browser",
+    "description": "Firefox over TCP (corpus: 9,882 requests, 100% Firefox User-Agents, 2026-08-23 to 2026-11-22)"
+  },
+  {
+    "hash": "q13d0314h3_55b375c5d22e_61724298b1a6",
+    "classification": "browser",
+    "description": "Firefox over QUIC (corpus: 14,841 requests, 100% Firefox User-Agents, 2026-10-01 to 2026-11-21)"
+  },
+  {
+    "hash": "q13d0313h3_55b375c5d22e_ce9ef325387e",
+    "classification": "browser",
+    "description": "Firefox over QUIC (corpus: 55,761 requests, 100% Firefox User-Agents, 2026-09-16 to 2026-11-20)"
+  },
+  {
+    "hash": "q13d0314h3_55b375c5d22e_2d2a40a25571",
+    "classification": "browser",
+    "description": "Firefox over QUIC (corpus: 10,135 requests, 100% Firefox User-Agents, 2026-09-05 to 2026-11-18)"
+  },
+  {
+    "hash": "q13d0315h3_55b375c5d22e_bb76f32061e3",
+    "classification": "browser",
+    "description": "Firefox over QUIC (corpus: 18,499 requests, 100% Firefox User-Agents, 2026-09-04 to 2026-11-14)"
+  },
+  {
+    "hash": "q13d0314h3_55b375c5d22e_80a9d9df9501",
+    "classification": "browser",
+    "description": "Firefox over QUIC (corpus: 64,100 requests, 100% Firefox User-Agents, 2026-09-28 to 2026-11-01)"
+  },
+  {
+    "hash": "t13d2013h2_a09f3c656075_7f0f34a4126d",
+    "classification": "browser",
+    "description": "Safari and iOS WebKit over TCP, Apple TLS (corpus: 2,357 requests, 100% WebKit User-Agents, 2026-08-23 to 2026-11-22)"
+  }
+]

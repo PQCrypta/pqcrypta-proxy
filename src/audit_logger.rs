@@ -140,6 +140,10 @@ pub enum AuditEvent {
         drift_score: f64,
         blocked: bool,
     },
+    /// A browser solved the proof-of-work challenge and was given a pass
+    ChallengePassed { ip: String },
+    /// A challenge solution was refused, and why
+    ChallengeFailed { ip: String, reason: String },
     /// Events that arrived while the queue was full and were not written
     EventsDropped { count: u64 },
 }
@@ -181,7 +185,9 @@ impl AuditEvent {
             | Self::WafBlock { ip, .. }
             | Self::WafDetect { ip, .. }
             | Self::FingerprintReplay { ip, .. }
-            | Self::FingerprintDrift { ip, .. } => Some(ip),
+            | Self::FingerprintDrift { ip, .. }
+            | Self::ChallengePassed { ip }
+            | Self::ChallengeFailed { ip, .. } => Some(ip),
             Self::ConfigReload { .. } | Self::TlsReload { .. } | Self::EventsDropped { .. } => None,
         }
     }
@@ -197,12 +203,14 @@ impl AuditEvent {
             | Self::IpBlocked { .. }
             | Self::ConfigReload { success: false, .. }
             | Self::TlsReload { success: false }
+            | Self::ChallengeFailed { .. }
             | Self::EventsDropped { .. } => "WARN",
             Self::AdminAction { .. }
             | Self::WafDetect { .. }
             | Self::RateLimitHit { .. }
             | Self::ConfigReload { .. }
-            | Self::TlsReload { .. } => "INFO",
+            | Self::TlsReload { .. }
+            | Self::ChallengePassed { .. } => "INFO",
         }
     }
 
@@ -217,6 +225,7 @@ impl AuditEvent {
             Self::ConfigReload { .. } => "config",
             Self::TlsReload { .. } => "tls",
             Self::FingerprintReplay { .. } | Self::FingerprintDrift { .. } => "fingerprint",
+            Self::ChallengePassed { .. } | Self::ChallengeFailed { .. } => "challenge",
             Self::EventsDropped { .. } => "audit",
         }
     }
@@ -280,6 +289,11 @@ impl AuditEvent {
             } => {
                 clip(fingerprint);
                 clip(ip);
+            }
+            Self::ChallengePassed { ip } => clip(ip),
+            Self::ChallengeFailed { ip, reason } => {
+                clip(ip);
+                clip(reason);
             }
             Self::TlsReload { .. } | Self::EventsDropped { .. } => {}
         }

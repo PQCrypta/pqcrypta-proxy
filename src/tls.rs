@@ -91,6 +91,28 @@ pub struct MultiDomainCertResolver {
     minting: AtomicBool,
 }
 
+/// One served certificate's end of validity ([`MultiDomainCertResolver::expiries`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CertificateExpiry {
+    pub domain: String,
+    /// `primary`, or `ml-dsa` for the domain's post-quantum companion
+    pub kind: &'static str,
+    /// The leaf's notBefore and notAfter, in seconds since the Unix epoch:
+    /// with both, a renewal overdue for its lifetime shows (a six-day
+    /// certificate renews days before its end, a 90-day one weeks)
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+/// A DER certificate's notBefore and notAfter, in seconds since the Unix epoch.
+fn validity(der: &[u8]) -> Option<(i64, i64)> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    X509Certificate::from_der(der).ok().map(|(_, cert)| {
+        let v = cert.validity();
+        (v.not_before.timestamp(), v.not_after.timestamp())
+    })
+}
+
 /// What a reload of the certs directory found.
 #[derive(Debug, Default)]
 struct LoadedCerts {
@@ -600,6 +622,35 @@ impl MultiDomainCertResolver {
             })
             .map(|key| key.cert.clone())
             .collect()
+    }
+}
+
+impl MultiDomainCertResolver {
+    /// When every certificate this resolver serves stops being valid, each
+    /// domain's primary and its post-quantum companion, by domain: what
+    /// `pqcrypta_certificate_not_after_seconds` exports, so a renewal that
+    /// has not happened is seen before a client sees it.
+    pub fn expiries(&self) -> Vec<CertificateExpiry> {
+        let loaded = self.certs.read();
+        let mut out: Vec<CertificateExpiry> = loaded
+            .by_name
+            .iter()
+            .flat_map(|(domain, certs)| {
+                std::iter::once(("primary", &certs.primary))
+                    .chain(certs.post_quantum.as_ref().map(|k| ("ml-dsa", k)))
+                    .filter_map(move |(kind, key)| {
+                        let (not_before, not_after) = validity(key.cert.first()?)?;
+                        Some(CertificateExpiry {
+                            domain: domain.clone(),
+                            kind,
+                            not_before,
+                            not_after,
+                        })
+                    })
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.domain, a.kind).cmp(&(&b.domain, b.kind)));
+        out
     }
 }
 

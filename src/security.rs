@@ -359,6 +359,11 @@ pub struct SecurityState {
     /// reached `warn!` and stopped there, so the one security control most
     /// worth an audit trail produced none.
     pub audit_logger: Option<Arc<AuditLogger>>,
+    /// Issues and checks proof-of-work challenges and their passes
+    /// (`[security.challenge]`, see challenge.rs)
+    pub challenger: Arc<crate::challenge::Challenger>,
+    /// Requests by country and declared body size (traffic_shape.rs)
+    pub traffic: Arc<crate::traffic_shape::TrafficShape>,
     /// CIDR ranges from database-synced blocklist files.
     /// P2-fix: single-IP parsing previously ignored subnet notation; CIDRs now stored
     /// separately and checked in is_blocked() via cidr_contains_ip().
@@ -456,6 +461,26 @@ pub enum SecurityDecision {
     InvalidRequest { status: u16, reason: String },
     /// WAF matched in block mode. `rule` identifies which.
     WafBlock { rule: String },
+    /// A page load that needs a challenge pass: the interstitial, carrying
+    /// a challenge for this client's network (see challenge.rs).
+    Challenge { page: String },
+    /// One of the challenge's own resources (its script, worker or style).
+    ChallengeAsset {
+        content_type: &'static str,
+        body: &'static str,
+    },
+    /// A solved challenge: the pass to set and where to send the browser.
+    ChallengePassed { cookie: String, location: String },
+    /// A solution that was not accepted, and why.
+    ChallengeFailed { reason: crate::challenge::Refusal },
+}
+
+/// What the challenge makes of one request ([`SecurityState::challenge_verdict`]).
+enum ChallengeVerdict {
+    /// The browser holds a pass
+    Pass,
+    /// A page load without one: the interstitial
+    Ask(String),
 }
 
 /// Which rate control refused a request.
@@ -564,6 +589,9 @@ pub struct RequestPolicy {
     /// blocklist or refused by location too, since those refusals send the
     /// visitor here. Every other rule applies to it as to any request.
     pub error_page: bool,
+    /// Every page load on the route needs a challenge pass
+    /// (`[routes.security] challenge`)
+    pub challenge: bool,
 }
 
 /// The policy a request for `host` (lowercase, no port) and canonical `path`
@@ -616,6 +644,11 @@ pub fn route_request_policy(
                 .as_ref()
                 .and_then(|s| s.rate_limit_override.clone()),
             error_page: false,
+            challenge: r
+                .security
+                .as_ref()
+                .and_then(|s| s.challenge)
+                .unwrap_or(false),
         })
         .unwrap_or_default();
     policy.skip_bot_blocking |= on_conformance_host;
@@ -927,6 +960,8 @@ impl SecurityState {
                 &config.waf.programmatic_client_paths,
             ))),
             audit_logger: None,
+            challenger: Arc::new(crate::challenge::Challenger::new()),
+            traffic: Arc::new(crate::traffic_shape::TrafficShape::new()),
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
             alt_svc_header: Arc::new(arc_swap::ArcSwap::from_pointee(refusal_alt_svc(config))),
         };
@@ -2008,6 +2043,94 @@ impl SecurityState {
         }
     }
 
+    /// The answer to a request for one of the challenge's resources or its
+    /// pass address, when the challenge is on; `None` for any other request.
+    fn challenge_endpoint(&self, view: &SecurityRequestView<'_>) -> Option<SecurityDecision> {
+        use crate::challenge::{Endpoint, Refusal, Solution};
+        let endpoint = Endpoint::of(view.path)?;
+        if !matches!(view.method, "GET" | "HEAD") {
+            return None;
+        }
+        let config = self.config.read().challenge.clone();
+        if !config.enabled {
+            return None;
+        }
+        if let Some((content_type, body)) = endpoint.asset() {
+            return Some(SecurityDecision::ChallengeAsset { content_type, body });
+        }
+        let now = crate::challenge::now();
+        let outcome = Solution::from_query(view.query)
+            .ok_or(Refusal::Malformed)
+            .and_then(|(solution, back)| {
+                self.challenger
+                    .redeem(&config, &solution, view.ip, now)
+                    .map(|()| back)
+            });
+        let ip = view.ip.to_string();
+        Some(match outcome {
+            Ok(location) => {
+                info!("challenge solved by {ip}");
+                if let Some(audit) = &self.audit_logger {
+                    audit.log(crate::audit_logger::AuditEvent::ChallengePassed { ip });
+                }
+                let pass = self.challenger.pass(&config, view.ip, view.headers, now);
+                SecurityDecision::ChallengePassed {
+                    cookie: crate::challenge::pass_cookie(&pass, &config),
+                    location,
+                }
+            }
+            Err(reason) => {
+                warn!("challenge solution from {ip} refused: {reason}");
+                if let Some(audit) = &self.audit_logger {
+                    audit.log(crate::audit_logger::AuditEvent::ChallengeFailed {
+                        ip,
+                        reason: reason.to_string(),
+                    });
+                }
+                SecurityDecision::ChallengeFailed { reason }
+            }
+        })
+    }
+
+    /// Count the request by country and declared body (traffic_shape.rs).
+    fn note_traffic(&self, view: &SecurityRequestView<'_>) {
+        #[cfg(feature = "geoip")]
+        if let Some(db) = self.geoip_db.load_full() {
+            self.traffic.note_country(db.country(view.ip));
+        }
+        if let Some(bytes) = view
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+        {
+            self.traffic.note_body(bytes);
+        }
+    }
+
+    /// What the challenge makes of a request: through on a pass, the
+    /// interstitial for a page load without one, `None` when the challenge
+    /// is off or the request is not a page load.
+    fn challenge_verdict(&self, view: &SecurityRequestView<'_>) -> Option<ChallengeVerdict> {
+        let config = self.config.read().challenge.clone();
+        if !config.enabled {
+            return None;
+        }
+        let now = crate::challenge::now();
+        if self
+            .challenger
+            .has_pass(&config, view.ip, view.headers, now)
+        {
+            return Some(ChallengeVerdict::Pass);
+        }
+        if !crate::challenge::is_navigation(view.method, view.headers) {
+            return None;
+        }
+        let issued = self.challenger.issue(&config, view.ip, now);
+        Some(ChallengeVerdict::Ask(crate::challenge::page(&issued)))
+    }
+
     /// Every rule of [`Self::evaluate`] but the WAF: `Err` with the decision
     /// when one of them decides the request (a trusted source is allowed
     /// here, before the WAF), else `Ok` with whether the source is one of
@@ -2019,10 +2142,18 @@ impl SecurityState {
     ) -> Result<bool, SecurityDecision> {
         let ip = view.ip;
 
+        // The challenge's own resources and pass address, to anyone, a
+        // blocked address above all: solving it is how a page load from one
+        // gets through.
+        if let Some(decided) = self.challenge_endpoint(view) {
+            return Err(decided);
+        }
+
         // Trusted sources skip everything, as they do on both paths today.
         if self.is_trusted(&ip) {
             return Err(SecurityDecision::Allow);
         }
+        self.note_traffic(view);
 
         let (auto_block_threshold, auto_block_duration_secs, max_header_size, dos_protection) = {
             let c = self.config.read();
@@ -2085,7 +2216,26 @@ impl SecurityState {
                     | BlockReason::SuspiciousFingerprint
             );
             if !(automatic && is_pentest) {
-                return Err(SecurityDecision::Blocked(info));
+                // A block a heuristic made is a guess: with the challenge on, a
+                // page load gets the interstitial instead, and a browser that
+                // solved it gets through. An operator's or the database's block
+                // stands whatever the browser has solved.
+                match automatic.then(|| self.challenge_verdict(view)).flatten() {
+                    Some(ChallengeVerdict::Pass) => {}
+                    Some(ChallengeVerdict::Ask(page)) => {
+                        return Err(SecurityDecision::Challenge { page });
+                    }
+                    None => return Err(SecurityDecision::Blocked(info)),
+                }
+            }
+        }
+
+        // A route that asks every page load for a pass. A verified search
+        // engine is not asked: it cannot solve one, and an index is the point
+        // of most pages such a route guards.
+        if policy.challenge && !is_pentest && !is_verified_crawler {
+            if let Some(ChallengeVerdict::Ask(page)) = self.challenge_verdict(view) {
+                return Err(SecurityDecision::Challenge { page });
             }
         }
 
@@ -3275,8 +3425,11 @@ pub struct DecisionRendering {
     pub status: StatusCode,
     pub headers: Vec<(&'static str, String)>,
     /// Body text, for transports that send one. HTTP/3 refusals are
-    /// header-only and ignore this.
+    /// header-only and ignore this unless `carries_body` is set.
     pub body: String,
+    /// The body is the response (the challenge's page and resources), sent
+    /// on every transport.
+    pub carries_body: bool,
 }
 
 /// Render a [`SecurityDecision`], or `None` when the request is allowed.
@@ -3309,6 +3462,7 @@ pub fn decision_rendering(
                 .map(|e| e.saturating_duration_since(Instant::now()).as_secs())
                 .unwrap_or(3600);
             Some(DecisionRendering {
+                carries_body: false,
                 status: StatusCode::FORBIDDEN,
                 headers: vec![("retry-after", retry_after.to_string())],
                 body: "Access denied - IP blocked".to_string(),
@@ -3323,12 +3477,14 @@ pub fn decision_rendering(
         // its blocked visitors to pqcrypta.com.
         SecurityDecision::GeoBlocked if config.geo_block_redirect_url.is_empty() => {
             Some(DecisionRendering {
+                carries_body: false,
                 status: StatusCode::FORBIDDEN,
                 headers: Vec::new(),
                 body: "Access denied".to_string(),
             })
         }
         SecurityDecision::GeoBlocked => Some(DecisionRendering {
+            carries_body: false,
             status: StatusCode::FOUND,
             headers: vec![("location", config.geo_block_redirect_url.clone())],
             body: String::new(),
@@ -3349,6 +3505,7 @@ pub fn decision_rendering(
                 request_origin,
             ));
             Some(DecisionRendering {
+                carries_body: false,
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers,
                 body: "Rate limit exceeded".to_string(),
@@ -3359,18 +3516,21 @@ pub fn decision_rendering(
         // here is an automated client that named itself by TLS fingerprint, so a
         // human-readable error page serves no one.
         SecurityDecision::FingerprintRejected => Some(DecisionRendering {
+            carries_body: false,
             status: StatusCode::FORBIDDEN,
             headers: Vec::new(),
             body: "Forbidden".to_string(),
         }),
 
         SecurityDecision::HeadersTooLarge { max } => Some(DecisionRendering {
+            carries_body: false,
             status: StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             headers: Vec::new(),
             body: format!("Headers exceed maximum size of {} bytes", max),
         }),
 
         SecurityDecision::InvalidRequest { status, .. } => Some(DecisionRendering {
+            carries_body: false,
             status: StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
             headers: Vec::new(),
             body: StatusCode::from_u16(*status)
@@ -3381,9 +3541,59 @@ pub fn decision_rendering(
         }),
 
         SecurityDecision::WafBlock { .. } => Some(DecisionRendering {
+            carries_body: false,
             status: StatusCode::FORBIDDEN,
             headers: vec![("x-waf-block", "1".to_string())],
             body: "Forbidden".to_string(),
+        }),
+
+        SecurityDecision::Challenge { page } => Some(DecisionRendering {
+            carries_body: true,
+            // Refused until solved; never stored, never indexed
+            status: StatusCode::FORBIDDEN,
+            headers: vec![
+                ("content-type", "text/html; charset=utf-8".to_string()),
+                ("cache-control", "no-store".to_string()),
+                (
+                    "content-security-policy",
+                    crate::challenge::page_csp().to_string(),
+                ),
+                ("x-robots-tag", "noindex".to_string()),
+                ("referrer-policy", "same-origin".to_string()),
+            ],
+            body: page.clone(),
+        }),
+
+        SecurityDecision::ChallengeAsset { content_type, body } => Some(DecisionRendering {
+            carries_body: true,
+            status: StatusCode::OK,
+            headers: vec![
+                ("content-type", (*content_type).to_string()),
+                ("cache-control", "public, max-age=3600".to_string()),
+                ("x-content-type-options", "nosniff".to_string()),
+            ],
+            body: (*body).to_string(),
+        }),
+
+        SecurityDecision::ChallengePassed { cookie, location } => Some(DecisionRendering {
+            carries_body: true,
+            status: StatusCode::SEE_OTHER,
+            headers: vec![
+                ("set-cookie", cookie.clone()),
+                ("location", location.clone()),
+                ("cache-control", "no-store".to_string()),
+            ],
+            body: String::new(),
+        }),
+
+        SecurityDecision::ChallengeFailed { .. } => Some(DecisionRendering {
+            carries_body: true,
+            status: StatusCode::FORBIDDEN,
+            headers: vec![
+                ("content-type", "text/plain; charset=utf-8".to_string()),
+                ("cache-control", "no-store".to_string()),
+            ],
+            body: "The check did not pass. Go back and reload the page to try again.\n".to_string(),
         }),
     }
 }
@@ -3642,6 +3852,27 @@ mod geoip {
                 .ok()
                 .flatten()?
                 .autonomous_system_number
+        }
+
+        /// The country `ip` is in (ISO 3166-1 alpha-2), read without
+        /// decoding the rest of the record: what counting every request by
+        /// country costs.
+        pub fn country(&self, ip: IpAddr) -> Option<[u8; 2]> {
+            #[derive(serde::Deserialize)]
+            struct City<'a> {
+                #[serde(borrow)]
+                country: Option<Country<'a>>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Country<'a> {
+                #[serde(borrow)]
+                iso_code: Option<&'a str>,
+            }
+            let city: City<'_> = self.reader.lookup(ip).ok()?.decode().ok().flatten()?;
+            let code = city.country?.iso_code?.as_bytes();
+            <[u8; 2]>::try_from(code)
+                .ok()
+                .map(|c| c.map(|b| b.to_ascii_uppercase()))
         }
 
         /// Look up IP address
@@ -4327,6 +4558,202 @@ mod tests {
                 },
                 &policy
             ),
+            SecurityDecision::Allow
+        ));
+    }
+
+    /// With `[security.challenge]` on, a page load from an address a
+    /// heuristic blocked gets the interstitial; a browser that solves it is
+    /// let through; a block an operator made stands; and the challenge's own
+    /// address answers a blocked client.
+    #[tokio::test]
+    async fn a_heuristic_block_becomes_a_challenge_a_solution_lifts() {
+        use sha2::{Digest, Sha256};
+        let mut config = ProxyConfig::default();
+        config.security.challenge.enabled = true;
+        config.security.challenge.max_number = 500;
+        let security = SecurityState::new(&config);
+        let policy = RequestPolicy::default();
+        let ip: IpAddr = "198.51.100.23".parse().unwrap();
+        security.block_ip(
+            ip,
+            BlockReason::RateLimitExceeded,
+            Some(Duration::from_secs(300)),
+        );
+
+        let mut page_load = HeaderMap::new();
+        page_load.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0"
+                .parse()
+                .unwrap(),
+        );
+        page_load.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        let mut fetch = page_load.clone();
+        fetch.insert("sec-fetch-mode", "cors".parse().unwrap());
+        let view = |path: &'static str, query: &'static str, headers: &'static HeaderMap| {
+            SecurityRequestView {
+                ip,
+                peer_port: None,
+                method: "GET",
+                path,
+                query,
+                headers,
+                body: None,
+                version: None,
+                authority: None,
+            }
+        };
+        let page_load: &'static HeaderMap = Box::leak(Box::new(page_load));
+        let fetch: &'static HeaderMap = Box::leak(Box::new(fetch));
+
+        // A fetch is refused as before; a page load gets the interstitial
+        assert!(matches!(
+            security.evaluate(&view("/docs", "", fetch), &policy),
+            SecurityDecision::Blocked(_)
+        ));
+        let SecurityDecision::Challenge { page } =
+            security.evaluate(&view("/docs", "", page_load), &policy)
+        else {
+            panic!("a page load from a heuristically blocked address is challenged");
+        };
+        let rendering = decision_rendering(
+            &SecurityDecision::Challenge { page: page.clone() },
+            None,
+            &config.security,
+        )
+        .unwrap();
+        assert!(rendering.carries_body);
+        assert!(rendering
+            .headers
+            .iter()
+            .any(|(k, v)| *k == "content-security-policy" && v.contains("script-src 'self'")));
+
+        // The page's challenge, solved as the worker would
+        let start = page.find("data-challenge=\"").unwrap() + "data-challenge=\"".len();
+        let json = page[start..start + page[start..].find('"').unwrap()].replace("&quot;", "\"");
+        let c: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let salt = c["salt"].as_str().unwrap();
+        let number = (0..=c["maxnumber"].as_u64().unwrap())
+            .find(|n| {
+                hex::encode(Sha256::digest(format!("{salt}{n}")))
+                    == c["challenge"].as_str().unwrap()
+            })
+            .unwrap();
+        let solution = serde_json::json!({
+            "algorithm": "SHA-256", "challenge": c["challenge"], "number": number,
+            "salt": salt, "signature": c["signature"],
+        });
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            solution.to_string(),
+        );
+        let query: &'static str =
+            Box::leak(format!("solution={encoded}&return=%2Fdocs").into_boxed_str());
+        let SecurityDecision::ChallengePassed { cookie, location } = security.evaluate(
+            &view("/.well-known/pqcrypta-challenge/pass", query, page_load),
+            &policy,
+        ) else {
+            panic!("the pass address answers a blocked client");
+        };
+        assert_eq!(location, "/docs");
+        assert!(cookie.starts_with("__Host-pqcrypta-pass=") && cookie.contains("Secure; HttpOnly"));
+        // Spent: the same solution again is refused
+        assert!(matches!(
+            security.evaluate(
+                &view("/.well-known/pqcrypta-challenge/pass", query, page_load),
+                &policy
+            ),
+            SecurityDecision::ChallengeFailed { .. }
+        ));
+
+        // With the pass, the page load and the fetch both go through
+        let value = cookie.split(';').next().unwrap().to_string();
+        let mut passed = page_load.clone();
+        passed.insert("cookie", value.parse().unwrap());
+        let passed: &'static HeaderMap = Box::leak(Box::new(passed));
+        assert!(matches!(
+            security.evaluate(&view("/docs", "", passed), &policy),
+            SecurityDecision::Allow
+        ));
+
+        // An operator's block stands, pass or not
+        security.block_ip(ip, BlockReason::Manual, None);
+        assert!(matches!(
+            security.evaluate(&view("/docs", "", passed), &policy),
+            SecurityDecision::Blocked(_)
+        ));
+
+        // The script is served, to anyone
+        assert!(matches!(
+            security.evaluate(
+                &view("/.well-known/pqcrypta-challenge/worker.js", "", fetch),
+                &policy
+            ),
+            SecurityDecision::ChallengeAsset { .. }
+        ));
+        assert_eq!(
+            security
+                .challenger
+                .passed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            security
+                .challenger
+                .failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// A route with `challenge = true` asks every page load for a pass; with
+    /// the challenge off nothing is served under its address.
+    #[tokio::test]
+    async fn a_challenge_route_asks_every_page_load() {
+        let mut config = ProxyConfig::default();
+        config.security.challenge.enabled = true;
+        let security = SecurityState::new(&config);
+        let policy = RequestPolicy {
+            challenge: true,
+            ..RequestPolicy::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("accept", "text/html,application/xhtml+xml".parse().unwrap());
+        let view = SecurityRequestView {
+            ip: "198.51.100.24".parse().unwrap(),
+            peer_port: None,
+            method: "GET",
+            path: "/signup",
+            query: "",
+            headers: &headers,
+            body: None,
+            version: None,
+            authority: None,
+        };
+        assert!(matches!(
+            security.evaluate(&view, &policy),
+            SecurityDecision::Challenge { .. }
+        ));
+        assert!(matches!(
+            security.evaluate(&view, &RequestPolicy::default()),
+            SecurityDecision::Allow
+        ));
+
+        let off = SecurityState::new(&ProxyConfig::default());
+        let asset = SecurityRequestView {
+            path: "/.well-known/pqcrypta-challenge/challenge.js",
+            ..view
+        };
+        assert!(matches!(
+            off.evaluate(&asset, &policy),
             SecurityDecision::Allow
         ));
     }
