@@ -3034,6 +3034,13 @@ pub struct SecurityConfig {
     /// Directory for database-synced blocklist JSON files.
     /// Must be outside the web root and mode 0700, owned by the service user.
     pub blocklist_dir: PathBuf,
+    /// Further synced blocklists, read with `blocklist_dir`'s
+    /// `blocked_ips.json` (another source's list: a fleet's shared bans, for
+    /// one). The same format; their union is what the proxy holds, and a ban
+    /// no list names any more is released. A list that does not exist names
+    /// nothing. Default: none.
+    #[serde(default)]
+    pub blocklist_files: Vec<PathBuf>,
     /// F-01: Allow backends that resolve to RFC1918 private addresses.
     ///
     /// By default PQCrypta Proxy warns when a backend address falls in an RFC1918
@@ -3349,6 +3356,7 @@ impl Default for SecurityConfig {
             max_tracked_fingerprints: default_max_tracked_fingerprints(),
             trusted_internal_cidrs: Vec::new(),
             blocklist_dir: PathBuf::from("/var/lib/pqcrypta-proxy/blocklists"),
+            blocklist_files: Vec::new(),
             allow_internal_backends: false,
             geoip_block_duration_secs: default_geoip_block_duration_secs(),
             zero_trust_mode: false,

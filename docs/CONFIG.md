@@ -718,6 +718,8 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `min_requests_for_error_check` | u64 | `200` | Minimum requests before error rate check |
 | `error_rate_threshold` | f64 | `0.7` | Error rate threshold (70%) to trigger suspicious |
 | `error_window_secs` | u64 | `60` | Error tracking sliding window (1 minute) |
+| `blocklist_dir` | path | `"/var/lib/pqcrypta-proxy/blocklists"` | Where a database sync writes `blocked_ips.json` (a JSON array of `{"ip", "expires_at"}`, an address or a CIDR, `expires_at` RFC 3339 or null); read every minute |
+| `blocklist_files` | array[path] | `[]` | Further lists in the same format, read with `blocked_ips.json`: another source's, such as a fleet's shared bans. The proxy holds their union; an entry first named this round takes its list's expiry, one named by two lists the later; a ban no list names any more is released; a list that exists but does not read or parse releases nothing that round; a missing list names nothing |
 | `pentest_bypass_ips` | array[string] | `[]` | Authorised test sources: inspected by the WAF but never rate-limited or auto-banned. An entry is an address or a host name standing for the addresses it resolves to |
 | `host_resolver` | socket address? | `null` | A validating resolver, reached over TCP, for the host names in `pentest_bypass_ips`. Only an answer it authenticates (AD bit) counts, refreshed every minute; without one, a name matches nothing |
 
