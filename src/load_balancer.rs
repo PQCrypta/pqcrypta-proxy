@@ -1503,7 +1503,7 @@ impl BackendPool {
         let range = total.max(100);
         // A cohort: the book's placement (past its size, the hash's); by
         // chance otherwise
-        let placed = cohort_key(canary_cfg, ctx).and_then(|key| {
+        let placed = cohort_key(canary_cfg, ctx).map(|key| {
             let generation = self.cohort_generation.load(Ordering::Relaxed);
             let mut book = self.cohort_book.lock();
             if book.generation != generation {
