@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.0...v0.21.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **moq:** serve native QUIC sessions whatever 0-RTT did ([b172984](https://github.com/PQCrypta/pqcrypta-proxy/commit/b172984d480857ddeaeab424318c52c71b7e1dd8))
+
 ## [0.21.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.20.0...v0.21.0) (2026-11-23)
 
 
