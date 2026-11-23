@@ -312,6 +312,101 @@ fn cohort_roll(
     u32::try_from(u64::from_be_bytes(first) % u64::from(range)).ok()
 }
 
+/// A client's key in a cohort canary's book: a digest of its address, or of
+/// the cohort header. `None` for chance (`random`, or a header absent).
+fn cohort_key(cfg: &CanaryPoolConfig, ctx: &SelectionContext) -> Option<[u8; 16]> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    match cfg.cohort.as_str() {
+        "ip" => match ctx.client_ip {
+            IpAddr::V4(ip) => h.update(ip.octets()),
+            IpAddr::V6(ip) => h.update(ip.octets()),
+        },
+        _ if cfg.cohort_header().is_some() => h.update(ctx.cohort_header.as_ref()?.as_bytes()),
+        _ => return None,
+    }
+    let digest = h.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    Some(key)
+}
+
+/// The clients a cohort canary has met in one rollout, and the side each is
+/// on. A hash of each client's address put it on the canary with the
+/// canary's weight for odds, so a pool whose traffic comes from a handful of
+/// clients could leave a 10% canary with none of them, and a rollout waiting
+/// on its requests starved (2026-11-23: 28 clients, none drawn). The book
+/// gives the canary its share of clients exactly: a client seen for the
+/// first time goes to the canary while the canary has fewer than its share
+/// of the clients seen, this one counted (rounded up, so the first client a
+/// rollout meets is the canary's); once placed it stays, and as the weight
+/// rises clients on the stable side move to the canary until it has its
+/// share, each at most once.
+#[derive(Default)]
+struct CohortBook {
+    /// The rollout this book belongs to ([`BackendPool::cohort_generation`])
+    generation: u64,
+    /// Each client → the canary it is on, or `None` for the stable servers
+    members: std::collections::HashMap<[u8; 16], Option<String>>,
+    /// Clients on each canary
+    on: std::collections::HashMap<String, u64>,
+}
+
+/// The clients a book holds; past it a new client is placed by the hash of
+/// its key, as before
+const COHORT_BOOK_MAX: usize = 1 << 20;
+
+impl CohortBook {
+    /// The canary `key` is on, placing it if it is new or if a canary's
+    /// share has risen past what it holds.
+    fn place<T: Clone>(
+        &mut self,
+        key: [u8; 16],
+        shares: &[(T, u32)],
+        id: impl Fn(&T) -> &str,
+    ) -> Option<Option<T>> {
+        let seen = self.members.len() as u64;
+        let find = |name: &str| {
+            shares
+                .iter()
+                .find(|(c, _)| id(c) == name)
+                .map(|(c, _)| c.clone())
+        };
+        match self.members.get(&key) {
+            // On a canary still taking traffic; one that has left sends it
+            // to the stable servers while it is away
+            Some(Some(name)) => return Some(find(name)),
+            Some(None) => {
+                // A stable client moves to a canary below its share
+                for (canary, percent) in shares {
+                    let have = self.on.get(id(canary)).copied().unwrap_or(0);
+                    if have * 100 < u64::from(*percent) * seen {
+                        self.members.insert(key, Some(id(canary).to_string()));
+                        *self.on.entry(id(canary).to_string()).or_default() += 1;
+                        return Some(Some(canary.clone()));
+                    }
+                }
+                return Some(None);
+            }
+            None => {}
+        }
+        if self.members.len() >= COHORT_BOOK_MAX {
+            return None;
+        }
+        let with_this = seen + 1;
+        for (canary, percent) in shares {
+            let have = self.on.get(id(canary)).copied().unwrap_or(0);
+            if have < (u64::from(*percent) * with_this).div_ceil(100) {
+                self.members.insert(key, Some(id(canary).to_string()));
+                *self.on.entry(id(canary).to_string()).or_default() += 1;
+                return Some(Some(canary.clone()));
+            }
+        }
+        self.members.insert(key, None);
+        Some(None)
+    }
+}
+
 fn canary_for_roll<T>(shares: &[(T, u32)], mut roll: u32) -> Option<&T> {
     shares.iter().find_map(|(canary, percent)| {
         if roll < *percent {
@@ -931,6 +1026,10 @@ pub struct BackendPool {
     pub canary_config: Option<CanaryPoolConfig>,
     /// Canary sticky-cookie → (server_id, last_access) with TTL eviction.
     canary_sessions: DashMap<String, (String, Instant)>,
+    /// The clients a cohort canary has met, and their sides ([`CohortBook`])
+    cohort_book: Mutex<CohortBook>,
+    /// Raised by every canary started, so each rollout opens its own book
+    cohort_generation: AtomicU64,
     /// The stable servers' requests and errors, to compare the canary with
     stable_outcomes: Mutex<OutcomeWindow>,
 
@@ -1091,6 +1190,8 @@ impl BackendPool {
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
             canary_config: config.canary.clone(),
             canary_sessions: DashMap::new(),
+            cohort_book: Mutex::new(CohortBook::default()),
+            cohort_generation: AtomicU64::new(0),
             stable_outcomes: Mutex::new(OutcomeWindow::new()),
             source: config.clone(),
             freed,
@@ -1392,9 +1493,27 @@ impl BackendPool {
             return None;
         }
         let range = total.max(100);
-        let roll = cohort_roll(canary_cfg, ctx, &shares[0].0.id, range)
-            .unwrap_or_else(|| rand::random_range(0..range));
-        let server = canary_for_roll(&shares, roll)?.clone();
+        // A cohort: the book's placement (past its size, the hash's); by
+        // chance otherwise
+        let placed = cohort_key(canary_cfg, ctx).and_then(|key| {
+            let generation = self.cohort_generation.load(Ordering::Relaxed);
+            let mut book = self.cohort_book.lock();
+            if book.generation != generation {
+                *book = CohortBook {
+                    generation,
+                    ..CohortBook::default()
+                };
+            }
+            book.place(key, &shares, |s| s.id.as_str())
+        });
+        let server = match placed {
+            Some(side) => side?,
+            None => {
+                let roll = cohort_roll(canary_cfg, ctx, &shares[0].0.id, range)
+                    .unwrap_or_else(|| rand::random_range(0..range));
+                canary_for_roll(&shares, roll)?.clone()
+            }
+        };
 
         let set_canary_cookie = if canary_cfg.sticky {
             self.canary_sessions
@@ -1731,6 +1850,7 @@ impl BackendPool {
             })?,
         };
         server.make_canary(start);
+        self.cohort_generation.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         *self.rollout.lock() = weight.is_none().then(|| Rollout {
             server: server.id.clone(),
@@ -4407,6 +4527,53 @@ mod rollout_tests {
             assert!(!before || *after, "a client on the canary stays there");
         }
         assert!(at_50.iter().filter(|c| **c).count() > share);
+    }
+
+    /// A cohort canary gets its share of the clients exactly, however few:
+    /// the first client a rollout meets is the canary's, every client keeps
+    /// its side, a rising weight moves stable clients over until the canary
+    /// has its share, and each rollout opens its own book.
+    #[test]
+    fn a_cohort_canary_gets_its_share_of_few_clients() {
+        let pool = pool(&PAIR.replace("sticky = false", "sticky = false\ncohort = \"ip\""));
+        let green = pool.member("127.0.0.1:3023").unwrap();
+        pool.start_canary(&green.id, Some(10)).unwrap();
+        let from = |i: u32| SelectionContext {
+            client_ip: IpAddr::V4(std::net::Ipv4Addr::from(0xC633_6400 + i)),
+            ..ctx()
+        };
+        let side = |i: u32| pool.select(&from(i)).unwrap().server.is_canary();
+        let at_10: Vec<bool> = (0..5).map(side).collect();
+        assert_eq!(
+            at_10,
+            [true, false, false, false, false],
+            "one in five, the first"
+        );
+        assert_eq!(at_10, (0..5).map(side).collect::<Vec<_>>(), "sides kept");
+        // The eleventh client is the canary's second: 2 of 11 is its 10%
+        let more: Vec<bool> = (5..11).map(side).collect();
+        assert_eq!(more.iter().filter(|c| **c).count(), 1);
+
+        green.canary_weight_percent.store(50, Ordering::Relaxed);
+        let at_50: Vec<bool> = (0..11).map(side).collect();
+        let before: Vec<bool> = at_10.iter().chain(&more).copied().collect();
+        for (b, a) in before.iter().zip(&at_50) {
+            assert!(!b || *a, "a client on the canary stays there");
+        }
+        assert_eq!(
+            at_50.iter().filter(|c| **c).count(),
+            6,
+            "half of 11, rounded up"
+        );
+        assert_eq!(at_50, (0..11).map(side).collect::<Vec<_>>(), "sides kept");
+
+        // A new rollout: a new book, whose first client is the canary's
+        pool.start_canary(&green.id, Some(10)).unwrap();
+        assert!(
+            side(7),
+            "a client of the stable side is the new rollout's first"
+        );
+        assert!(!side(0));
     }
 
     #[test]
