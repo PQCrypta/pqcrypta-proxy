@@ -31,9 +31,11 @@ pub async fn send_from_config(
 ) -> anyhow::Result<AdminResponse> {
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", config_path.display()))?;
-    let (config, _ignored) = crate::config::parse_config_str(&content)
-        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", config_path.display()))?;
-    send(&config.admin, method, path_and_query, body).await
+    // [admin] alone: the client reads the admin credentials and no other
+    // section's secret
+    let admin: AdminConfig = crate::config::parse_config_section(&content, "admin")
+        .map_err(|e| anyhow::anyhow!("parsing [admin] of {}: {e}", config_path.display()))?;
+    send(&admin, method, path_and_query, body).await
 }
 
 /// Where a client on this host reaches the admin API: its bind address, or

@@ -20,7 +20,9 @@
 //! (`pqcrypta-proxy --admin`, a script's unit) finds the same names in its own
 //! `$CREDENTIALS_DIRECTORY`, in `PQCRYPTA_CREDENTIALS_DIRECTORY`, or -- run as
 //! root while the service runs -- in the service's own directory,
-//! `/run/credentials/pqcrypta-proxy.service`.
+//! `/run/credentials/pqcrypta-proxy.service`. A tool that reads one section
+//! (`--admin` its `[admin]`, `--moq-token` its `[moq]`) resolves that
+//! section's secrets alone (`config::parse_config_section`).
 //!
 //! The configuration then holds no secret at all, so a copy of it can be
 //! tracked as it is, with nothing to redact. A value is read when the

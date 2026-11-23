@@ -440,7 +440,7 @@ LoadCredentialEncrypted=admin-token
 LoadCredentialEncrypted=admin-hmac
 ```
 
-`--with-key=auto` seals to the TPM2 and the host key where the machine has a TPM2, and to the host key otherwise; systemd decrypts it into the service's private credentials directory when the service starts. A value is read at start and at every reload, less one trailing newline; a secret that cannot be read, or is empty, refuses the configuration. A command run outside the service (`--admin`, `--validate`) reads the same names from its own `$CREDENTIALS_DIRECTORY`, from `PQCRYPTA_CREDENTIALS_DIRECTORY`, or, run as root while the service runs, from the service's own `/run/credentials/pqcrypta-proxy.service`.
+`--with-key=auto` seals to the TPM2 and the host key where the machine has a TPM2, and to the host key otherwise; systemd decrypts it into the service's private credentials directory when the service starts. A value is read at start and at every reload, less one trailing newline; a secret that cannot be read, or is empty, refuses the configuration. A command run outside the service (`--admin`, `--validate`) reads the same names from its own `$CREDENTIALS_DIRECTORY`, from `PQCRYPTA_CREDENTIALS_DIRECTORY`, or, run as root while the service runs, from the service's own `/run/credentials/pqcrypta-proxy.service`. `--admin` reads only `[admin]` and `--moq-token` only `[moq]`, so a unit that runs one is given that section's credentials and no other; `--validate` reads every section, and needs every credential.
 
 ## Admin API
 

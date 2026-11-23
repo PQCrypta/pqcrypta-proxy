@@ -1725,6 +1725,28 @@ pub fn parse_config_str(content: &str) -> Result<(ProxyConfig, Vec<String>), tom
     Ok((config, ignored))
 }
 
+/// One section of the configuration, `[name]`, read without the rest.
+///
+/// It is the section `parse_config_str` gives, over the same defaults. A tool
+/// that needs one section (the admin client `[admin]`, a MoQ token `[moq]`)
+/// resolves only that section's secrets: another section's credential is
+/// never read, so a unit that runs the tool is given only the credentials it
+/// uses.
+pub fn parse_config_section<T>(content: &str, name: &str) -> Result<T, toml::de::Error>
+where
+    T: Default + Serialize + serde::de::DeserializeOwned,
+{
+    use serde::de::Error as _;
+    let mut file: toml::Table = toml::from_str(content)?;
+    let defaults = toml::Value::try_from(T::default())
+        .map_err(|e| toml::de::Error::custom(format!("the default [{name}]: {e}")))?;
+    match file.remove(name) {
+        Some(section @ toml::Value::Table(_)) => merge_toml_values(defaults, section).try_into(),
+        Some(_) => Err(toml::de::Error::custom(format!("`{name}` is not a table"))),
+        None => defaults.try_into(),
+    }
+}
+
 fn warn_ignored_keys(path: &Path, ignored: &[String]) {
     for key in ignored {
         warn!(
@@ -6447,6 +6469,42 @@ mod tests {
         );
         let (_, clean) = parse_config_str("[headers]\nhsts = \"x\"\n").unwrap();
         assert!(clean.is_empty(), "{clean:?}");
+    }
+
+    /// A section read alone is the section the whole file gives.
+    ///
+    /// It reads no other section's secret: the admin client runs where the
+    /// MoQ publish key is not a credential it was given.
+    #[test]
+    fn a_section_alone_matches_the_whole_file_and_reads_only_its_own_secrets() {
+        let file = "[admin]\nenabled = true\nport = 9443\nauth_token = \"an-admin-token-long-enough-for-the-floor-0123456789\"\n\
+                    [moq]\nenabled = true\ncache_mb = 64\npublish_key = \"a-publish-key\"\n";
+        let (whole, _) = parse_config_str(file).unwrap();
+        let admin: AdminConfig = parse_config_section(file, "admin").unwrap();
+        let moq: MoqConfig = parse_config_section(file, "moq").unwrap();
+        fn value<T: Serialize>(v: &T) -> toml::Value {
+            toml::Value::try_from(v).unwrap()
+        }
+        assert_eq!(value(&admin), value(&whole.admin));
+        assert_eq!(value(&moq), value(&whole.moq));
+        // An absent section is the default one
+        let absent: MoqConfig = parse_config_section("[admin]\nenabled = true\n", "moq").unwrap();
+        assert_eq!(value(&absent), value(&MoqConfig::default()));
+        // Another section's credential that cannot be read refuses the whole
+        // file, and not the section that does not name it
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = file.replace(
+            "publish_key = \"a-publish-key\"",
+            &format!(
+                "publish_key = {{ file = {:?} }}",
+                dir.path().join("absent").display().to_string()
+            ),
+        );
+        assert!(parse_config_str(&unreadable).is_err());
+        let admin: AdminConfig = parse_config_section(&unreadable, "admin").unwrap();
+        assert_eq!(value(&admin), value(&whole.admin));
+        assert!(parse_config_section::<MoqConfig>(&unreadable, "moq").is_err());
+        assert!(parse_config_section::<MoqConfig>("moq = 3\n", "moq").is_err());
     }
 
     /// Signing secrets are held to the admin token's floor: a secret one

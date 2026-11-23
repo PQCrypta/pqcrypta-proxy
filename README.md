@@ -1832,7 +1832,7 @@ Options:
       --test-certificates <DIR>        Write self-signed certificates for testing into DIR and exit: for each host the routes name and localhost, an ECDSA P-256 certificate and an ML-DSA-87 companion, in the certificate directory's layout. No client trusts them; a file already there is never replaced
       --merge-fingerprints <OUT>       Merge fingerprint corpora into one and write it here: observed.json of either version, or a published directory's full.json (`--from`)
       --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
-      --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration names (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
+      --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration's `[admin]` names, and no other section's (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
       --admin-body <JSON>              The JSON body of an `--admin` request
       --moq-token <PREFIX>             Print a Media over QUIC publish token for a Track Namespace prefix, in the serialized form of draft-ietf-moq-transport section 8.8 (`music-radio`; "" for every namespace), signed with `[moq] publish_key`, and exit
       --moq-token-days <DAYS>          Days a `--moq-token` is valid [default: 30]
