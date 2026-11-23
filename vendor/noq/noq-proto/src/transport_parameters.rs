@@ -132,6 +132,9 @@ macro_rules! make_struct {
 
             /// Nat traversal draft
             pub max_remote_nat_traversal_addresses: Option<NonZeroU8>,
+
+            /// The endpoint is willing to receive RESET_STREAM_AT frames
+            pub(crate) reset_stream_at: bool,
         }
 
         // We deliberately don't implement the `Default` trait, since that would be public, and
@@ -159,6 +162,7 @@ macro_rules! make_struct {
                     address_discovery_role: address_discovery::Role::default(),
                     initial_max_path_id: None,
                     max_remote_nat_traversal_addresses: None,
+                    reset_stream_at: false,
                 }
             }
         }
@@ -216,6 +220,7 @@ impl TransportParameters {
             address_discovery_role: config.address_discovery_role,
             initial_max_path_id: config.get_initial_max_path_id(),
             max_remote_nat_traversal_addresses: config.max_remote_nat_traversal_addresses,
+            reset_stream_at: config.reset_stream_at,
             ..Self::default()
         }
     }
@@ -234,6 +239,7 @@ impl TransportParameters {
             || cached.grease_quic_bit && !self.grease_quic_bit
             || cached.address_discovery_role != self.address_discovery_role
             || cached.max_remote_nat_traversal_addresses != self.max_remote_nat_traversal_addresses
+            || cached.reset_stream_at && !self.reset_stream_at
         {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "0-RTT accepted with incompatible transport parameters",
@@ -385,6 +391,12 @@ impl TransportParameters {
                         w.write_var(0);
                     }
                 }
+                TransportParameterId::ResetStreamAt => {
+                    if self.reset_stream_at {
+                        w.write_var(id as u64);
+                        w.write_var(0);
+                    }
+                }
                 TransportParameterId::MaxDatagramFrameSize => {
                     if let Some(x) = self.max_datagram_frame_size {
                         w.write_var(id as u64);
@@ -527,6 +539,12 @@ impl TransportParameters {
                         return Err(Error::Malformed);
                     }
                     params.disable_active_migration = true;
+                }
+                TransportParameterId::ResetStreamAt => {
+                    if len != 0 || params.reset_stream_at {
+                        return Err(Error::Malformed);
+                    }
+                    params.reset_stream_at = true;
                 }
                 TransportParameterId::PreferredAddress => {
                     if params.preferred_address.is_some() {
@@ -764,11 +782,14 @@ pub(crate) enum TransportParameterId {
     // inspired by https://www.ietf.org/archive/id/draft-seemann-quic-nat-traversal-02.html,
     // simplified to n0's own protocol.
     N0NatTraversal = 0x3d7f91120401,
+
+    // https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset
+    ResetStreamAt = 0x1d,
 }
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 24] = [
+    const SUPPORTED: [Self; 25] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -793,6 +814,7 @@ impl TransportParameterId {
         Self::ObservedAddr,
         Self::InitialMaxPathId,
         Self::N0NatTraversal,
+        Self::ResetStreamAt,
     ];
 }
 
@@ -835,6 +857,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::ObservedAddr == id => Self::ObservedAddr,
             id if Self::InitialMaxPathId == id => Self::InitialMaxPathId,
             id if Self::N0NatTraversal == id => Self::N0NatTraversal,
+            id if Self::ResetStreamAt == id => Self::ResetStreamAt,
             _ => return Err(()),
         };
         Ok(param)
@@ -877,6 +900,7 @@ mod test {
             address_discovery_role: address_discovery::Role::send_only(),
             initial_max_path_id: Some(PathId::MAX),
             max_remote_nat_traversal_addresses: Some(5u8.try_into().unwrap()),
+            reset_stream_at: true,
             ..TransportParameters::default()
         };
         params.write(&mut buf);
@@ -1010,5 +1034,29 @@ mod test {
         };
         high_limit.validate_resumption_from(&low_limit).unwrap();
         low_limit.validate_resumption_from(&high_limit).unwrap_err();
+    }
+
+    #[test]
+    fn resumption_reset_stream_at() {
+        let enabled = TransportParameters {
+            reset_stream_at: true,
+            ..TransportParameters::default()
+        };
+        let disabled = TransportParameters::default();
+        enabled.validate_resumption_from(&disabled).unwrap();
+        // A server must not disable the extension when accepting 0-RTT
+        disabled.validate_resumption_from(&enabled).unwrap_err();
+    }
+
+    #[test]
+    fn reset_stream_at_must_be_empty() {
+        let mut buf = Vec::new();
+        buf.write_var(TransportParameterId::ResetStreamAt as u64);
+        buf.write_var(1);
+        buf.push(0);
+        assert_eq!(
+            TransportParameters::read(Side::Client, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
     }
 }

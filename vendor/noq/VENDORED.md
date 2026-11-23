@@ -25,6 +25,21 @@ when the proxy builds noq as a dependency.
 - `Connection::is_settled`: nothing queued or unacknowledged, so a stream-level
   signal (a STOP_SENDING) reaches the peer before a close.
 - A client that rejects the server's handshake says so with CONNECTION_CLOSE.
+- A server that rejects a ClientHello spanning two Initial packets (a hybrid
+  post-quantum key share makes most ClientHellos this size) says so with
+  CONNECTION_CLOSE too, on the path the connection began on, within the
+  anti-amplification limit; upstream n0-computer/noq#892.
+- RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset): the
+  `reset_stream_at` transport parameter (on by default), the frame both ways,
+  and `SendStream::reset_at`. This is a port of n0-computer/noq#843 onto this
+  fork's stream state, which differs from that PR's base in three places:
+  - reset streams leave the pending queue;
+  - `StreamAffinity`;
+  - `stream_recv_freed`.
+
+  A stream reset this way sends and retransmits its data below the reliable
+  size, and is freed once both that data and the reset are acknowledged. A
+  STOP_SENDING for it abandons the reliable data with a RESET_STREAM.
 - 1-RTT frames sent as 0.5-RTT data right behind the server's Handshake flight
   (an HTTP/3 server's SETTINGS arrive with the handshake), and no stall after a
   HelloRetryRequest.

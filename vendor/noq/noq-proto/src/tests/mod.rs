@@ -59,6 +59,7 @@ mod multipath;
 mod proptests;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod random_interaction;
+mod reset_stream_at;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -1281,6 +1282,25 @@ fn client_alpn_unset() {
 
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     let client_ch = pair.begin_connect(client_config());
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(err) }) if err.error_code == TransportErrorCode::crypto(0x78)
+    );
+}
+
+/// A ClientHello too large for one Initial packet, refused by the TLS stack,
+/// is answered with CONNECTION_CLOSE all the same: a hybrid post-quantum key
+/// share makes most ClientHellos this size.
+#[test]
+fn alpn_mismatch_in_a_client_hello_spanning_two_initials() {
+    let _guard = subscribe();
+    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec!["foo".into()])));
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    // Long protocol names push the ClientHello past one packet
+    let mut offered: Vec<Vec<u8>> = vec!["quux".into()];
+    offered.extend((0..6).map(|i| vec![b'a' + i; 250]));
+    let client_ch = pair.begin_connect(ClientConfig::new(Arc::new(client_crypto_with_alpn(offered))));
     pair.drive();
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),

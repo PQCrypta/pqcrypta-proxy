@@ -1,0 +1,1008 @@
+//! The relay end to end over real QUIC connections, in both drafts: a
+//! publisher and subscribers that speak the wire directly (the codec only
+//! frames bytes; every exchange is the client's own), and the relay as the
+//! listener serves it.
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::io::BufReader;
+
+use super::codec::{put_vi64, read_vi64, Location, Namespace, TrackName};
+use super::data::{
+    encode_subgroup_object, read_subgroup_object, Delivery, FetchEntry, FetchState, Object,
+    ObjectStatus, SubgroupHeader, SubgroupIdMode, STREAM_FETCH_HEADER,
+};
+use super::message::{
+    self, read_frame, Context, GroupOrder, LocationFilter, Message, Params, PrefixRequest, Publish,
+    Setup, Token, TrackRequest,
+};
+use super::version::Version;
+use super::Moq;
+use crate::config::MoqConfig;
+use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
+
+const KEY: &str = "e2e-publish-key";
+const WAIT: Duration = Duration::from_secs(5);
+
+type Served = (
+    quinn::Endpoint,
+    Arc<Moq>,
+    tokio::task::JoinHandle<()>,
+    Vec<u8>,
+);
+
+/// A relay on a loopback port, serving every MOQT version.
+async fn relay() -> Served {
+    let moq = Moq::new(&MoqConfig {
+        enabled: true,
+        publish_key: Some(KEY.into()),
+        ..MoqConfig::default()
+    })
+    .expect("the relay");
+    serve(moq)
+}
+
+/// `moq` served on a loopback port, with a throwaway certificate.
+fn serve(moq: Arc<Moq>) -> Served {
+    let throwaway = throwaway_cert();
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("TLS 1.3")
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
+    crypto.alpn_protocols = Version::alpns();
+    let server = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("QUIC server config"),
+        )),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    )
+    .expect("a server port");
+    let accept = {
+        let server = server.clone();
+        let moq = Arc::clone(&moq);
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let moq = Arc::clone(&moq);
+                tokio::spawn(async move {
+                    let peer = incoming.remote_address();
+                    let Ok(conn) = incoming.await else { return };
+                    let alpn = conn
+                        .handshake_data()
+                        .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                        .and_then(|h| h.protocol)
+                        .unwrap_or_default();
+                    moq.serve_quic(conn, &alpn, peer).await;
+                });
+            }
+        })
+    };
+    (server, moq, accept, throwaway.der.to_vec())
+}
+
+/// A client endpoint that trusts the relay's certificate and offers `alpns`.
+fn client_endpoint(cert: &[u8], alpns: Vec<Vec<u8>>) -> quinn::Endpoint {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedTo(cert.to_vec().into(), provider)))
+        .with_no_client_auth();
+    crypto.alpn_protocols = alpns;
+    let client =
+        quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("a client port");
+    client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("QUIC client config"),
+    )));
+    client
+}
+
+/// One MOQT client session, speaking the wire itself.
+struct Client {
+    conn: quinn::Connection,
+    v: Version,
+    _control: quinn::SendStream,
+    server_setup: Setup,
+    next_id: u64,
+}
+
+impl Client {
+    async fn connect(server: &quinn::Endpoint, cert: &[u8], v: Version, setup: Setup) -> Self {
+        let ep = client_endpoint(cert, vec![v.alpn().as_bytes().to_vec()]);
+        let conn = ep
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap()
+            .await
+            .expect("the handshake");
+        let mut control = conn.open_uni().await.unwrap();
+        control
+            .write_all(&Message::Setup(setup).encode(v))
+            .await
+            .unwrap();
+        let recv = tokio::time::timeout(WAIT, conn.accept_uni())
+            .await
+            .expect("the server's control stream")
+            .unwrap();
+        let mut recv = BufReader::new(recv);
+        let (kind, body) = read_frame(&mut recv, v, 1 << 20)
+            .await
+            .ok()
+            .flatten()
+            .expect("SETUP");
+        assert_eq!(kind, message::SETUP);
+        let server_setup = Setup::decode(&body, v).expect("the server's SETUP");
+        // The server's control stream stays open for GOAWAY
+        tokio::spawn(async move {
+            let mut r = recv;
+            while let Ok(Some(_)) = read_frame(&mut r, v, 1 << 20).await {}
+        });
+        Self {
+            conn,
+            v,
+            _control: control,
+            server_setup,
+            next_id: 0,
+        }
+    }
+
+    /// A session the relay is expected to refuse: SETUP is sent, and the
+    /// relay's own SETUP may or may not arrive before its close.
+    async fn connect_refused(
+        server: &quinn::Endpoint,
+        cert: &[u8],
+        v: Version,
+        setup: Setup,
+    ) -> quinn::Connection {
+        let ep = client_endpoint(cert, vec![v.alpn().as_bytes().to_vec()]);
+        let conn = ep
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap()
+            .await
+            .expect("the handshake");
+        let mut control = conn.open_uni().await.unwrap();
+        control
+            .write_all(&Message::Setup(setup).encode(v))
+            .await
+            .unwrap();
+        // The stream stays open until the relay closes the session
+        std::mem::forget(control);
+        conn
+    }
+
+    fn id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 2;
+        id
+    }
+
+    /// Open a request stream with `m`; the response's first message.
+    async fn request(
+        &self,
+        m: Message,
+    ) -> (
+        quinn::SendStream,
+        BufReader<quinn::RecvStream>,
+        u64,
+        Message,
+    ) {
+        let (mut send, recv) = self.conn.open_bi().await.unwrap();
+        send.write_all(&m.encode(self.v)).await.unwrap();
+        let mut recv = BufReader::new(recv);
+        let (kind, body) = tokio::time::timeout(WAIT, read_frame(&mut recv, self.v, 1 << 20))
+            .await
+            .expect("an answer in time")
+            .ok()
+            .flatten()
+            .expect("an answer");
+        let ctx = Context {
+            ok_allows: message::allowed::ok_with_largest(),
+            ok_properties: true,
+            ..Context::default()
+        };
+        let decoded = Message::decode(kind, &body, self.v, &ctx).expect("a well-formed answer");
+        (send, recv, kind, decoded)
+    }
+
+    /// The session's close code, once the relay closes it.
+    async fn closed_with(&self) -> u64 {
+        match tokio::time::timeout(WAIT, self.conn.closed())
+            .await
+            .expect("the relay closes the session")
+        {
+            quinn::ConnectionError::ApplicationClosed(c) => c.error_code.into_inner(),
+            other => panic!("closed otherwise: {other}"),
+        }
+    }
+}
+
+/// The code a refused session was closed with.
+async fn closed_code(conn: &quinn::Connection) -> u64 {
+    match tokio::time::timeout(WAIT, conn.closed())
+        .await
+        .expect("the relay closes the session")
+    {
+        quinn::ConnectionError::ApplicationClosed(c) => c.error_code.into_inner(),
+        other => panic!("closed otherwise: {other}"),
+    }
+}
+
+fn ns(fields: &[&'static [u8]]) -> Namespace {
+    Namespace(fields.iter().map(|f| Bytes::from_static(f)).collect())
+}
+
+fn track() -> TrackName {
+    TrackName {
+        namespace: ns(&[b"music", b"e2e"]),
+        name: Bytes::from_static(b"audio"),
+    }
+}
+
+fn token_for(prefix: &Namespace) -> Token {
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let value = super::auth::PublishAuth::new(KEY.as_bytes()).issue(prefix, expiry);
+    Token::UseValue {
+        kind: 0,
+        value: Bytes::from(value),
+    }
+}
+
+fn object(g: u64, o: u64, payload: &'static [u8]) -> Object {
+    Object {
+        location: Location::new(g, o),
+        delivery: Delivery::Subgroup(0),
+        priority: 64,
+        status: ObjectStatus::Normal,
+        properties: Bytes::new(),
+        payload: Bytes::from_static(payload),
+    }
+}
+
+/// Send `objects` (one group, subgroup 0) on a new stream, then FIN.
+async fn send_subgroup(conn: &quinn::Connection, alias: u64, group: u64, objects: &[Object]) {
+    let mut s = conn.open_uni().await.unwrap();
+    let header = SubgroupHeader {
+        track_alias: alias,
+        group,
+        subgroup: SubgroupIdMode::Zero,
+        priority: Some(64),
+        properties: false,
+        end_of_group: false,
+        first_object: true,
+    };
+    let mut wire = Vec::new();
+    header.encode(&mut wire);
+    let mut prior = None;
+    for o in objects {
+        encode_subgroup_object(&mut wire, prior, o, false);
+        prior = Some(o.location.object);
+    }
+    s.write_all(&wire).await.unwrap();
+    s.finish().unwrap();
+}
+
+/// Read one subgroup stream the relay opened: its alias, group and objects.
+async fn receive_subgroup(conn: &quinn::Connection) -> (u64, u64, Vec<(u64, Bytes)>) {
+    let recv = tokio::time::timeout(WAIT, conn.accept_uni())
+        .await
+        .expect("a subgroup stream")
+        .unwrap();
+    let mut r = BufReader::new(recv);
+    let flags = read_vi64(&mut r).await.unwrap().unwrap();
+    let header = SubgroupHeader::read(flags, &mut r)
+        .await
+        .expect("a SUBGROUP_HEADER");
+    let mut out = Vec::new();
+    let mut prior = None;
+    while let Some((id, _status, _props, payload)) =
+        read_subgroup_object(&mut r, &header, prior, 1 << 20)
+            .await
+            .unwrap()
+    {
+        prior = Some(id);
+        out.push((id, payload));
+    }
+    (header.track_alias, header.group, out)
+}
+
+#[tokio::test]
+async fn published_objects_reach_a_subscriber_and_a_fetch_in_both_drafts() {
+    let (server, _moq, _accept, cert) = relay().await;
+    for v in Version::ALL {
+        let t = TrackName {
+            namespace: Namespace(vec![Bytes::from_static(b"music"), Bytes::from(v.alpn())]),
+            name: Bytes::from_static(b"audio"),
+        };
+        let mut publisher = Client::connect(&server, &cert, v, Setup::default()).await;
+        let id = publisher.id();
+        let (_pub_send, _pub_recv, kind, _) = publisher
+            .request(Message::Publish(Publish {
+                request_id: id,
+                track: t.clone(),
+                track_alias: 9,
+                params: Params {
+                    auth_tokens: vec![token_for(&t.namespace)],
+                    ..Params::default()
+                },
+                properties: Bytes::new(),
+            }))
+            .await;
+        assert_eq!(kind, message::REQUEST_OK, "{v}: PUBLISH_OK");
+
+        let mut subscriber = Client::connect(&server, &cert, v, Setup::default()).await;
+        assert!(subscriber
+            .server_setup
+            .implementation
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("pqcrypta-proxy/"));
+        let id = subscriber.id();
+        let (_s, _r, kind, ok) = subscriber
+            .request(Message::Subscribe(TrackRequest {
+                request_id: id,
+                track: t.clone(),
+                params: Params::default(),
+            }))
+            .await;
+        assert_eq!(kind, message::SUBSCRIBE_OK, "{v}");
+        let Message::SubscribeOk { track_alias, .. } = ok else {
+            unreachable!()
+        };
+
+        let objects = [
+            object(0, 0, b"zero"),
+            object(0, 1, b"one"),
+            object(0, 2, b"two"),
+        ];
+        send_subgroup(&publisher.conn, 9, 0, &objects).await;
+        let (alias, group, got) = receive_subgroup(&subscriber.conn).await;
+        assert_eq!((alias, group), (track_alias, 0), "{v}");
+        assert_eq!(
+            got.iter().map(|(i, p)| (*i, p.clone())).collect::<Vec<_>>(),
+            objects
+                .iter()
+                .map(|o| (o.location.object, o.payload.clone()))
+                .collect::<Vec<_>>(),
+            "{v}"
+        );
+
+        // A FETCH of the same range is served from the relay's cache
+        let mut fetcher = Client::connect(&server, &cert, v, Setup::default()).await;
+        let id = fetcher.id();
+        let (_s, _r, kind, ok) = fetcher
+            .request(Message::Fetch(TrackRequest {
+                request_id: id,
+                track: t.clone(),
+                params: Params {
+                    location_filter: Some(LocationFilter::AbsoluteRange {
+                        start: Location::new(0, 0),
+                        end: Location::new(0, 2),
+                    }),
+                    ..Params::default()
+                },
+            }))
+            .await;
+        if v.fetch_ok_is_request_ok() {
+            assert_eq!(kind, message::REQUEST_OK, "{v}");
+            let Message::RequestOk { params, .. } = ok else {
+                unreachable!()
+            };
+            assert_eq!(
+                params.largest_object,
+                Some(Location::new(0, 2)),
+                "LARGEST_OBJECT is within the range"
+            );
+        } else {
+            assert_eq!(kind, message::FETCH_OK_22, "{v}");
+        }
+        let recv = tokio::time::timeout(WAIT, fetcher.conn.accept_uni())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut r = BufReader::new(recv);
+        assert_eq!(read_vi64(&mut r).await.unwrap(), Some(STREAM_FETCH_HEADER));
+        assert_eq!(read_vi64(&mut r).await.unwrap(), Some(id));
+        let mut state = FetchState::default();
+        let mut fetched = Vec::new();
+        while let Some(e) = state
+            .read(&mut r, GroupOrder::Ascending, v, 1 << 20)
+            .await
+            .unwrap()
+        {
+            if let FetchEntry::Object(o) = e {
+                fetched.push(o.payload);
+            }
+        }
+        assert_eq!(
+            fetched,
+            objects
+                .iter()
+                .map(|o| o.payload.clone())
+                .collect::<Vec<_>>(),
+            "{v}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_id_of_the_wrong_parity_or_used_twice_closes_the_session() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let c = Client::connect(&server, &cert, v, Setup::default()).await;
+    let (mut s, _r) = c.conn.open_bi().await.unwrap();
+    s.write_all(
+        &Message::TrackStatus(TrackRequest {
+            request_id: 1,
+            track: track(),
+            params: Params::default(),
+        })
+        .encode(v),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.closed_with().await, 0x4, "INVALID_REQUEST_ID");
+
+    let mut c = Client::connect(&server, &cert, v, Setup::default()).await;
+    let id = c.id();
+    let _ = c
+        .request(Message::TrackStatus(TrackRequest {
+            request_id: id,
+            track: track(),
+            params: Params::default(),
+        }))
+        .await;
+    let (mut s, _r) = c.conn.open_bi().await.unwrap();
+    s.write_all(
+        &Message::TrackStatus(TrackRequest {
+            request_id: id,
+            track: track(),
+            params: Params::default(),
+        })
+        .encode(v),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        c.closed_with().await,
+        0x4,
+        "a duplicate is INVALID_REQUEST_ID"
+    );
+}
+
+#[tokio::test]
+async fn a_request_stream_that_opens_with_no_request_is_unexpected() {
+    let (server, _moq, _accept, cert) = relay().await;
+    for (v, code) in [(Version::Draft23, 0x303), (Version::Draft22, 0x3)] {
+        let c = Client::connect(&server, &cert, v, Setup::default()).await;
+        let (mut s, _r) = c.conn.open_bi().await.unwrap();
+        s.write_all(
+            &Message::Goaway {
+                uri: Bytes::new(),
+                timeout_ms: 0,
+            }
+            .encode(v),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.closed_with().await, code, "{v}");
+    }
+}
+
+#[tokio::test]
+async fn publishing_needs_a_token_for_the_namespace() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let mut c = Client::connect(&server, &cert, v, Setup::default()).await;
+    for params in [
+        Params::default(),
+        Params {
+            auth_tokens: vec![token_for(&ns(&[b"other"]))],
+            ..Params::default()
+        },
+    ] {
+        let id = c.id();
+        let (_s, _r, kind, m) = c
+            .request(Message::Publish(Publish {
+                request_id: id,
+                track: track(),
+                track_alias: id + 1,
+                params,
+                properties: Bytes::new(),
+            }))
+            .await;
+        assert_eq!(kind, message::REQUEST_ERROR);
+        let Message::RequestError(e) = m else {
+            unreachable!()
+        };
+        assert_eq!(e.code, 0x1, "UNAUTHORIZED");
+    }
+    // A token in SETUP authorizes the session's requests
+    let setup = Setup {
+        auth_tokens: vec![token_for(&ns(&[b"music"]))],
+        ..Setup::default()
+    };
+    let mut c = Client::connect(&server, &cert, v, setup).await;
+    let id = c.id();
+    let (_s, _r, kind, _) = c
+        .request(Message::PublishNamespace(PrefixRequest {
+            request_id: id,
+            prefix: ns(&[b"music", b"e2e"]),
+            params: Params::default(),
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+}
+
+#[tokio::test]
+async fn namespace_subscribers_hear_advertisements_and_subscriptions_reach_the_publisher() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let mut watcher = Client::connect(&server, &cert, v, Setup::default()).await;
+    let id = watcher.id();
+    let (_ws, mut wr, kind, _) = watcher
+        .request(Message::SubscribeNamespace(PrefixRequest {
+            request_id: id,
+            prefix: ns(&[b"music"]),
+            params: Params::default(),
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+
+    let mut publisher = Client::connect(&server, &cert, v, Setup::default()).await;
+    let id = publisher.id();
+    let prefix = ns(&[b"music", b"e2e"]);
+    let (_ps, _pr, kind, _) = publisher
+        .request(Message::PublishNamespace(PrefixRequest {
+            request_id: id,
+            prefix: prefix.clone(),
+            params: Params {
+                auth_tokens: vec![token_for(&prefix)],
+                ..Params::default()
+            },
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+    let (kind, body) = tokio::time::timeout(WAIT, read_frame(&mut wr, v, 1 << 20))
+        .await
+        .unwrap()
+        .ok()
+        .flatten()
+        .unwrap();
+    assert_eq!(kind, message::NAMESPACE);
+    let Message::Namespace { suffix, .. } =
+        Message::decode(kind, &body, v, &Context::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(suffix, ns(&[b"e2e"]));
+
+    // A SUBSCRIBE for a track in the namespace goes to the publisher
+    let pub_conn = publisher.conn.clone();
+    let serve_publisher = tokio::spawn(async move {
+        let (mut send, recv) = tokio::time::timeout(WAIT, pub_conn.accept_bi())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut recv = BufReader::new(recv);
+        let (kind, body) = read_frame(&mut recv, v, 1 << 20)
+            .await
+            .ok()
+            .flatten()
+            .unwrap();
+        assert_eq!(kind, message::SUBSCRIBE);
+        let Message::Subscribe(req) = Message::decode(kind, &body, v, &Context::default()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(req.request_id % 2, 1, "the relay's requests are odd");
+        let ok = Message::SubscribeOk {
+            track_alias: 4,
+            params: Params::default(),
+            properties: Bytes::new(),
+        };
+        send.write_all(&ok.encode(v)).await.unwrap();
+        send_subgroup(&pub_conn, 4, 7, &[object(7, 0, b"live")]).await;
+        // Hold the subscription open
+        tokio::time::sleep(WAIT).await;
+        drop(send);
+    });
+    let mut subscriber = Client::connect(&server, &cert, v, Setup::default()).await;
+    let id = subscriber.id();
+    let (_s, _r, kind, _) = subscriber
+        .request(Message::Subscribe(TrackRequest {
+            request_id: id,
+            track: track(),
+            params: Params::default(),
+        }))
+        .await;
+    assert_eq!(kind, message::SUBSCRIBE_OK);
+    let (_alias, group, got) = receive_subgroup(&subscriber.conn).await;
+    assert_eq!(group, 7);
+    assert_eq!(got, vec![(0, Bytes::from_static(b"live"))]);
+    serve_publisher.abort();
+}
+
+#[tokio::test]
+async fn a_subscribe_with_no_publisher_is_refused_at_once_or_after_the_rendezvous() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let mut c = Client::connect(&server, &cert, v, Setup::default()).await;
+    let id = c.id();
+    let (_s, _r, kind, m) = c
+        .request(Message::Subscribe(TrackRequest {
+            request_id: id,
+            track: track(),
+            params: Params::default(),
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_ERROR);
+    let Message::RequestError(e) = m else {
+        unreachable!()
+    };
+    assert_eq!(e.code, 0x10, "DOES_NOT_EXIST with no RENDEZVOUS_TIMEOUT");
+
+    let id = c.id();
+    let started = std::time::Instant::now();
+    let (_s, _r, _, m) = c
+        .request(Message::Subscribe(TrackRequest {
+            request_id: id,
+            track: track(),
+            params: Params {
+                rendezvous_timeout: Some(300),
+                ..Params::default()
+            },
+        }))
+        .await;
+    let Message::RequestError(e) = m else {
+        panic!("{m:?}")
+    };
+    assert_eq!(e.code, 0x2, "TIMEOUT after the rendezvous");
+    assert!(started.elapsed() >= Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn the_reserved_namespace_does_not_exist() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let mut client = Client::connect(&server, &cert, v, Setup::default()).await;
+    for first in [&b"."[..], b".session"] {
+        let id = client.id();
+        let name = TrackName {
+            namespace: Namespace(vec![Bytes::copy_from_slice(first)]),
+            name: Bytes::from_static(b"x"),
+        };
+        let (_s, _r, kind, answer) = client
+            .request(Message::TrackStatus(TrackRequest {
+                request_id: id,
+                track: name,
+                params: Params::default(),
+            }))
+            .await;
+        assert_eq!(kind, message::REQUEST_ERROR);
+        let Message::RequestError(error) = answer else {
+            unreachable!()
+        };
+        assert_eq!(error.code, 0x10);
+    }
+}
+
+/// A client that offers no version the relay speaks is refused in the
+/// handshake with no_application_protocol (RFC 9001 section 8.1), promptly:
+/// whether its ClientHello fits one Initial packet (X25519 alone) or spans
+/// two (the hybrid post-quantum key share).
+#[tokio::test]
+async fn an_unknown_alpn_is_refused_in_the_handshake() {
+    let (server, _moq, _accept, cert) = relay().await;
+    // The server's own groups less the hybrid ones: a classical key share
+    // keeps the ClientHello within one Initial packet
+    let default = rustls::crypto::aws_lc_rs::default_provider();
+    let classical = rustls::crypto::CryptoProvider {
+        kx_groups: default
+            .kx_groups
+            .iter()
+            .copied()
+            .filter(|g| !format!("{:?}", g.name()).contains("MLKEM"))
+            .collect(),
+        ..default
+    };
+    for (name, provider) in [
+        ("one Initial packet", Arc::new(classical)),
+        (
+            "two Initial packets",
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        ),
+    ] {
+        let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTo(cert.clone().into(), provider)))
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"moqt-99".to_vec()];
+        let ep = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        )));
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            WAIT,
+            ep.connect(server.local_addr().unwrap(), "localhost")
+                .unwrap(),
+        )
+        .await;
+        let Ok(outcome) = outcome else {
+            panic!("{name}: no answer within {WAIT:?}: the refusal was never sent");
+        };
+        let Err(err) = outcome else {
+            panic!("{name}: a MOQT-less ALPN was accepted");
+        };
+        // no_application_protocol (alert 120) as a CRYPTO_ERROR (0x100 + 120)
+        let refused = matches!(
+            &err,
+            quinn::ConnectionError::ConnectionClosed(c)
+                if c.error_code == quinn::TransportErrorCode::crypto(120)
+        );
+        assert!(
+            refused,
+            "{name}: refused otherwise, after {:?}: {err:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_control_stream_and_an_unknown_stream_type_close_the_session() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let c = Client::connect(&server, &cert, v, Setup::default()).await;
+    let mut s = c.conn.open_uni().await.unwrap();
+    s.write_all(&Message::Setup(Setup::default()).encode(v))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.closed_with().await,
+        0x303,
+        "a second control stream is UNEXPECTED_MESSAGE"
+    );
+
+    let c = Client::connect(&server, &cert, v, Setup::default()).await;
+    let mut s = c.conn.open_uni().await.unwrap();
+    let mut w = Vec::new();
+    put_vi64(&mut w, 0x7777);
+    s.write_all(&w).await.unwrap();
+    assert_eq!(c.closed_with().await, 0x200, "INVALID_STREAM_HEADER");
+}
+
+#[tokio::test]
+async fn path_and_authority_from_a_native_client_are_checked() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let ok = Setup {
+        path: Some(Bytes::from_static(b"/moq")),
+        authority: Some(Bytes::from_static(b"localhost:443")),
+        ..Setup::default()
+    };
+    let c = Client::connect(&server, &cert, v, ok).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), c.conn.closed())
+            .await
+            .is_err(),
+        "a served PATH is accepted"
+    );
+
+    let bad = Setup {
+        path: Some(Bytes::from_static(b"/elsewhere")),
+        ..Setup::default()
+    };
+    let conn = Client::connect_refused(&server, &cert, v, bad).await;
+    assert_eq!(closed_code(&conn).await, 0x8, "INVALID_PATH");
+
+    let malformed = Setup {
+        path: Some(Bytes::from_static(b"no-slash")),
+        ..Setup::default()
+    };
+    let conn = Client::connect_refused(&server, &cert, v, malformed).await;
+    assert_eq!(closed_code(&conn).await, 0x9, "MALFORMED_PATH");
+
+    let malformed = Setup {
+        authority: Some(Bytes::from_static(b"a/b")),
+        ..Setup::default()
+    };
+    let conn = Client::connect_refused(&server, &cert, v, malformed).await;
+    assert_eq!(closed_code(&conn).await, 0x1A, "MALFORMED_AUTHORITY");
+}
+
+/// Two relays as one (section 7): a subscriber at the edge gets a track
+/// published at the origin through the edge's upstream session, and a FETCH
+/// at the edge for objects only the origin holds is filled from upstream.
+#[tokio::test]
+async fn an_edge_relay_serves_the_origin_s_tracks() {
+    let (origin, _o, _oa, origin_cert) = relay().await;
+    let edge_moq = Moq::new(&MoqConfig {
+        enabled: true,
+        ..MoqConfig::default()
+    })
+    .expect("the edge");
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedTo(origin_cert.clone().into(), provider)))
+        .with_no_client_auth();
+    crypto.alpn_protocols = Version::alpns();
+    let client = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+    ));
+    let uri = super::upstream::UpstreamUri::parse(&format!(
+        "moqt://127.0.0.1:{}/moq",
+        origin.local_addr().unwrap().port()
+    ))
+    .unwrap();
+    let link = super::upstream::UpstreamLink::with_client(
+        uri,
+        &edge_moq.relay,
+        Arc::clone(&edge_moq.settings),
+        client,
+    )
+    .unwrap();
+    edge_moq
+        .relay
+        .set_upstream(Arc::new(super::upstream::UpstreamPublisher(link)));
+    let (edge, _e, _ea, edge_cert) = serve(edge_moq);
+
+    let v = Version::Draft23;
+    let t = track();
+    let mut publisher = Client::connect(&origin, &origin_cert, v, Setup::default()).await;
+    let id = publisher.id();
+    let (_ps, _pr, kind, _) = publisher
+        .request(Message::Publish(Publish {
+            request_id: id,
+            track: t.clone(),
+            track_alias: 3,
+            params: Params {
+                auth_tokens: vec![token_for(&t.namespace)],
+                ..Params::default()
+            },
+            properties: Bytes::new(),
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+    // Group 0 reaches the origin before anyone at the edge subscribes
+    let early = [object(0, 0, b"a"), object(0, 1, b"b"), object(0, 2, b"c")];
+    send_subgroup(&publisher.conn, 3, 0, &early).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut subscriber = Client::connect(&edge, &edge_cert, v, Setup::default()).await;
+    let id = subscriber.id();
+    let (_ss, _sr, kind, ok) = subscriber
+        .request(Message::Subscribe(TrackRequest {
+            request_id: id,
+            track: t.clone(),
+            params: Params::default(),
+        }))
+        .await;
+    assert_eq!(
+        kind,
+        message::SUBSCRIBE_OK,
+        "the edge subscribed upstream first"
+    );
+    let Message::SubscribeOk { params, .. } = ok else {
+        unreachable!()
+    };
+    assert_eq!(
+        params.largest_object,
+        Some(Location::new(0, 2)),
+        "Largest Object from upstream"
+    );
+
+    send_subgroup(&publisher.conn, 3, 1, &[object(1, 0, b"live")]).await;
+    let (_alias, group, got) = receive_subgroup(&subscriber.conn).await;
+    assert_eq!((group, got), (1, vec![(0, Bytes::from_static(b"live"))]));
+
+    // Group 0 was never at the edge: its FETCH is filled from the origin
+    let mut fetcher = Client::connect(&edge, &edge_cert, v, Setup::default()).await;
+    let id = fetcher.id();
+    let (_fs, _fr, kind, _) = fetcher
+        .request(Message::Fetch(TrackRequest {
+            request_id: id,
+            track: t.clone(),
+            params: Params {
+                location_filter: Some(LocationFilter::AbsoluteRange {
+                    start: Location::new(0, 0),
+                    end: Location::new(0, 2),
+                }),
+                ..Params::default()
+            },
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+    let recv = tokio::time::timeout(WAIT, fetcher.conn.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut r = BufReader::new(recv);
+    assert_eq!(read_vi64(&mut r).await.unwrap(), Some(STREAM_FETCH_HEADER));
+    assert_eq!(read_vi64(&mut r).await.unwrap(), Some(id));
+    let mut state = FetchState::default();
+    let mut fetched = Vec::new();
+    while let Some(e) = state
+        .read(&mut r, GroupOrder::Ascending, v, 1 << 20)
+        .await
+        .unwrap()
+    {
+        match e {
+            FetchEntry::Object(o) => fetched.push(o.payload),
+            other => panic!("the origin holds every object: {other:?}"),
+        }
+    }
+    assert_eq!(
+        fetched,
+        early.iter().map(|o| o.payload.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// RESET_STREAM_AT between two endpoints of this QUIC stack: the bytes
+/// before the reliable size arrive whatever follows them, then the reset
+/// (draft-ietf-quic-reliable-stream-reset; a WebTransport data stream is
+/// reset this way to keep its header, draft-ietf-webtrans-http3 4.4).
+#[tokio::test]
+async fn a_stream_reset_at_its_header_still_delivers_the_header() {
+    let throwaway = throwaway_cert();
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
+    crypto.alpn_protocols = vec![b"test".to_vec()];
+    let server = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto).unwrap(),
+        )),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let sender = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut s = conn.open_uni().await.unwrap();
+        s.write_all(b"HDR").await.unwrap();
+        s.write_all(&vec![7u8; 64 * 1024]).await.unwrap();
+        s.reset_at(quinn::VarInt::from_u32(9), 3)
+            .expect("the peer supports RESET_STREAM_AT");
+        conn.closed().await;
+    });
+    let ep = client_endpoint(&throwaway.der, vec![b"test".to_vec()]);
+    let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    let mut r = tokio::time::timeout(WAIT, conn.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut header = [0u8; 3];
+    r.read_exact(&mut header)
+        .await
+        .expect("the reliable bytes arrive");
+    assert_eq!(&header, b"HDR");
+    let end = tokio::time::timeout(WAIT, r.read_to_end(usize::MAX))
+        .await
+        .unwrap();
+    match end {
+        Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => {
+            assert_eq!(code, quinn::VarInt::from_u32(9));
+        }
+        other => panic!("the stream ended otherwise: {other:?}"),
+    }
+    conn.close(0u32.into(), b"");
+    sender.abort();
+}

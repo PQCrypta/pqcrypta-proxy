@@ -66,7 +66,7 @@ pub use proto::{
     ConnectionIdGenerator, ConnectionStats, DecryptedInitial, Dir, EcnCodepoint, EndpointConfig,
     FourTuple, FrameStats, FrameType, IdleTimeout, InvalidCid, MtuDiscoveryConfig,
     NetworkChangeHint, NoneTokenLog, NoneTokenStore, PathError, PathEvent, PathId, PathStats,
-    PathStatus, ServerConfig, SetPathStatusError, Side, StdSystemTime, StreamAffinity, StreamId,
+    PathStatus, ResetStreamAtError, ServerConfig, SetPathStatusError, Side, StdSystemTime, StreamAffinity, StreamId,
     TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig,
     TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt, VarIntBoundsExceeded, congestion,
     crypto,

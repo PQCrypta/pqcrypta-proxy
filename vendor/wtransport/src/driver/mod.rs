@@ -26,6 +26,7 @@ use wtransport_proto::error::ErrorCode;
 use wtransport_proto::frame::Frame;
 use wtransport_proto::session::SessionRequest;
 use wtransport_proto::settings::Settings;
+use wtransport_proto::varint::VarInt;
 
 #[derive(Clone, Debug)]
 pub enum DriverError {
@@ -43,6 +44,7 @@ pub struct Driver {
     ready_bi_wt_streams: Mutex<mpsc::Receiver<StreamBiRemoteWT>>,
     ready_datagrams: Mutex<mpsc::Receiver<Datagram>>,
     driver_result: SharedResultGet<DriverError>,
+    close_requests: mpsc::Sender<(VarInt, Box<[u8]>)>,
 }
 
 impl Driver {
@@ -53,6 +55,7 @@ impl Driver {
         let ready_bi_wt_streams = mpsc::channel(1);
         let ready_datagrams = mpsc::channel(1);
         let driver_result = shared_result();
+        let close_requests = mpsc::channel(1);
 
         tokio::spawn(
             worker::Worker::new(
@@ -63,6 +66,7 @@ impl Driver {
                 ready_bi_wt_streams.0,
                 ready_datagrams.0,
                 driver_result.0,
+                close_requests.1,
             )
             .run()
             .instrument(debug_span!("Driver", quic_id = quic_connection.stable_id())),
@@ -76,6 +80,20 @@ impl Driver {
             ready_bi_wt_streams: Mutex::new(ready_bi_wt_streams.1),
             ready_datagrams: Mutex::new(ready_datagrams.1),
             driver_result: driver_result.1,
+            close_requests: close_requests.0,
+        }
+    }
+
+    /// End the session with an application error code and message: a
+    /// WT_CLOSE_SESSION capsule and FIN on the CONNECT stream
+    /// (draft-ietf-webtrans-http3 section 6), then the connection.
+    pub fn close_session(&self, error_code: VarInt, reason: &[u8]) {
+        if self
+            .close_requests
+            .try_send((error_code, reason.to_vec().into_boxed_slice()))
+            .is_err()
+        {
+            // A close is already under way, or the driver has ended
         }
     }
 
@@ -265,6 +283,8 @@ mod worker {
         remote_qpack_enc_stream: RemoteQPackEncStream,
         remote_qpack_dec_stream: RemoteQPackDecStream,
         connect_stream: ConnectStream,
+        close_requests: mpsc::Receiver<(VarInt, Box<[u8]>)>,
+        close_requests_open: bool,
     }
 
     impl Worker {
@@ -276,6 +296,7 @@ mod worker {
             ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
             ready_datagrams: mpsc::Sender<Datagram>,
             driver_result: SharedResultSet<DriverError>,
+            close_requests: mpsc::Receiver<(VarInt, Box<[u8]>)>,
         ) -> Self {
             Self {
                 quic_connection,
@@ -290,6 +311,8 @@ mod worker {
                 remote_qpack_enc_stream: RemoteQPackEncStream::empty(),
                 remote_qpack_dec_stream: RemoteQPackDecStream::empty(),
                 connect_stream: ConnectStream::empty(),
+                close_requests,
+                close_requests_open: true,
             }
         }
 
@@ -384,6 +407,20 @@ mod worker {
                                                       &mut self.remote_qpack_dec_stream,
                                                       &mut self.connect_stream) => {
                         return Err(error);
+                    }
+
+                    request = self.close_requests.recv(), if self.close_requests_open => {
+                        match request {
+                            Some((code, reason)) => {
+                                // The capsule and FIN, then the connection
+                                // ends (run) once the peer has answered
+                                self.connect_stream.close(code, &reason).await;
+                                return Err(DriverError::ApplicationClosed(
+                                    ApplicationClose::new(code, reason),
+                                ));
+                            }
+                            None => self.close_requests_open = false,
+                        }
                     }
 
                     () = self.driver_result.closed() => {

@@ -1834,6 +1834,8 @@ Options:
       --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
       --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration names (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
       --admin-body <JSON>              The JSON body of an `--admin` request
+      --moq-token <PREFIX>             Print a Media over QUIC publish token for a Track Namespace prefix, in the serialized form of draft-ietf-moq-transport section 8.8 (`music-radio`; "" for every namespace), signed with `[moq] publish_key`, and exit
+      --moq-token-days <DAYS>          Days a `--moq-token` is valid [default: 30]
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -1938,6 +1940,7 @@ src/
 ├── dns_wire.rs             # The DNS message format (RFC 1035 §4), as far as the proxy reads and writes it
 ├── doh.rs                  # DNS over HTTPS (RFC 8484) for the authoritative name server on this host
 ├── doq.rs                  # DNS over QUIC (RFC 9250) on the QUIC listener, beside HTTP/3
+├── moq/                    # Media over QUIC relay (draft-ietf-moq-transport 23 and 22) and its upstream link: docs/MOQ.md
 ├── early_data.rs           # TLS 1.3 early data (0-RTT) on the TCP listeners
 ├── ech_config.rs           # Loads Encrypted Client Hello (ECH, draft-ietf-tls-esni-25) server configurations from disk
 ├── error_chain.rs          # An error with every cause under it, for log lines (a failed fetch says why)
@@ -2251,6 +2254,10 @@ the client certificate; with `hmac_secret`, a signed request; `GET` of the three
 | `/pools/{pool}/servers/{server_id}/{action}` | POST | `drain`, `undrain`, `healthy`, `unhealthy`, `canary` (`{"weight": n}`, or no body for the pool's ramp) or `promote` for one server |
 | `/cache` | GET | Response cache statistics |
 | `/cache/purge` | POST | Purge the response cache: everything, one host and path prefix (`?host=&prefix=`), or one URL (`?host=&path=`) |
+| `/moq` | GET | Media over QUIC relay: versions, sessions, tracks, cache, counters (404 where `[moq]` is off) |
+| `/moq/sessions` | GET | MoQ sessions open now: peer, transport, version, the peer's MOQT_IMPLEMENTATION, path |
+| `/moq/tracks` | GET | Tracks the relay holds: Largest Object, publishers, subscribers, cached bytes |
+| `/moq/namespaces` | GET | Namespaces publishers advertise (serialized form, draft-ietf-moq-transport section 8.8) |
 
 ### Example
 

@@ -626,6 +626,26 @@ async fn handle_incoming_session(
     };
 
     async move {
+        // Media over QUIC at `[moq] path`: the version is the one
+        // WT-Available-Protocols offers and WT-Protocol names
+        // (draft-ietf-moq-transport section 6.2.1)
+        if let Some(moq) = crate::moq::running().filter(|m| path == m.path) {
+            let offered = session_request
+                .headers()
+                .get("wt-available-protocols")
+                .map(String::as_str);
+            let Some((version, wt_protocol)) = crate::moq::negotiate_webtransport(offered) else {
+                session_request.reject_with(400).await;
+                return Ok(());
+            };
+            let connection = session_request
+                .accept_with_headers([("wt-protocol", wt_protocol)])
+                .await?;
+            moq.serve_webtransport(Arc::new(connection), remote_addr, version, path)
+                .await;
+            return Ok(());
+        }
+
         // Accept the session
         let connection = session_request.accept().await?;
 

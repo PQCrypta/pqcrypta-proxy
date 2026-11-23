@@ -106,8 +106,8 @@ pub use streams::StreamsState;
 #[cfg(not(fuzzing))]
 use streams::StreamsState;
 pub use streams::{
-    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
-    ShouldTransmit, StreamAffinity, StreamEvent, Streams, WriteError,
+    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, ResetStreamAtError,
+    SendStream, ShouldTransmit, StreamAffinity, StreamEvent, Streams, WriteError,
 };
 
 pub(crate) mod timer;
@@ -4599,7 +4599,21 @@ impl Connection {
                     // error, and `move_to_drained` then yields `error: None`
                     // for a state whose error was already read -- which the
                     // driver asserts cannot happen.
-                    if self.side.is_client() {
+                    //
+                    // A server says so too while the handshake runs, for a
+                    // packet on the path the connection began on: nothing
+                    // migrates before the handshake is confirmed (RFC 9000
+                    // section 9), and what it sends there is bounded by the
+                    // anti-amplification limit (section 8.1) -- exactly what
+                    // the Initial close for an error in the first packet
+                    // already sends (`Endpoint::accept`). Without it, a
+                    // ClientHello spanning two Initial packets (a hybrid
+                    // post-quantum key share does) that the TLS stack refuses
+                    // -- no common ALPN, group or signature scheme -- got no
+                    // answer, and the client waited out its idle timeout.
+                    let original_path = path_id == PathId::ZERO
+                        && self.path_data(PathId::ZERO).network_path == network_path;
+                    if self.side.is_client() || (self.state.is_handshake() && original_path) {
                         self.connection_close_pending = true;
                     }
                     self.state.move_to_closed(err);
@@ -5237,6 +5251,17 @@ impl Connection {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
+                Frame::ResetStreamAt(frame) => {
+                    // Without our transport parameter, this is an unknown frame type to the peer
+                    if !self.config.reset_stream_at {
+                        return Err(TransportError::FRAME_ENCODING_ERROR(
+                            "received RESET_STREAM_AT frame when not negotiated",
+                        ));
+                    }
+                    if self.streams.received_reset_at(frame)?.should_transmit() {
+                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    }
+                }
                 Frame::DataBlocked(DataBlocked(offset)) => {
                     debug!(offset, "peer claims to be blocked at connection level");
                 }
@@ -5277,7 +5302,14 @@ impl Connection {
                         ));
                     }
                     self.last_stop_sending = Some((id, error_code));
-                    self.streams.received_stop_sending(id, error_code);
+                    // A stream reset with RESET_STREAM_AT that the peer stops is reset
+                    // outright: its reliable data is no longer wanted
+                    if let Some(reset_code) = self.streams.received_stop_sending(id, error_code) {
+                        self.spaces[SpaceId::Data]
+                            .pending
+                            .reset_stream
+                            .push((id, reset_code));
+                    }
                 }
                 Frame::RetireConnectionId(frame::RetireConnectionId { path_id, sequence }) => {
                     if let Some(ref path_id) = path_id {
@@ -8046,6 +8078,11 @@ impl SentFrames {
                     .or_insert(path_cids_blocked.next_seq);
             }
             ResetStream(reset) => self
+                .retransmits_mut()
+                .reset_stream
+                .push((reset.id, reset.error_code)),
+            // Shares the RESET_STREAM queue. The stream's state determines which frame to send.
+            ResetStreamAt(reset) => self
                 .retransmits_mut()
                 .reset_stream
                 .push((reset.id, reset.error_code)),

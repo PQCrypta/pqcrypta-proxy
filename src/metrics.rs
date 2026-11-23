@@ -134,6 +134,11 @@ impl MetricsRegistry {
         // Connection metrics
         self.connections.export_prometheus(&mut output);
 
+        // The Media over QUIC relay, where it runs
+        if let Some(moq) = crate::moq::running() {
+            moq.export_prometheus(&mut output);
+        }
+
         // Route metrics
         self.routes.export_prometheus(&mut output);
 
@@ -179,6 +184,7 @@ impl MetricsRegistry {
             traffic: None,
             challenges: None,
             certificates: Vec::new(),
+            moq: crate::moq::running().map(|m| m.snapshot()),
         }
     }
 }
@@ -271,6 +277,9 @@ pub struct MetricsSnapshot {
     /// When each served certificate expires (`tls::MultiDomainCertResolver::expiries`)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<crate::tls::CertificateExpiry>,
+    /// The Media over QUIC relay's figures, where `[moq]` is on
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moq: Option<crate::moq::MoqSnapshot>,
 }
 
 /// [`MetricsSnapshot::challenges`]
@@ -775,12 +784,16 @@ impl ConnectionMetrics {
             webtransport: opened(ConnectionProtocol::WebTransport),
             connect_udp: opened(ConnectionProtocol::ConnectUdp),
             passthrough: opened(ConnectionProtocol::Passthrough),
+            doq: opened(ConnectionProtocol::Doq),
+            moqt: opened(ConnectionProtocol::Moqt),
             open_http3: open(ConnectionProtocol::Http3),
             open_http2: open(ConnectionProtocol::Http2),
             open_http1: open(ConnectionProtocol::Http1),
             open_webtransport: open(ConnectionProtocol::WebTransport),
             open_connect_udp: open(ConnectionProtocol::ConnectUdp),
             open_passthrough: open(ConnectionProtocol::Passthrough),
+            open_doq: open(ConnectionProtocol::Doq),
+            open_moqt: open(ConnectionProtocol::Moqt),
             handshake_failures: c.handshake_failures.load(Ordering::Relaxed),
         }
     }
@@ -797,16 +810,23 @@ pub enum ConnectionProtocol {
     /// A CONNECT-UDP (MASQUE) session
     ConnectUdp,
     Passthrough,
+    /// DNS over QUIC (RFC 9250): a QUIC connection that negotiated `doq`
+    Doq,
+    /// Media over QUIC on native QUIC: a connection that negotiated a MOQT
+    /// version (a MOQT session over WebTransport counts as WebTransport)
+    Moqt,
 }
 
 impl ConnectionProtocol {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Http3,
         Self::Http2,
         Self::Http1,
         Self::WebTransport,
         Self::ConnectUdp,
         Self::Passthrough,
+        Self::Doq,
+        Self::Moqt,
     ];
 
     const fn index(self) -> usize {
@@ -817,6 +837,8 @@ impl ConnectionProtocol {
             Self::WebTransport => 3,
             Self::ConnectUdp => 4,
             Self::Passthrough => 5,
+            Self::Doq => 6,
+            Self::Moqt => 7,
         }
     }
 
@@ -828,6 +850,8 @@ impl ConnectionProtocol {
             Self::WebTransport => "webtransport",
             Self::ConnectUdp => "connect_udp",
             Self::Passthrough => "passthrough",
+            Self::Doq => "doq",
+            Self::Moqt => "moqt",
         }
     }
 }
@@ -845,6 +869,8 @@ pub struct ConnectionMetricsSnapshot {
     pub webtransport: u64,
     pub connect_udp: u64,
     pub passthrough: u64,
+    pub doq: u64,
+    pub moqt: u64,
     /// Open now, by protocol
     pub open_http3: u64,
     pub open_http2: u64,
@@ -852,6 +878,8 @@ pub struct ConnectionMetricsSnapshot {
     pub open_webtransport: u64,
     pub open_connect_udp: u64,
     pub open_passthrough: u64,
+    pub open_doq: u64,
+    pub open_moqt: u64,
     pub handshake_failures: u64,
 }
 
@@ -1806,6 +1834,29 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Each protocol has its own counter slot and its own label: a protocol
+    /// added to the enum and not to the table would share a slot or a name,
+    /// and every figure built on it would mix two kinds of traffic.
+    #[test]
+    fn connection_protocols_have_distinct_slots_and_labels() {
+        use super::ConnectionProtocol;
+        let mut labels = std::collections::HashSet::new();
+        for (i, p) in ConnectionProtocol::ALL.iter().enumerate() {
+            assert_eq!(p.index(), i, "{p:?} is at position {i} of ALL");
+            assert!(labels.insert(p.label()), "{} is used twice", p.label());
+        }
+        let m = super::ConnectionMetrics::new();
+        let guard = m.connection_opened(ConnectionProtocol::Doq);
+        let s = m.snapshot();
+        assert_eq!(
+            (s.doq, s.open_doq, s.http3, s.open_http3),
+            (1, 1, 0, 0),
+            "DNS over QUIC is not HTTP/3"
+        );
+        drop(guard);
+        assert_eq!(m.snapshot().open_doq, 0);
+    }
+
     /// A connection is counted open by protocol while its guard is held, and
     /// closed when it drops however it ends; CONNECT-UDP is its own protocol.
     #[test]

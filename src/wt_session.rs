@@ -52,6 +52,29 @@ pub trait WtSession: Send + Sync + 'static {
     /// Open a unidirectional stream to the client.
     fn open_uni(&self) -> impl Future<Output = Result<Self::Send, WtClosed>> + Send;
 
+    /// Open a bidirectional stream to the client.
+    fn open_bi(&self) -> impl Future<Output = Result<(Self::Send, Self::Recv), WtClosed>> + Send;
+
+    /// Reset a stream's sending half with a WebTransport application error
+    /// code, carried in the WT_APPLICATION_ERROR range of HTTP/3's error
+    /// space ([`wt_application_code`]). A stream this end opened is reset
+    /// with RESET_STREAM_AT, its reliable size the WebTransport stream
+    /// header, so the peer still learns which session the stream was for
+    /// (draft-ietf-webtrans-http3 section 4.4); RESET_STREAM where the peer
+    /// does not support it.
+    fn reset(&self, send: &mut Self::Send, code: u32);
+
+    /// Ask the peer to stop sending on a stream, as [`Self::reset`].
+    fn stop(recv: &mut Self::Recv, code: u32);
+
+    /// The sending half's scheduling priority (higher is sent first).
+    fn set_priority(send: &Self::Send, priority: i32);
+
+    /// End the session with an application error code and message: a
+    /// WT_CLOSE_SESSION capsule on the CONNECT stream, then its FIN
+    /// (draft-ietf-webtrans-http3 section 6).
+    fn close(&self, code: u32, reason: &str);
+
     /// The next datagram the client sends.
     fn receive_datagram(&self) -> impl Future<Output = Result<Bytes, WtClosed>> + Send;
 
@@ -68,6 +91,75 @@ pub trait WtSession: Send + Sync + 'static {
 
     /// The QUIC connection the session runs on.
     fn quic_connection(&self) -> &quinn::Connection;
+}
+
+/// Where WebTransport application error codes start in HTTP/3's error space
+/// (draft-ietf-webtrans-http3 section 4.4)
+const WT_APPLICATION_ERROR_FIRST: u64 = 0x52e4_a40f_a8db;
+/// The WT_SESSION_GONE stream error (section 9.5)
+pub const WT_SESSION_GONE: u32 = 0x170d_7b68;
+/// The WT_CLOSE_SESSION capsule type (section 6)
+const WT_CLOSE_SESSION: u64 = 0x2843;
+/// Largest Application Error Message in WT_CLOSE_SESSION (section 6)
+const WT_CLOSE_MESSAGE_MAX: usize = 1024;
+
+/// A WebTransport application error code in HTTP/3's error space, skipping
+/// the reserved code points of the form 0x1f * N + 0x21 (section 4.4).
+pub const fn wt_application_code(n: u32) -> u64 {
+    WT_APPLICATION_ERROR_FIRST + n as u64 + (n as u64 / 0x1e)
+}
+
+/// The application code an HTTP/3 error code carries, if it is one.
+pub fn wt_code_from_http(h: u64) -> Option<u32> {
+    if !(WT_APPLICATION_ERROR_FIRST..=0x52e5_ac98_3162).contains(&h)
+        || (h - 0x21).is_multiple_of(0x1f)
+    {
+        return None;
+    }
+    let shifted = h - WT_APPLICATION_ERROR_FIRST;
+    u32::try_from(shifted - shifted / 0x1f).ok()
+}
+
+/// The length of the WebTransport header a stream this end opened began
+/// with: its signal value (0x54 unidirectional, 0x41 bidirectional, both two
+/// bytes as varints) and the session ID; 0 for a stream the peer opened, whose
+/// header was the peer's.
+fn wt_header_len(id: quinn::StreamId, local: quinn::Side, session_id: u64) -> u64 {
+    if id.initiator() != local {
+        return 0;
+    }
+    let session = match session_id {
+        0..=0x3f => 1,
+        0x40..=0x3fff => 2,
+        0x4000..=0x3fff_ffff => 4,
+        _ => 8,
+    };
+    2 + session
+}
+
+/// Reset `send` with WebTransport application error `code`, keeping its
+/// first `header` bytes reliable when there are any and the peer supports
+/// RESET_STREAM_AT.
+fn reset_wt_stream(send: &mut quinn::SendStream, code: u32, header: u64) {
+    let code = quinn::VarInt::from_u64(wt_application_code(code)).expect("below 2^62");
+    if header > 0 && send.reset_at(code, header).is_ok() {
+        return;
+    }
+    let _ = send.reset(code);
+}
+
+/// A WT_CLOSE_SESSION capsule, its message cut to 1024 bytes at a character.
+pub fn close_session_capsule(code: u32, reason: &str) -> Bytes {
+    let mut end = reason.len().min(WT_CLOSE_MESSAGE_MAX);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = Vec::with_capacity(end + 16);
+    put_varint(&mut out, WT_CLOSE_SESSION);
+    put_varint(&mut out, 4 + end as u64);
+    out.extend_from_slice(&code.to_be_bytes());
+    out.extend_from_slice(&reason.as_bytes()[..end]);
+    Bytes::from(out)
 }
 
 // ── The WebTransport server's sessions (wtransport) ─────────────────────────
@@ -93,6 +185,37 @@ impl WtSession for wtransport::Connection {
             .await
             .map_err(|e| WtClosed(e.to_string()))?;
         opening.await.map_err(|e| WtClosed(e.to_string()))
+    }
+
+    async fn open_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
+        let opening = wtransport::Connection::open_bi(self)
+            .await
+            .map_err(|e| WtClosed(e.to_string()))?;
+        opening.await.map_err(|e| WtClosed(e.to_string()))
+    }
+
+    fn reset(&self, send: &mut Self::Send, code: u32) {
+        let id = send.quic_stream().id();
+        let session = self.session_id().into_u64();
+        reset_wt_stream(
+            send.quic_stream_mut(),
+            code,
+            wt_header_len(id, quinn::Side::Server, session),
+        );
+    }
+
+    fn stop(recv: &mut Self::Recv, code: u32) {
+        let _ = recv
+            .quic_stream_mut()
+            .stop(quinn::VarInt::from_u64(wt_application_code(code)).expect("below 2^62"));
+    }
+
+    fn set_priority(send: &Self::Send, priority: i32) {
+        send.set_priority(priority);
+    }
+
+    fn close(&self, code: u32, reason: &str) {
+        self.close_session(code, reason);
     }
 
     async fn receive_datagram(&self) -> Result<Bytes, WtClosed> {
@@ -124,6 +247,8 @@ const DATAGRAM_QUEUE: usize = 256;
 /// The WebTransport unidirectional stream type (draft-ietf-webtrans-http3
 /// section 4.1)
 const WEBTRANSPORT_UNI_STREAM: u64 = 0x54;
+/// WT_STREAM: a bidirectional stream's signal value (section 4.2)
+const WEBTRANSPORT_BIDI_STREAM: u64 = 0x41;
 /// WT_BUFFERED_STREAM_REJECTED: a stream refused because its session cannot
 /// take it (draft-ietf-webtrans-http3 section 9.5)
 pub const WT_BUFFERED_STREAM_REJECTED: u32 = 0x3994_bd84;
@@ -165,6 +290,9 @@ pub struct H3Session {
     uni: Mutex<mpsc::Receiver<Prefixed<quinn::RecvStream>>>,
     datagrams: Mutex<mpsc::Receiver<Bytes>>,
     ended: CancellationToken,
+    /// Where a close goes: the task holding the CONNECT stream writes the
+    /// WT_CLOSE_SESSION capsule there
+    closer: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<(u32, String)>>>,
 }
 
 /// The accept loop's side of an [`H3Session`]: where it delivers the
@@ -194,6 +322,7 @@ impl H3Session {
                 uni: Mutex::new(uni_rx),
                 datagrams: Mutex::new(dg_rx),
                 ended: ended.clone(),
+                closer: std::sync::Mutex::new(None),
             }),
             H3SessionFeed {
                 bi: bi_tx,
@@ -212,6 +341,17 @@ impl H3Session {
     /// End the session: its handlers' accepts return [`WtClosed`].
     pub fn end(&self) {
         self.ended.cancel();
+    }
+
+    /// Where [`WtSession::close`] sends the code and message: the task that
+    /// holds the CONNECT stream writes them as WT_CLOSE_SESSION.
+    pub fn close_requests(&self) -> tokio::sync::oneshot::Receiver<(u32, String)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self
+            .closer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        rx
     }
 
     async fn next<T>(&self, queue: &Mutex<mpsc::Receiver<T>>) -> Result<T, WtClosed> {
@@ -286,6 +426,51 @@ impl WtSession for H3Session {
         Ok(send)
     }
 
+    async fn open_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
+        let (mut send, recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| WtClosed(e.to_string()))?;
+        // WT_STREAM and the session it belongs to (section 4.2)
+        let mut header = Vec::with_capacity(16);
+        put_varint(&mut header, WEBTRANSPORT_BIDI_STREAM);
+        put_varint(&mut header, self.session_id);
+        send.write_all(&header)
+            .await
+            .map_err(|e| WtClosed(e.to_string()))?;
+        Ok((send, Prefixed::new(Bytes::new(), recv)))
+    }
+
+    fn reset(&self, send: &mut Self::Send, code: u32) {
+        let header = wt_header_len(send.id(), quinn::Side::Server, self.session_id);
+        reset_wt_stream(send, code, header);
+    }
+
+    fn stop(recv: &mut Self::Recv, code: u32) {
+        let _ = recv
+            .inner
+            .stop(quinn::VarInt::from_u64(wt_application_code(code)).expect("below 2^62"));
+    }
+
+    fn set_priority(send: &Self::Send, priority: i32) {
+        let _ = send.set_priority(priority);
+    }
+
+    fn close(&self, code: u32, reason: &str) {
+        let closer = self
+            .closer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match closer {
+            Some(tx) => {
+                let _ = tx.send((code, reason.to_string()));
+            }
+            None => self.end(),
+        }
+    }
+
     async fn receive_datagram(&self) -> Result<Bytes, WtClosed> {
         self.next(&self.datagrams).await
     }
@@ -335,6 +520,36 @@ mod tests {
         assert_eq!(enc(0x3fff), [0x7f, 0xff]);
         assert_eq!(enc(0x4000), [0x80, 0x00, 0x40, 0x00]);
         assert_eq!(enc(1 << 40), [0xc0, 0, 1, 0, 0, 0, 0, 0]);
+    }
+
+    /// Section 4.4's mapping, both ways, skipping the reserved code points.
+    #[test]
+    fn application_codes_map_into_http3_space() {
+        assert_eq!(wt_application_code(0), 0x52e4_a40f_a8db);
+        assert_eq!(wt_application_code(u32::MAX), 0x52e5_ac98_3162);
+        for n in [0u32, 1, 0x1d, 0x1e, 0x1f, 0x3c, 1000, u32::MAX] {
+            let h = wt_application_code(n);
+            assert_ne!((h - 0x21) % 0x1f, 0, "{n} lands on a reserved code point");
+            assert_eq!(wt_code_from_http(h), Some(n));
+        }
+        assert_eq!(wt_code_from_http(0x100), None);
+    }
+
+    #[test]
+    fn header_lengths_count_the_signal_and_the_session() {
+        let server_uni = quinn::StreamId::new(quinn::Side::Server, quinn::Dir::Uni, 0);
+        let client_bi = quinn::StreamId::new(quinn::Side::Client, quinn::Dir::Bi, 0);
+        assert_eq!(wt_header_len(server_uni, quinn::Side::Server, 0), 3);
+        assert_eq!(wt_header_len(server_uni, quinn::Side::Server, 4000), 4);
+        assert_eq!(wt_header_len(client_bi, quinn::Side::Server, 0), 0);
+    }
+
+    #[test]
+    fn close_capsules_are_framed_and_cut() {
+        let c = close_session_capsule(7, "bye");
+        assert_eq!(&c[..], &[0x68, 0x43, 0x07, 0, 0, 0, 7, b'b', b'y', b'e']);
+        let long = close_session_capsule(1, &"é".repeat(600));
+        assert!(long.len() <= 2 + 2 + 4 + 1024);
     }
 
     /// What arrived with a stream's header is read before the rest.

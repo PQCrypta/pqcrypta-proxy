@@ -165,6 +165,7 @@ pub mod load_balancer;
 pub mod log_file;
 pub mod memory_pressure;
 pub mod metrics;
+pub mod moq;
 pub mod ocsp;
 #[cfg(feature = "pqc")]
 pub mod openssl_alloc;

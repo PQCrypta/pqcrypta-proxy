@@ -1,10 +1,10 @@
 //! Secrets the configuration names rather than holds.
 //!
 //! Every secret setting -- `[admin] auth_token`, `hmac_secret` and
-//! `metrics_token`, a route's
-//! `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`,
-//! `[security.challenge] secret`, `[acme] eab_hmac_key` -- takes its value as a string, or as a table that
-//! says where the value is:
+//! `metrics_token`, a route's `[routes.security] hmac_secret`,
+//! `[advanced_rate_limiting] jwt_secret`, `[security.challenge] secret`,
+//! `[acme] eab_hmac_key`, `[moq] publish_key` -- takes its value as a
+//! string, or as a table that says where the value is:
 //!
 //! ```toml
 //! [admin]

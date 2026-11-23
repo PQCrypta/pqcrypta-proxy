@@ -161,6 +161,22 @@ struct Args {
     /// The JSON body of an `--admin` request
     #[arg(long, value_name = "JSON", requires = "admin")]
     admin_body: Option<String>,
+
+    /// Print a Media over QUIC publish token for a Track Namespace prefix,
+    /// in the serialized form of draft-ietf-moq-transport section 8.8
+    /// (`music-radio`; "" for every namespace), signed with `[moq]
+    /// publish_key`, and exit
+    #[arg(long, value_name = "PREFIX")]
+    moq_token: Option<String>,
+
+    /// Days a `--moq-token` is valid
+    #[arg(
+        long,
+        value_name = "DAYS",
+        default_value_t = 30,
+        requires = "moq_token"
+    )]
+    moq_token_days: u64,
 }
 
 /// Raise `RLIMIT_NOFILE`'s soft limit to the hard limit.
@@ -382,6 +398,30 @@ async fn run() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // A tool, not the proxy: a MoQ publish token from the configuration's
+    // key, on standard output
+    if let Some(prefix) = args.moq_token.as_deref() {
+        let Some(namespace) = pqcrypta_proxy::moq::codec::Namespace::parse_safe(prefix) else {
+            eprintln!(
+                "--moq-token {prefix:?} is not a namespace in the serialized form (section 8.8)"
+            );
+            std::process::exit(2);
+        };
+        let content = std::fs::read_to_string(&args.config)?;
+        let (config, _) = pqcrypta_proxy::config::parse_config_str(&content)?;
+        let Some(key) = config.moq.publish_key.filter(|k| !k.is_empty()) else {
+            eprintln!("[moq] publish_key is not set in {}", args.config.display());
+            std::process::exit(1);
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let expiry = now.saturating_add(args.moq_token_days.saturating_mul(86_400));
+        let auth = pqcrypta_proxy::moq::auth::PublishAuth::new(key.as_bytes());
+        println!("{}", auth.issue(&namespace, expiry));
+        return Ok(());
     }
 
     // A client of this node's admin API, not the proxy: one request with the
@@ -1994,6 +2034,12 @@ async fn run() -> anyhow::Result<()> {
         let _ = quic_shutdown_tx.send(()).await;
     }
 
+    // Every MoQ session is sent GOAWAY, so its client moves to another
+    // session (draft-ietf-moq-transport section 6.6.1) while this one drains
+    if let Some(moq) = pqcrypta_proxy::moq::running() {
+        moq.begin_shutdown();
+    }
+
     // AUD-11 / SEC-A06: Poll active connections and exit as soon as they reach
     // zero, rather than always sleeping for the full timeout duration.  This
     // allows rapid container restarts when the proxy is already idle while still
@@ -2013,14 +2059,16 @@ async fn run() -> anyhow::Result<()> {
         let c = metrics_registry.snapshot().connections;
         format!(
             "{} client connection(s) held; open: http1 {}, http2 {}, http3 {}, \
-             webtransport {}, connect-udp {}, passthrough {}",
+             webtransport {}, connect-udp {}, passthrough {}, doq {}, moqt {}",
             held,
             c.open_http1,
             c.open_http2,
             c.open_http3,
             c.open_webtransport,
             c.open_connect_udp,
-            c.open_passthrough
+            c.open_passthrough,
+            c.open_doq,
+            c.open_moqt
         )
     };
     loop {

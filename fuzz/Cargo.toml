@@ -75,3 +75,17 @@ members = ["."]
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "moq_control"
+path = "fuzz_targets/moq_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "moq_data"
+path = "fuzz_targets/moq_data.rs"
+test = false
+doc = false
+bench = false

@@ -18,6 +18,45 @@ use std::task::Poll;
 use tokio::io::ReadBuf;
 use wtransport_proto::stream_header::StreamHeader;
 
+/// Where WebTransport application error codes start in HTTP/3's error
+/// space (draft-ietf-webtrans-http3 section 4.4).
+const WT_APPLICATION_ERROR_FIRST: u64 = 0x52e4_a40f_a8db;
+const WT_APPLICATION_ERROR_LAST: u64 = 0x52e5_ac98_3162;
+
+/// An application error code as it goes on the wire: in the
+/// WT_APPLICATION_ERROR range, skipping the code points of the form
+/// 0x1f * N + 0x21 that HTTP/3 reserves (section 4.4). Application codes are
+/// 32 bits; a larger one is carried as the largest.
+pub(crate) fn wt_code_to_http(code: VarInt) -> VarInt {
+    let n = u64::from(u32::try_from(code.into_inner()).unwrap_or(u32::MAX));
+    VarInt::try_from_u64(WT_APPLICATION_ERROR_FIRST + n + n / 0x1e).expect("below 2^62")
+}
+
+/// The application error code a received HTTP/3 code carries; one outside
+/// the WT_APPLICATION_ERROR range is given as it came.
+pub(crate) fn http_code_to_wt(code: VarInt) -> VarInt {
+    let h = code.into_inner();
+    if !(WT_APPLICATION_ERROR_FIRST..=WT_APPLICATION_ERROR_LAST).contains(&h) || (h - 0x21) % 0x1f == 0 {
+        return code;
+    }
+    let shifted = h - WT_APPLICATION_ERROR_FIRST;
+    VarInt::try_from_u64(shifted - shifted / 0x1f).expect("32 bits")
+}
+
+fn map_write_error(e: StreamWriteError) -> StreamWriteError {
+    match e {
+        StreamWriteError::Stopped(code) => StreamWriteError::Stopped(http_code_to_wt(code)),
+        other => other,
+    }
+}
+
+fn map_read_error(e: StreamReadError) -> StreamReadError {
+    match e {
+        StreamReadError::Reset(code) => StreamReadError::Reset(http_code_to_wt(code)),
+        other => other,
+    }
+}
+
 /// A stream that can only be used to send data.
 #[derive(Debug)]
 pub struct SendStream(QuicSendStream);
@@ -35,13 +74,13 @@ impl SendStream {
     /// indicating that only a prefix of `buf` was written.
     #[inline(always)]
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamWriteError> {
-        self.0.write(buf).await
+        self.0.write(buf).await.map_err(map_write_error)
     }
 
     /// Convenience method to write an entire buffer to the stream.
     #[inline(always)]
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), StreamWriteError> {
-        self.0.write_all(buf).await
+        self.0.write_all(buf).await.map_err(map_write_error)
     }
 
     /// Shuts down the send stream gracefully.
@@ -50,7 +89,7 @@ impl SendStream {
     /// acknowledged all sent data, retransmitting data as needed.
     #[inline(always)]
     pub async fn finish(&mut self) -> Result<(), StreamWriteError> {
-        self.0.finish().await
+        self.0.finish().await.map_err(map_write_error)
     }
 
     /// Returns the [`StreamId`] associated.
@@ -90,7 +129,7 @@ impl SendStream {
     /// If called more than once, subsequent calls will result in [`ClosedStream`] error.
     #[inline(always)]
     pub fn reset(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
-        self.0.reset(error_code)
+        self.0.reset(wt_code_to_http(error_code))
     }
 
     /// Passively waits for the send stream to be stopped for any reason.
@@ -100,7 +139,7 @@ impl SendStream {
     /// Otherwise returns [`StreamWriteError::Stopped`] with an error code from the peer.
     #[inline(always)]
     pub async fn stopped(&mut self) -> StreamWriteError {
-        self.0.stopped().await
+        map_write_error(self.0.stopped().await)
     }
 
     /// Returns a reference to the underlying QUIC stream.
@@ -135,7 +174,7 @@ impl RecvStream {
     /// On success, returns the number of bytes read into `buf`.
     #[inline(always)]
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, StreamReadError> {
-        self.0.read(buf).await
+        self.0.read(buf).await.map_err(map_read_error)
     }
 
     /// Reads an exact number of bytes contiguously from the stream.
@@ -143,14 +182,17 @@ impl RecvStream {
     /// If the stream terminates before the entire length has been read, it
     /// returns [`StreamReadExactError::FinishedEarly`].
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), StreamReadExactError> {
-        self.0.read_exact(buf).await
+        self.0.read_exact(buf).await.map_err(|e| match e {
+            StreamReadExactError::Read(e) => StreamReadExactError::Read(map_read_error(e)),
+            other => other,
+        })
     }
 
     /// Stops accepting data on the stream.
     ///
     /// Discards unread data and notifies the peer to stop transmitting.
     pub fn stop(mut self, error_code: VarInt) {
-        let _ = self.0.stop(error_code);
+        let _ = self.0.stop(wt_code_to_http(error_code));
     }
 
     /// Returns the [`StreamId`] associated.
@@ -388,5 +430,24 @@ impl Future for OpeningBiStream {
     #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Future::poll(self.0.as_mut(), cx)
+    }
+}
+
+#[cfg(test)]
+mod code_mapping_tests {
+    use super::*;
+
+    /// draft-ietf-webtrans-http3 section 4.4, both ways.
+    #[test]
+    fn application_codes_map_into_the_reserved_range() {
+        for n in [0u32, 1, 0x1d, 0x1e, 0x1f, 1000, u32::MAX] {
+            let h = wt_code_to_http(VarInt::from_u32(n));
+            assert_ne!((h.into_inner() - 0x21) % 0x1f, 0, "{n}");
+            assert_eq!(http_code_to_wt(h), VarInt::from_u32(n));
+        }
+        assert_eq!(wt_code_to_http(VarInt::from_u32(0)).into_inner(), 0x52e4_a40f_a8db);
+        assert_eq!(wt_code_to_http(VarInt::from_u32(u32::MAX)).into_inner(), 0x52e5_ac98_3162);
+        // An HTTP/3 code outside the range is given as it came
+        assert_eq!(http_code_to_wt(VarInt::from_u32(0x100)), VarInt::from_u32(0x100));
     }
 }
