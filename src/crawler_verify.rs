@@ -427,6 +427,23 @@ impl CrawlerVerifier {
         self.ranges.store(Arc::new(map));
     }
 
+    /// Whether `ip` is a crawler operator's own address, whatever its
+    /// User-Agent says.
+    ///
+    /// It is, inside a range the operator publishes, or once a request that
+    /// named the crawler proved it and the verdict is still cached. A search
+    /// engine renders pages in a headless browser from the same addresses:
+    /// Bing's renderer sends `HeadlessChrome/...` with no bingbot token, and
+    /// the beacons the rendered page fires must not be taken for a scraper's.
+    /// Never schedules a lookup.
+    pub fn verified_address(&self, ip: IpAddr) -> bool {
+        self.ranges
+            .load()
+            .values()
+            .any(|nets| nets.iter().any(|net| net.contains(&ip)))
+            || self.cached_verdict(ip) == Some(CrawlerVerdict::Verified)
+    }
+
     /// Read a previously established verdict without scheduling a lookup.
     ///
     /// For call sites that have an address but no User-Agent — the error-rate
@@ -898,6 +915,31 @@ mod tests {
         let back = read_ranges_cache(&path).unwrap();
         assert_eq!(back.len(), 1, "unknown families are dropped");
         assert!(back["bing"][0].contains(&"157.55.39.59".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn an_operators_address_is_verified_whatever_its_user_agent() {
+        let verifier = CrawlerVerifier::new_inline();
+        verifier.set_ranges("bing", &["40.77.177.0/24"]);
+        let renderer: IpAddr = "40.77.177.38".parse().unwrap();
+        // Bing's renderer names no crawler, so classify cannot verify it
+        assert_eq!(
+            verifier.classify(
+                renderer,
+                Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/146.0.7680.165 Safari/537.36")
+            ),
+            CrawlerVerdict::NotClaimed
+        );
+        assert!(verifier.verified_address(renderer));
+        assert!(!verifier.verified_address("192.0.2.7".parse().unwrap()));
+        // An address proven by a request that named the crawler counts too,
+        // while its verdict is cached
+        let proven: IpAddr = "198.51.100.4".parse().unwrap();
+        verifier.remember(proven, CrawlerVerdict::Verified);
+        assert!(verifier.verified_address(proven));
+        let refused: IpAddr = "198.51.100.5".parse().unwrap();
+        verifier.remember(refused, CrawlerVerdict::Rejected);
+        assert!(!verifier.verified_address(refused));
     }
 
     #[test]

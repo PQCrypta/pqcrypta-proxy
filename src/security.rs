@@ -1883,7 +1883,12 @@ impl SecurityState {
             // self-checks that carry no browser User-Agent, so without this the
             // bad-bot-UA rules 403'd our own monitoring — the bypass list only
             // suppressed the auto-block counter below, never the Block verdict.
-            || is_pentest;
+            || is_pentest
+            // A crawler operator's own address (a published range, or proven
+            // by a request that named the crawler): search engines render
+            // pages in headless browsers whose User-Agent names no crawler.
+            // Only these identity rules are skipped; attack inspection is not.
+            || self.crawler_verifier.load_full().verified_address(view.ip);
 
         WafRequest {
             method: view.method,

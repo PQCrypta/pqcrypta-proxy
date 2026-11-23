@@ -1225,6 +1225,8 @@ scanner_ua_exempt_paths = ['^/robots\.txt$', '^/sitemap\.xml$', '^/\.well-known/
 programmatic_client_paths = ['^/downloads/', '^/api/dataset\.json$']
 ```
 
+A verified crawler's own address skips the user-agent rules too: one inside a range its operator publishes (Google, Bing, Apple, DuckDuckGo, OpenAI, Perplexity, Ahrefs, Common Crawl; fetched every six hours), or proven by an earlier request that named the crawler and passed its DNS check. Search engines render pages in a headless browser from those addresses, and the renderer's User-Agent names no crawler (Bing's sends `HeadlessChrome/...`), so without this the beacons a rendered page fires were refused as a scraper's. Injection, traversal and the other attack rules still run on every request from them.
+
 A route can declare the same exemption instead: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.
 
 Two narrower flags admit scripts without admitting scanners. Both lift only the generic-client rules (curl, Wget, python-requests, python-urllib, Go, Java, and a missing or blank User-Agent); attack tools such as sqlmap and nikto, scrapers and headless browsers stay blocked whatever the request carries, where `skip_bot_blocking` lets them through too:
