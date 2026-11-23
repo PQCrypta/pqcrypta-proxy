@@ -368,6 +368,12 @@ pub struct SecurityState {
     /// P2-fix: single-IP parsing previously ignored subnet notation; CIDRs now stored
     /// separately and checked in is_blocked() via cidr_contains_ip().
     pub blocked_cidrs: Arc<RwLock<Vec<(IpNet, BlockedIpInfo)>>>,
+    /// Synced bans on a client fingerprint, by JA4: the network each bans it
+    /// from (`None`: every address) and its expiry. A list entry with `ja4`
+    /// and `ip` bans that tool from that address or network alone (a shared
+    /// egress, whose other users are not refused); one with `ja4` alone bans
+    /// it everywhere (a scanner's tool, followed across addresses).
+    pub synced_ja4: Arc<DashMap<String, Vec<(Option<IpNet>, Option<Instant>)>>>,
     /// Alt-Svc header value for the proxy's own refusals, derived from the
     /// configured ports and `alt_svc_ports` at startup and on every reload.
     /// P3-fix: previously a hardcoded constant listing ports 443/4433/4434.
@@ -422,8 +428,37 @@ pub enum BlockReason {
 /// Entry from the database-synced blocklist JSON file
 #[derive(serde::Deserialize)]
 struct BlocklistEntry {
-    ip: String,
+    /// An address or a CIDR; absent in a fingerprint ban that holds
+    /// everywhere
+    #[serde(default)]
+    ip: Option<String>,
+    /// A JA4: the entry bans that client fingerprint, from `ip` alone when
+    /// it is given
+    #[serde(default)]
+    ja4: Option<String>,
     expires_at: Option<String>,
+}
+
+/// Whether `s` is a JA4 fingerprint as the proxy writes one: the readable
+/// part (transport, version, SNI, counts, ALPN) and two 12-digit hashes.
+fn is_ja4(s: &str) -> bool {
+    let mut parts = s.split('_');
+    let (Some(a), Some(b), Some(c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let hex12 = |h: &str| {
+        h.len() == 12
+            && h.bytes()
+                .all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x))
+    };
+    a.len() == 10
+        && matches!(a.as_bytes()[0], b't' | b'q' | b'd')
+        && a.bytes()
+            .all(|x| x.is_ascii_digit() || x.is_ascii_lowercase())
+        && hex12(b)
+        && hex12(c)
 }
 
 /// The later of two expiries, where `None` is never.
@@ -1033,6 +1068,7 @@ impl SecurityState {
             challenger: Arc::new(crate::challenge::Challenger::new()),
             traffic: Arc::new(crate::traffic_shape::TrafficShape::new()),
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
+            synced_ja4: Arc::new(DashMap::new()),
             alt_svc_header: Arc::new(arc_swap::ArcSwap::from_pointee(refusal_alt_svc(config))),
         };
         state.apply_configured_blocks(&config.security.blocked_ips);
@@ -1690,6 +1726,47 @@ impl SecurityState {
         self.connection_rates.remove(&ip);
     }
 
+    /// The synced fingerprint ban that refuses `ja4` from `ip`, if one does.
+    pub fn ja4_ban(&self, ip: IpAddr, ja4: &str) -> Option<BlockedIpInfo> {
+        let bans = self.synced_ja4.get(ja4)?;
+        let now = Instant::now();
+        bans.iter()
+            .find(|(net, expires)| {
+                expires.is_none_or(|at| at > now) && net.is_none_or(|net| net.contains(&ip))
+            })
+            .map(|(_, expires)| BlockedIpInfo {
+                blocked_at: now,
+                expires_at: *expires,
+                reason: BlockReason::DatabaseSync,
+                block_count: 1,
+            })
+    }
+
+    /// The synced fingerprint bans in force, for the admin API: each JA4 and
+    /// where it is banned from (`*`: everywhere).
+    pub fn fingerprint_ban_snapshot(&self) -> Vec<(String, String)> {
+        let now = Instant::now();
+        let mut out: Vec<(String, String)> = self
+            .synced_ja4
+            .iter()
+            .flat_map(|e| {
+                let ja4 = e.key().clone();
+                e.value()
+                    .iter()
+                    .filter(|(_, expires)| expires.is_none_or(|at| at > now))
+                    .map(|(net, _)| {
+                        (
+                            ja4.clone(),
+                            net.map_or_else(|| "*".to_string(), |n| n.to_string()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Snapshot of currently blocked IPs and CIDRs, for the admin API.
     pub fn blocklist_snapshot(&self) -> (Vec<(IpAddr, String)>, Vec<(IpNet, String)>) {
         let ips = self
@@ -1753,6 +1830,8 @@ impl SecurityState {
         let mut loaded = 0;
         let mut present_ips: HashSet<IpAddr> = HashSet::new();
         let mut present_nets: HashSet<IpNet> = HashSet::new();
+        let mut fingerprints: HashMap<String, Vec<(Option<IpNet>, Option<Instant>)>> =
+            HashMap::new();
         for entry in entries {
             // Calculate expiration from the expires_at field (shared logic)
             let expires_at = entry.expires_at.as_ref().and_then(|exp| {
@@ -1770,6 +1849,27 @@ impl SecurityState {
             if entry.expires_at.is_some() && expires_at.is_none() {
                 continue;
             }
+            if let Some(ja4) = entry.ja4.as_deref() {
+                let ja4 = ja4.trim().to_ascii_lowercase();
+                let net = match entry.ip.as_deref() {
+                    None => None,
+                    Some(ip) if ip.contains('/') => match ip.parse::<IpNet>() {
+                        Ok(net) => Some(net),
+                        Err(_) => continue,
+                    },
+                    Some(ip) => match ip.parse::<IpAddr>() {
+                        Ok(ip) => Some(IpNet::from(ip)),
+                        Err(_) => continue,
+                    },
+                };
+                if is_ja4(&ja4) {
+                    fingerprints.entry(ja4).or_default().push((net, expires_at));
+                }
+                continue;
+            }
+            let Some(entry_ip) = entry.ip.as_deref() else {
+                continue;
+            };
             let block_info = BlockedIpInfo {
                 blocked_at: Instant::now(),
                 expires_at,
@@ -1788,9 +1888,9 @@ impl SecurityState {
                     };
                 }
             };
-            if entry.ip.contains('/') {
+            if entry_ip.contains('/') {
                 // A CIDR entry blocks its whole subnet
-                if let Ok(net) = entry.ip.parse::<IpNet>() {
+                if let Ok(net) = entry_ip.parse::<IpNet>() {
                     let again = !present_nets.insert(net);
                     let mut cidrs = self.blocked_cidrs.write();
                     match cidrs.iter_mut().find(|(n, _)| n == &net) {
@@ -1801,7 +1901,7 @@ impl SecurityState {
                         }
                     }
                 }
-            } else if let Ok(ip) = entry.ip.parse::<IpAddr>() {
+            } else if let Ok(ip) = entry_ip.parse::<IpAddr>() {
                 // Recorded as present before anything else, or the reconcile
                 // below would drop the very entries this sync reaffirmed
                 let again = !present_ips.insert(ip);
@@ -1820,8 +1920,18 @@ impl SecurityState {
                 loaded
             );
         }
+        // Fingerprint bans are the lists' alone: held as the lists give them
+        // (added to, while a list does not read)
         if !reconcile {
+            for (ja4, bans) in fingerprints {
+                self.synced_ja4.entry(ja4).or_default().extend(bans);
+            }
             return;
+        }
+        self.synced_ja4
+            .retain(|ja4, _| fingerprints.contains_key(ja4));
+        for (ja4, bans) in fingerprints {
+            self.synced_ja4.insert(ja4, bans);
         }
         // Reconcile: drop synced blocks no list names any more. Without this
         // the reload only ever ADDED, so clearing a row in security_blocklist
@@ -1915,6 +2025,11 @@ impl SecurityState {
                     is_pentest,
                     ip: view.ip,
                     path: view.path.into(),
+                    ja4: view
+                        .headers
+                        .get("x-ja4-hash")
+                        .and_then(|v| v.to_str().ok())
+                        .map(Into::into),
                     audit: self.audit_logger.clone(),
                 }),
             ),
@@ -1970,7 +2085,14 @@ impl SecurityState {
         view: &SecurityRequestView<'_>,
         is_pentest: bool,
     ) -> SecurityDecision {
-        report_waf_verdict(&verdict, view.ip, view.path, self.audit_logger.as_ref());
+        let ja4 = view.headers.get("x-ja4-hash").and_then(|v| v.to_str().ok());
+        report_waf_verdict(
+            &verdict,
+            view.ip,
+            view.path,
+            ja4,
+            self.audit_logger.as_ref(),
+        );
         let WafVerdict::Block { rule, .. } = verdict else {
             return SecurityDecision::Allow;
         };
@@ -2287,6 +2409,20 @@ impl SecurityState {
                         return Err(SecurityDecision::Challenge { page });
                     }
                     None => return Err(SecurityDecision::Blocked(info)),
+                }
+            }
+        }
+
+        // 1b. Synced fingerprint bans (a fleet's: `blocklist_files`). They name
+        // a tool, which others may use too, so neither a verified crawler (its
+        // claimed name or its operator's address) nor an authorised test
+        // source is refused by one.
+        if !policy.error_page && !is_pentest && !is_verified_crawler {
+            if let Some(ja4) = view.headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()) {
+                if let Some(info) = self.ja4_ban(ip, ja4) {
+                    if !self.crawler_verifier.load_full().verified_address(ip) {
+                        return Err(SecurityDecision::Blocked(info));
+                    }
                 }
             }
         }
@@ -2851,6 +2987,8 @@ pub struct PendingWaf {
     /// head's verdict is reported against
     ip: IpAddr,
     path: Box<str>,
+    /// The client's JA4, recorded with the verdict
+    ja4: Option<Box<str>>,
     audit: Option<Arc<AuditLogger>>,
 }
 
@@ -2863,7 +3001,13 @@ impl Drop for PendingWaf {
     fn drop(&mut self) {
         if let Some(head) = self.head.take() {
             let verdict = self.engine.conclude(head, &self.path);
-            report_waf_verdict(&verdict, self.ip, &self.path, self.audit.as_ref());
+            report_waf_verdict(
+                &verdict,
+                self.ip,
+                &self.path,
+                self.ja4.as_deref(),
+                self.audit.as_ref(),
+            );
         }
     }
 }
@@ -2873,6 +3017,7 @@ fn report_waf_verdict(
     verdict: &WafVerdict,
     ip: IpAddr,
     path: &str,
+    ja4: Option<&str>,
     audit: Option<&Arc<AuditLogger>>,
 ) {
     match verdict {
@@ -2894,7 +3039,7 @@ fn report_waf_verdict(
                 path
             );
             if let Some(audit) = audit {
-                audit.log_waf_block(ip, rule.clone(), path, location.clone());
+                audit.log_waf_block(ip, rule.clone(), path, location.clone(), ja4);
             }
         }
         WafVerdict::Detect {
@@ -2915,7 +3060,7 @@ fn report_waf_verdict(
                 path
             );
             if let Some(audit) = audit {
-                audit.log_waf_detect(ip, rule.clone(), path, location.clone());
+                audit.log_waf_detect(ip, rule.clone(), path, location.clone(), ja4);
             }
         }
         WafVerdict::Allow => {}
@@ -5038,6 +5183,69 @@ mod tests {
         assert!(security.is_blocked(&in_main).is_some());
         assert!(security.is_blocked(&in_fleet).is_none());
         assert!(security.is_blocked(&in_both).is_none());
+    }
+
+    /// A list entry with a JA4 bans that client fingerprint: from its address
+    /// or network alone when it names one, everywhere when it does not. A
+    /// malformed fingerprint names nothing, and the bans go with the list.
+    #[tokio::test]
+    async fn test_reload_holds_fingerprint_bans() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("blocked_ips.json");
+        let config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        security.config.write().blocklist_dir = dir.path().to_path_buf();
+
+        let tool = "t13d190900_9dc949149365_97f8aa674fd9";
+        let headless = "t13d1516h2_8daaf6152771_02713d6af862";
+        let shared: IpAddr = "104.28.246.147".parse().unwrap();
+        let elsewhere: IpAddr = "198.51.100.40".parse().unwrap();
+        let soon = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_string();
+        std::fs::write(
+            &main,
+            format!(
+                r#"[{{"ja4":"{tool}","expires_at":"{soon}"}},
+                    {{"ip":"104.28.246.147","ja4":"{headless}","expires_at":null}},
+                    {{"ja4":"not-a-ja4","expires_at":null}},
+                    {{"ip":"203.0.113.50","expires_at":null}}]"#
+            ),
+        )
+        .unwrap();
+        security.reload_blocklist_from_files();
+
+        // The tool, from anywhere
+        assert!(security.ja4_ban(elsewhere, tool).is_some());
+        assert!(security.ja4_ban(shared, tool).is_some());
+        // The pair: that tool from that address, and nothing else there
+        assert!(security.ja4_ban(shared, headless).is_some());
+        assert!(security.ja4_ban(elsewhere, headless).is_none());
+        assert!(
+            security.is_blocked(&shared).is_none(),
+            "the address itself is not banned"
+        );
+        assert!(security.ja4_ban(shared, "not-a-ja4").is_none());
+        // An address entry is still an address ban
+        assert!(security
+            .is_blocked(&"203.0.113.50".parse().unwrap())
+            .is_some());
+        assert_eq!(security.fingerprint_ban_snapshot().len(), 2);
+
+        // Gone from the list, gone
+        std::fs::write(&main, r#"[{"ip":"203.0.113.50","expires_at":null}]"#).unwrap();
+        security.reload_blocklist_from_files();
+        assert!(security.ja4_ban(elsewhere, tool).is_none());
+        assert!(security.ja4_ban(shared, headless).is_none());
+    }
+
+    #[test]
+    fn ja4_fingerprints_are_recognised() {
+        assert!(is_ja4("t13d1516h2_8daaf6152771_02713d6af862"));
+        assert!(is_ja4("q13d0312h3_55b375c5d22e_06cda9e17597"));
+        assert!(is_ja4("t13d190900_9dc949149365_97f8aa674fd9"));
+        assert!(!is_ja4("t13d1516h2_8daaf6152771"));
+        assert!(!is_ja4("x13d1516h2_8daaf6152771_02713d6af862"));
+        assert!(!is_ja4("t13d1516h2_8DAAF6152771_02713d6af862"));
+        assert!(!is_ja4("t13d1516h2_8daaf6152771_02713d6af862_x"));
     }
 
     /// A CIDR entry that leaves the sync file must be released too.

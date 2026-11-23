@@ -1930,7 +1930,16 @@ struct BlocklistResponse {
     enabled: bool,
     ips: Vec<BlocklistEntryView>,
     cidrs: Vec<BlocklistEntryView>,
+    /// Synced fingerprint bans: a JA4, banned from an address or network,
+    /// or from everywhere (`*`)
+    fingerprints: Vec<FingerprintBanView>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FingerprintBanView {
+    ja4: String,
+    from: String,
 }
 
 /// `GET /blocklist` — what the running proxy is actually enforcing.
@@ -1958,6 +1967,11 @@ async fn blocklist_handler(State(state): State<Arc<AdminState>>) -> Json<Blockli
                         reason,
                     })
                     .collect(),
+                fingerprints: sec
+                    .fingerprint_ban_snapshot()
+                    .into_iter()
+                    .map(|(ja4, from)| FingerprintBanView { ja4, from })
+                    .collect(),
                 error: None,
             })
         }
@@ -1965,6 +1979,7 @@ async fn blocklist_handler(State(state): State<Arc<AdminState>>) -> Json<Blockli
             enabled: false,
             ips: Vec::new(),
             cidrs: Vec::new(),
+            fingerprints: Vec::new(),
             error: Some("Security state not available".to_string()),
         }),
     }

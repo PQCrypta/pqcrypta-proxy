@@ -107,6 +107,9 @@ pub enum AuditEvent {
         path: String,
         /// The part of the request the rule matched (`header:<name>`, ...)
         location: String,
+        /// The client's JA4 fingerprint, where its handshake gave one
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ja4: Option<String>,
     },
     /// WAF rule triggered — detection mode (logged, not blocked)
     WafDetect {
@@ -115,6 +118,9 @@ pub enum AuditEvent {
         path: String,
         /// The part of the request the rule matched (`header:<name>`, ...)
         location: String,
+        /// The client's JA4 fingerprint, where its handshake gave one
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ja4: Option<String>,
     },
     /// Configuration reloaded
     ConfigReload {
@@ -266,17 +272,22 @@ impl AuditEvent {
                 rule,
                 path,
                 location,
+                ja4,
             }
             | Self::WafDetect {
                 ip,
                 rule,
                 path,
                 location,
+                ja4,
             } => {
                 clip(ip);
                 clip(rule);
                 clip(path);
                 clip(location);
+                if let Some(ja4) = ja4 {
+                    clip(ja4);
+                }
             }
             Self::ConfigReload {
                 changed_sections, ..
@@ -542,12 +553,14 @@ impl AuditLogger {
         rule: impl Into<String>,
         path: impl Into<String>,
         location: impl Into<String>,
+        ja4: Option<&str>,
     ) {
         self.log(AuditEvent::WafBlock {
             ip: ip.to_string(),
             rule: rule.into(),
             path: path.into(),
             location: location.into(),
+            ja4: ja4.map(str::to_string),
         });
     }
 
@@ -558,12 +571,14 @@ impl AuditLogger {
         rule: impl Into<String>,
         path: impl Into<String>,
         location: impl Into<String>,
+        ja4: Option<&str>,
     ) {
         self.log(AuditEvent::WafDetect {
             ip: ip.to_string(),
             rule: rule.into(),
             path: path.into(),
             location: location.into(),
+            ja4: ja4.map(str::to_string),
         });
     }
 }
@@ -580,6 +595,7 @@ mod tests {
             rule: "sqli".into(),
             path: path.into(),
             location: "query".into(),
+            ja4: Some("t13d1516h2_8daaf6152771_02713d6af862".into()),
         }
     }
 
