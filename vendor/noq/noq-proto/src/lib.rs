@@ -57,9 +57,10 @@ pub use crate::connection::{
     Chunk, Chunks, ClosePathError, ClosedPath, ClosedStream, Connection, ConnectionError,
     ConnectionStats, Datagrams, EcnFeedback, Event, FinishError, FrameStats,
     MultipathNotNegotiated, NetworkChangeHint, PathAbandonReason, PathError, PathEvent, PathId,
-    PathStats, PathStatus, ReadError, ReadableError, RecvStream, RttEstimator, SendDatagramError,
-    SendStream, SetPathStatusError, ShouldTransmit, StreamAffinity, StreamEvent, Streams, UdpStats,
-    WriteError,
+    PathStats, PathStatus, ReadError, ReadableError, RecvStream, ResetStreamAtError, RttEstimator,
+    SendDatagramError,
+    SendStream, SetPathStatusError, ShouldTransmit, StreamAffinity, StreamEvent, Streams,
+    UdpStats, WriteError,
 };
 #[cfg(test)]
 use test_strategy::Arbitrary;
@@ -159,7 +160,7 @@ pub mod bench_exports {
 #[cfg(fuzzing)]
 pub mod fuzzing {
     pub use crate::connection::{Retransmits, State as ConnectionState, StreamsState};
-    pub use crate::frame::ResetStream;
+    pub use crate::frame::{ResetStream, ResetStreamAt};
     pub use crate::packet::PartialDecode;
     pub use crate::transport_parameters::TransportParameters;
     pub use bytes::{BufMut, BytesMut};
