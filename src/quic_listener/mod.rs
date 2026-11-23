@@ -1299,7 +1299,7 @@ impl QuicListener {
                 let _open = metrics
                     .connections
                     .connection_opened(ConnectionProtocol::Moqt);
-                if established.await {
+                if handshake_completed(established, &connection).await {
                     moq.serve_quic(connection, alpn, remote_addr).await;
                 }
                 return Ok(());
@@ -2431,6 +2431,16 @@ impl QuicListener {
 /// for it.
 type Established = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 
+/// Whether a connection's handshake completed. `established` resolves when
+/// the handshake ends either way, and its value is whether the client's 0-RTT
+/// was accepted, false on every ordinary connection: the close reason is what
+/// says it failed. Read as success, it kept the MoQ entrance from serving
+/// any client that sent no 0-RTT.
+async fn handshake_completed(established: Established, connection: &quinn::Connection) -> bool {
+    established.await;
+    connection.close_reason().is_none()
+}
+
 /// The application protocol a connection negotiated, by ALPN, and the
 /// handshake's completion to wait on from here.
 ///
@@ -2475,6 +2485,82 @@ mod application_protocol_tests {
         rustls::crypto::CryptoProvider {
             kx_groups: kx,
             ..rustls::crypto::aws_lc_rs::default_provider()
+        }
+    }
+
+    /// An ordinary connection, no 0-RTT sent: the server's 0.5-RTT future
+    /// resolves to false (whether 0-RTT was accepted), and the handshake has
+    /// completed. Taken as the handshake's outcome, that false kept the MoQ
+    /// entrance from serving the music origin, a relay's upstream and the
+    /// analyzer's sessions (2026-11-23); `handshake_completed` reads the
+    /// close reason instead.
+    #[tokio::test]
+    async fn an_ordinary_handshake_completes_though_no_0rtt_was_accepted() {
+        let throwaway = throwaway_cert();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is available")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
+        server_crypto.alpn_protocols = vec![b"moqt-23".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                    .expect("building the QUIC server configuration"),
+            )),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("binding a server port");
+        let server_addr = server.local_addr().expect("the server's address");
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is available")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTo(throwaway.der.clone(), provider)))
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"moqt-23".to_vec()];
+        let client = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("binding a client port");
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .expect("building the QUIC client configuration"),
+        )));
+
+        for judged in [false, true] {
+            let accept = async {
+                let (connection, established) = server
+                    .accept()
+                    .await
+                    .expect("a connection arrives")
+                    .accept()
+                    .expect("accepting it")
+                    .into_0rtt()
+                    .expect("a server takes 0.5-RTT");
+                if judged {
+                    handshake_completed(Box::pin(established), &connection).await
+                } else {
+                    // The premise: no 0-RTT, so the future's value is false
+                    !established.await && connection.close_reason().is_none()
+                }
+            };
+            let connect = async {
+                client
+                    .connect(server_addr, "localhost")
+                    .expect("starting the connection")
+                    .await
+                    .expect("the handshake completes")
+            };
+            let (outcome, _client) = tokio::join!(accept, connect);
+            assert!(
+                outcome,
+                "{}",
+                if judged {
+                    "an ordinary handshake is judged complete"
+                } else {
+                    "the 0.5-RTT future resolves to false with no 0-RTT"
+                }
+            );
         }
     }
 
