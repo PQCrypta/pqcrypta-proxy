@@ -76,6 +76,11 @@ closes the session with CLOSED_CONTROL_STREAM. On shutdown the relay sends
 GOAWAY and refuses new requests with GOING_AWAY. After `goaway_timeout_ms` it
 closes with GOAWAY_TIMEOUT.
 
+A WebTransport session ends with its CONNECT stream, with WT_CLOSE_SESSION
+from either end, or with its connection. However it ends, its namespaces are
+withdrawn, its tracks lose it as a publisher and it leaves `/moq/sessions`
+and `sessions_open`.
+
 ### Requests
 
 Each request is one bidirectional stream, and every request type is served:
@@ -200,6 +205,7 @@ USE_ALIAS and USE_VALUE are supported, with these errors:
 | `GET /moq/namespaces` | Advertised namespaces |
 | `/metrics` | `pqcrypta_moq_*` counters and gauges, `pqcrypta_moq_version_info{version}`, and native MOQT connections under `pqcrypta_connections_by_protocol{protocol="moqt"}` |
 | `/metrics/json` | The same figures under `moq` |
+| The log (INFO) | One line per session as it ends: its transport and version, how far SETUP got each way, the requests it opened by type, and what ended it (the relay's session error, the peer, or the transport) |
 
 ## WebTransport details
 

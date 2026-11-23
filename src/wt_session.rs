@@ -91,6 +91,17 @@ pub trait WtSession: Send + Sync + 'static {
 
     /// The QUIC connection the session runs on.
     fn quic_connection(&self) -> &quinn::Connection;
+
+    /// Resolves when the session has ended: closed by either end, its
+    /// CONNECT stream finished or reset, or its connection closed. A session
+    /// ends before its connection does wherever the connection carries other
+    /// requests, so the connection's end alone is not the session's.
+    fn ended(&self) -> impl Future<Output = ()> + Send {
+        let connection = self.quic_connection().clone();
+        async move {
+            connection.closed().await;
+        }
+    }
 }
 
 /// Where WebTransport application error codes start in HTTP/3's error space
@@ -235,6 +246,10 @@ impl WtSession for wtransport::Connection {
 
     fn quic_connection(&self) -> &quinn::Connection {
         wtransport::Connection::quic_connection(self)
+    }
+
+    async fn ended(&self) {
+        let _ = wtransport::Connection::closed(self).await;
     }
 }
 
@@ -486,6 +501,19 @@ impl WtSession for H3Session {
 
     fn quic_connection(&self) -> &quinn::Connection {
         &self.connection
+    }
+
+    /// Its end ([`H3Session::end`], when the CONNECT stream ends or the
+    /// session is closed), or its connection's
+    fn ended(&self) -> impl Future<Output = ()> + Send {
+        let ended = self.ended.clone();
+        let connection = self.connection.clone();
+        async move {
+            tokio::select! {
+                () = ended.cancelled() => {}
+                _ = connection.closed() => {}
+            }
+        }
     }
 }
 
