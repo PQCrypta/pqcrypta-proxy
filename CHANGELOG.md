@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.20.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.19.1...v0.20.0) (2026-11-23)
+
+
+### Features
+
+* **moq:** Media over QUIC relay (draft-ietf-moq-transport 23 and 22) ([e5fe7bb](https://github.com/PQCrypta/pqcrypta-proxy/commit/e5fe7bb3f89468a6a1c9caa597a5d634ea20f0e5))
+* **quic:** RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset) ([0e1a457](https://github.com/PQCrypta/pqcrypta-proxy/commit/0e1a457ff4c4cb4d29013c1175f67de48f4465f0))
+
+
+### Bug Fixes
+
+* **metrics:** QUIC connections are counted by the application they negotiate; DNS over QUIC is its own protocol ([f6793d5](https://github.com/PQCrypta/pqcrypta-proxy/commit/f6793d516399768605662e697d1a009a39a0b353))
+* **quic:** answer a refused ClientHello that spans two Initial packets ([7d33c4d](https://github.com/PQCrypta/pqcrypta-proxy/commit/7d33c4d5ec0282b2ae4773f7aeb42fdbbaf869de))
+* **webtransport:** end sessions with WT_CLOSE_SESSION, carry application error codes, reset with RESET_STREAM_AT ([8b21ad7](https://github.com/PQCrypta/pqcrypta-proxy/commit/8b21ad7fba454686bb5399c5e743bd4293cd1de8))
+
 ## [0.19.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.19.0...v0.19.1) (2026-11-22)
 
 
