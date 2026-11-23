@@ -301,6 +301,16 @@ impl Connection {
         self.driver.send_datagram(self.session_id, payload.as_ref())
     }
 
+    /// Ends the WebTransport session with an application error code and
+    /// message: a WT_CLOSE_SESSION capsule and FIN on the CONNECT stream
+    /// (draft-ietf-webtrans-http3 section 6), after which the connection
+    /// closes. [`Self::close`] closes the QUIC connection at once and sends
+    /// no capsule.
+    pub fn close_session(&self, error_code: u32, reason: &str) {
+        self.driver
+            .close_session(VarInt::from_u32(error_code), reason.as_bytes());
+    }
+
     /// Closes the connection immediately.
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         self.quic_connection.close(varint_w2q(error_code), reason);

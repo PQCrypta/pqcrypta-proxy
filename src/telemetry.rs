@@ -1214,6 +1214,13 @@ mod tests {
         fn send_datagram(&self, _payload: &[u8]) -> Result<(), WtClosed> {
             Ok(())
         }
+        async fn open_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
+            std::future::pending().await
+        }
+        fn reset(&self, _send: &mut Self::Send, _code: u32) {}
+        fn stop(_recv: &mut Self::Recv, _code: u32) {}
+        fn set_priority(_send: &Self::Send, _priority: i32) {}
+        fn close(&self, _code: u32, _reason: &str) {}
         fn rtt(&self) -> Duration {
             Duration::ZERO
         }

@@ -30,6 +30,36 @@ impl ConnectStream {
         self.stream = Some(stream);
     }
 
+    /// Send WT_CLOSE_SESSION and FIN (draft-ietf-webtrans-http3 section 6),
+    /// then wait a moment for the peer to close or reset the stream in
+    /// response, so the capsule arrives before the connection closes.
+    pub async fn close(&mut self, error_code: VarInt, reason: &[u8]) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        // The message is at most 1024 bytes, cut at a character
+        let mut end = reason.len().min(1024);
+        while end > 0 && std::str::from_utf8(&reason[..end]).is_err() {
+            end -= 1;
+        }
+        let code = u32::try_from(error_code.into_inner()).unwrap_or(u32::MAX);
+        let mut capsule = Vec::with_capacity(end + 16);
+        put_varint(&mut capsule, 0x2843);
+        put_varint(&mut capsule, 4 + end as u64);
+        capsule.extend_from_slice(&code.to_be_bytes());
+        capsule.extend_from_slice(&reason[..end]);
+        let _ = stream
+            .write_frame(wtransport_proto::frame::Frame::new_data(
+                std::borrow::Cow::Owned(capsule),
+            ))
+            .await;
+        stream.finish().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while stream.read_frame().await.is_ok() {}
+        })
+        .await;
+    }
+
     pub async fn run(&mut self) -> DriverError {
         let stream = match self.stream.as_mut() {
             Some(stream) => stream,
@@ -102,4 +132,17 @@ impl ConnectStream {
             };
         }
     }
+}
+
+/// A QUIC variable-length integer in its shortest form (RFC 9000 section 16).
+fn put_varint(out: &mut Vec<u8>, value: u64) {
+    let (len, tag) = match value {
+        0..=0x3f => (1, 0x00),
+        0x40..=0x3fff => (2, 0x40),
+        0x4000..=0x3fff_ffff => (4, 0x80),
+        _ => (8, 0xc0),
+    };
+    let start = out.len();
+    out.extend_from_slice(&value.to_be_bytes()[8 - len..]);
+    out[start] |= tag;
 }
