@@ -1102,7 +1102,6 @@ impl QuicListener {
                         tokio::spawn(async move {
                             // Held until the connection ends
                             let _slot = slot;
-                            let _open = metrics.connections.connection_opened(ConnectionProtocol::Http3);
                             if let Err(e) = Self::handle_connection(
                                 incoming,
                                 remote_addr,
@@ -1264,7 +1263,15 @@ impl QuicListener {
         // only when `[doq]` is on, so a negotiated `doq` has its service
         let (negotiated, established) =
             application_protocol(hello_data.as_deref(), &connection, established).await;
+        // Counted by the application the client negotiated, once it is known:
+        // every QUIC connection was counted as HTTP/3 when it was accepted, so
+        // DNS over QUIC and handshakes that never finished read as HTTP/3
+        // traffic in every figure built on these counters. Held until the
+        // connection ends.
         if negotiated.as_deref() == Some(crate::doq::ALPN) {
+            let _open = metrics
+                .connections
+                .connection_opened(ConnectionProtocol::Doq);
             if let Some(service) = doq {
                 crate::doq::serve(
                     connection,
@@ -1278,6 +1285,9 @@ impl QuicListener {
             }
             return Ok(());
         }
+        let _open = metrics
+            .connections
+            .connection_opened(ConnectionProtocol::Http3);
 
         // Advertises SETTINGS_ENABLE_WEBTRANSPORT=1 and
         // SETTINGS_WEBTRANSPORT_MAX_SESSIONS (draft-ietf-webtrans-http3-09 §8.2).

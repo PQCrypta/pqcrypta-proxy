@@ -2013,14 +2013,15 @@ async fn run() -> anyhow::Result<()> {
         let c = metrics_registry.snapshot().connections;
         format!(
             "{} client connection(s) held; open: http1 {}, http2 {}, http3 {}, \
-             webtransport {}, connect-udp {}, passthrough {}",
+             webtransport {}, connect-udp {}, passthrough {}, doq {}",
             held,
             c.open_http1,
             c.open_http2,
             c.open_http3,
             c.open_webtransport,
             c.open_connect_udp,
-            c.open_passthrough
+            c.open_passthrough,
+            c.open_doq
         )
     };
     loop {
