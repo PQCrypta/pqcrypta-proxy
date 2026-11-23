@@ -152,7 +152,7 @@ struct Args {
     merge_from: Vec<PathBuf>,
 
     /// Send one request to this node's admin API with the credentials its
-    /// configuration names (the token, and the HMAC proof of possession where
+    /// configuration's `[admin]` names, and no other section's (the token, and the HMAC proof of possession where
     /// `[admin] hmac_secret` is set), print the response body and exit, 1
     /// unless it succeeded: `--admin POST /reload`
     #[arg(long, num_args = 2, value_names = ["METHOD", "PATH"])]
@@ -410,8 +410,10 @@ async fn run() -> anyhow::Result<()> {
             std::process::exit(2);
         };
         let content = std::fs::read_to_string(&args.config)?;
-        let (config, _) = pqcrypta_proxy::config::parse_config_str(&content)?;
-        let Some(key) = config.moq.publish_key.filter(|k| !k.is_empty()) else {
+        // [moq] alone: the token needs its key and no other section's secret
+        let moq: pqcrypta_proxy::config::MoqConfig =
+            pqcrypta_proxy::config::parse_config_section(&content, "moq")?;
+        let Some(key) = moq.publish_key.filter(|k| !k.is_empty()) else {
             eprintln!("[moq] publish_key is not set in {}", args.config.display());
             std::process::exit(1);
         };

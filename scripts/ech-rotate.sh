@@ -112,7 +112,10 @@ if [[ "$admin_enabled" == "yes" ]]; then
     # Sent by the proxy itself with the node's admin credentials (the token,
     # and the signature where [admin] hmac_secret is set), which never reach
     # a command line.
-    reply=$("$PROXY_BIN" --config "$PROXY_CONFIG" --admin POST /reload --admin-body '{"tls_only": true}' 2>&1)
+    # A client that fails (a configuration it cannot load, a secret it cannot
+    # read) exits non-zero; its message is what the log needs, so the
+    # assignment must not end the script under `set -e` before it is logged
+    reply=$("$PROXY_BIN" --config "$PROXY_CONFIG" --admin POST /reload --admin-body '{"tls_only": true}' 2>&1) || true
     if ! grep -q '"success":true' <<<"$reply"; then
         log "ERROR: the proxy did not reload its TLS material: $reply"
         exit 1

@@ -80,10 +80,14 @@ pub mod check {
         let kind = TYPES[kind];
         if let Ok(m) = Message::decode(kind, body, v, &ctx) {
             // Parameters that cannot be honoured are kept for the request's
-            // own error, not re-encoded
-            let unencodable = |p: &super::message::Params| {
-                p.filter_error.is_some() || !p.removed_filters.is_empty()
-            };
+            // own error, not re-encoded: at the top level, or inside
+            // FILL_PARAMETERS, which nests a scope of its own (section
+            // 9.19.15)
+            fn unencodable(p: &super::message::Params) -> bool {
+                p.filter_error.is_some()
+                    || !p.removed_filters.is_empty()
+                    || p.fill.as_deref().is_some_and(unencodable)
+            }
             let skip = match &m {
                 Message::Subscribe(r) | Message::Fetch(r) | Message::TrackStatus(r) => {
                     unencodable(&r.params)
@@ -558,6 +562,18 @@ pub fn negotiate_webtransport(field: Option<&str>) -> Option<(Version, String)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ClusterFuzzLite's crash of 2026-11-23 (moq_control): a SUBSCRIBE_TRACKS
+    /// whose FILL_PARAMETERS held a repeated Range Filter and empty ones,
+    /// kept for the request's error, which the check re-encoded
+    #[test]
+    fn nested_parameters_kept_for_an_error_are_not_re_encoded() {
+        use base64::Engine as _;
+        let input = base64::engine::general_purpose::STANDARD
+            .decode("X+gBAAIhAgICAiIKAADvv71EFgAAAAAAAAAAAAAABQAAAAEAAAEAAAEAAAEA")
+            .unwrap();
+        check::control(&input);
+    }
 
     #[test]
     fn wt_available_protocols_parse_as_a_list_of_strings() {

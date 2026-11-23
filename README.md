@@ -198,7 +198,7 @@
 - **Server Identity Concealment**: the backend's `Server` header is replaced by `server_header` in `[server]` (default `pqcrypta`, no version); an empty value passes the backend's own header through, as HAProxy and NGINX do by default
 - **Log Injection Prevention**: Newlines and all control characters stripped from every user-controlled field before writing to access or audit logs
 - **Backend Certificates Always Verified**: `tls_cert` pins a self-signed backend or private CA; `tls_skip_verify` is refused at config load
-- **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — supports individual IPs and CIDR subnet ranges (e.g. `192.0.2.0/24`); updates without restart. The reload **reconciles in both directions**: entries added to the synced file are blocked, and database-sourced entries that disappear from it are released from memory on the next reload (60 s), so deactivating a row or clicking unblock in the threat dashboard actually lifts a live block. Only `DatabaseSync` entries are reconciled — blocks the proxy raised itself (rate limit, WAF, `Manual` config entries) are unaffected. For an immediate release, `POST /blocklist/unblock/:ip` on the admin API drops the IP (and any CIDR entry covering it) without waiting for the next sync; `GET /blocklist` shows what the running proxy is actually enforcing, which is the copy that decides whether a request is refused
+- **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — supports individual IPs and CIDR subnet ranges (e.g. `192.0.2.0/24`); updates without restart. The reload **reconciles in both directions**: entries added to the synced file are blocked, and database-sourced entries that disappear from it are released from memory on the next reload (60 s), so deactivating a row or clicking unblock in the threat dashboard actually lifts a live block. Only `DatabaseSync` entries are reconciled — blocks the proxy raised itself (rate limit, WAF, `Manual` config entries) are unaffected. For an immediate release, `POST /blocklist/unblock/:ip` on the admin API drops the IP (and any CIDR entry covering it) without waiting for the next sync; `GET /blocklist` shows what the running proxy is actually enforcing, which is the copy that decides whether a request is refused. A synced entry may also name a JA4 client fingerprint (`{"ip", "ja4", "expires_at"}`): with an address or network it bans that tool from there alone, so the other users of a shared egress address are not refused; without one, everywhere. A verified crawler and an authorised test source are never refused by a fingerprint ban, and every WAF verdict in the audit log carries the client's JA4. `[security] blocklist_files` adds further lists, such as a fleet's shared bans
 - **ACME Domain Path Sanitization**: Domain names validated against RFC 1035 before use in file-system paths — prevents path traversal via config
 
 ### Load Balancing
@@ -1225,6 +1225,8 @@ scanner_ua_exempt_paths = ['^/robots\.txt$', '^/sitemap\.xml$', '^/\.well-known/
 programmatic_client_paths = ['^/downloads/', '^/api/dataset\.json$']
 ```
 
+A verified crawler's own address skips the user-agent rules too: one inside a range its operator publishes (Google, Bing, Apple, DuckDuckGo, OpenAI, Perplexity, Ahrefs, Common Crawl; fetched every six hours), or proven by an earlier request that named the crawler and passed its DNS check. Search engines render pages in a headless browser from those addresses, and the renderer's User-Agent names no crawler (Bing's sends `HeadlessChrome/...`), so without this the beacons a rendered page fires were refused as a scraper's. Injection, traversal and the other attack rules still run on every request from them.
+
 A route can declare the same exemption instead: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.
 
 Two narrower flags admit scripts without admitting scanners. Both lift only the generic-client rules (curl, Wget, python-requests, python-urllib, Go, Java, and a missing or blank User-Agent); attack tools such as sqlmap and nikto, scrapers and headless browsers stay blocked whatever the request carries, where `skip_bot_blocking` lets them through too:
@@ -1832,7 +1834,7 @@ Options:
       --test-certificates <DIR>        Write self-signed certificates for testing into DIR and exit: for each host the routes name and localhost, an ECDSA P-256 certificate and an ML-DSA-87 companion, in the certificate directory's layout. No client trusts them; a file already there is never replaced
       --merge-fingerprints <OUT>       Merge fingerprint corpora into one and write it here: observed.json of either version, or a published directory's full.json (`--from`)
       --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
-      --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration names (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
+      --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration's `[admin]` names, and no other section's (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
       --admin-body <JSON>              The JSON body of an `--admin` request
       --moq-token <PREFIX>             Print a Media over QUIC publish token for a Track Namespace prefix, in the serialized form of draft-ietf-moq-transport section 8.8 (`music-radio`; "" for every namespace), signed with `[moq] publish_key`, and exit
       --moq-token-days <DAYS>          Days a `--moq-token` is valid [default: 30]
@@ -2236,7 +2238,7 @@ the client certificate; with `hmac_secret`, a signed request; `GET` of the three
 | `/acme/renew` | POST | Force certificate renewal *(1-hour cooldown)* |
 | `/ratelimit` | GET | Rate limiter status and statistics |
 | `/ratelimit/reset/{key}` | POST | Clear a client's rate-limit buckets; `key` is a whole key (`SourceIp:203.0.113.7`) or its value |
-| `/blocklist` | GET | Blocked addresses, with reason and expiry |
+| `/blocklist` | GET | Blocked addresses and networks, with reason, and the synced fingerprint bans (a JA4, from an address, a network or everywhere) |
 | `/blocklist/block/{ip}` | POST | Block an address on every listener — audit logged |
 | `/blocklist/unblock/{ip}` | POST | Lift a block on every listener — audit logged |
 | `/security/status` | GET | Which protections are on and what they have loaded |

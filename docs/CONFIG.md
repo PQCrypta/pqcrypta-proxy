@@ -440,7 +440,7 @@ LoadCredentialEncrypted=admin-token
 LoadCredentialEncrypted=admin-hmac
 ```
 
-`--with-key=auto` seals to the TPM2 and the host key where the machine has a TPM2, and to the host key otherwise; systemd decrypts it into the service's private credentials directory when the service starts. A value is read at start and at every reload, less one trailing newline; a secret that cannot be read, or is empty, refuses the configuration. A command run outside the service (`--admin`, `--validate`) reads the same names from its own `$CREDENTIALS_DIRECTORY`, from `PQCRYPTA_CREDENTIALS_DIRECTORY`, or, run as root while the service runs, from the service's own `/run/credentials/pqcrypta-proxy.service`.
+`--with-key=auto` seals to the TPM2 and the host key where the machine has a TPM2, and to the host key otherwise; systemd decrypts it into the service's private credentials directory when the service starts. A value is read at start and at every reload, less one trailing newline; a secret that cannot be read, or is empty, refuses the configuration. A command run outside the service (`--admin`, `--validate`) reads the same names from its own `$CREDENTIALS_DIRECTORY`, from `PQCRYPTA_CREDENTIALS_DIRECTORY`, or, run as root while the service runs, from the service's own `/run/credentials/pqcrypta-proxy.service`. `--admin` reads only `[admin]` and `--moq-token` only `[moq]`, so a unit that runs one is given that section's credentials and no other; `--validate` reads every section, and needs every credential.
 
 ## Admin API
 
@@ -718,6 +718,8 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `min_requests_for_error_check` | u64 | `200` | Minimum requests before error rate check |
 | `error_rate_threshold` | f64 | `0.7` | Error rate threshold (70%) to trigger suspicious |
 | `error_window_secs` | u64 | `60` | Error tracking sliding window (1 minute) |
+| `blocklist_dir` | path | `"/var/lib/pqcrypta-proxy/blocklists"` | Where a database sync writes `blocked_ips.json` (a JSON array of `{"ip", "expires_at"}`, an address or a CIDR, `expires_at` RFC 3339 or null); read every minute |
+| `blocklist_files` | array[path] | `[]` | Further lists in the same format, read with `blocked_ips.json`: another source's, such as a fleet's shared bans. The proxy holds their union; an entry first named this round takes its list's expiry, one named by two lists the later; a ban no list names any more is released; a list that exists but does not read or parse releases nothing that round; a missing list names nothing |
 | `pentest_bypass_ips` | array[string] | `[]` | Authorised test sources: inspected by the WAF but never rate-limited or auto-banned. An entry is an address or a host name standing for the addresses it resolves to |
 | `host_resolver` | socket address? | `null` | A validating resolver, reached over TCP, for the host names in `pentest_bypass_ips`. Only an answer it authenticates (AD bit) counts, refreshed every minute; without one, a name matches nothing |
 
@@ -931,7 +933,7 @@ A member a request cannot reach (its connection refused or never made, so nothin
 | `ramp_step_secs` | u64 | `120` | How long each step lasts at least |
 | `ramp_min_requests` | u64 | `10` | Requests the canary answers in a step before the rollout moves on |
 | `auto_promote` | bool | `false` | Promote the canary when it has held the last step (needs `ramp_percent`): it becomes a stable member and the members it replaces drain. Otherwise it waits for `promote` |
-| `cohort` | string | `"random"` | Who goes to the canary: `"random"` (each new request by chance), `"ip"` (each client by a hash of its address) or `"header:<name>"` (by a hash of that header; by chance without it). A cohort keeps each client on its side while the weight holds and moves it to the canary at most once as the weight rises, so state an instance holds for a client (a bound session's keys) changes hands once per rollout. The hash is salted with the canary's address, so each rollout draws its own cohort |
+| `cohort` | string | `"random"` | Who goes to the canary: `"random"` (each new request by chance), `"ip"` (each client by its address) or `"header:<name>"` (each by that header; by chance without it). A cohort gives the canary its share of the clients exactly, however few: a client met for the first time goes to the canary while the canary holds fewer than its share of the clients met, this one counted and rounded up, so the first client a rollout meets is the canary's and a 10% canary serves one client in ten. Each keeps its side while the weight holds and moves to the canary at most once as the weight rises, so state an instance holds for a client (a bound session's keys) changes hands once per rollout. Each rollout keeps its own book of clients (up to about a million; past that a new client is placed by a hash of its key) |
 
 A member marked `canary = true` in a pool whose canary is not enabled is refused: it would take no requests.
 

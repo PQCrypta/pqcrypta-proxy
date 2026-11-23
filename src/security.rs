@@ -368,6 +368,12 @@ pub struct SecurityState {
     /// P2-fix: single-IP parsing previously ignored subnet notation; CIDRs now stored
     /// separately and checked in is_blocked() via cidr_contains_ip().
     pub blocked_cidrs: Arc<RwLock<Vec<(IpNet, BlockedIpInfo)>>>,
+    /// Synced bans on a client fingerprint, by JA4: the network each bans it
+    /// from (`None`: every address) and its expiry. A list entry with `ja4`
+    /// and `ip` bans that tool from that address or network alone (a shared
+    /// egress, whose other users are not refused); one with `ja4` alone bans
+    /// it everywhere (a scanner's tool, followed across addresses).
+    pub synced_ja4: Arc<DashMap<String, Vec<(Option<IpNet>, Option<Instant>)>>>,
     /// Alt-Svc header value for the proxy's own refusals, derived from the
     /// configured ports and `alt_svc_ports` at startup and on every reload.
     /// P3-fix: previously a hardcoded constant listing ports 443/4433/4434.
@@ -422,8 +428,107 @@ pub enum BlockReason {
 /// Entry from the database-synced blocklist JSON file
 #[derive(serde::Deserialize)]
 struct BlocklistEntry {
-    ip: String,
+    /// An address or a CIDR; absent in a fingerprint ban that holds
+    /// everywhere
+    #[serde(default)]
+    ip: Option<String>,
+    /// A JA4: the entry bans that client fingerprint, from `ip` alone when
+    /// it is given
+    #[serde(default)]
+    ja4: Option<String>,
     expires_at: Option<String>,
+}
+
+/// Whether `s` is a JA4 fingerprint as the proxy writes one: the readable
+/// part (transport, version, SNI, counts, ALPN) and two 12-digit hashes.
+fn is_ja4(s: &str) -> bool {
+    let mut parts = s.split('_');
+    let (Some(a), Some(b), Some(c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let hex12 = |h: &str| {
+        h.len() == 12
+            && h.bytes()
+                .all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x))
+    };
+    a.len() == 10
+        && matches!(a.as_bytes()[0], b't' | b'q' | b'd')
+        && a.bytes()
+            .all(|x| x.is_ascii_digit() || x.is_ascii_lowercase())
+        && hex12(b)
+        && hex12(c)
+}
+
+/// The later of two expiries, where `None` is never.
+fn later(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    Some(a?.max(b?))
+}
+
+/// The entries of one synced blocklist file, or `None` when it cannot be
+/// trusted this round: unreadable, over the size cap, or not a list.
+fn read_blocklist_file(path: &std::path::Path) -> Option<Vec<BlocklistEntry>> {
+    // SR-07: a world- or group-writable list lets another local user add
+    // blocks (a denial of service) or clear them (a bypass): said loudly, as
+    // the operator has to fix the mode (0640)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.mode();
+            if mode & 0o002 != 0 {
+                warn!(
+                    "SR-07: Blocklist file {} is world-writable (mode {:o}). \
+                     This allows any local user to tamper with the blocklist. \
+                     Run: chmod 640 {}",
+                    path.display(),
+                    mode & 0o777,
+                    path.display(),
+                );
+            } else if mode & 0o020 != 0 {
+                warn!(
+                    "SR-07: Blocklist file {} is group-writable (mode {:o}). \
+                     Restrict to mode 640 to prevent unauthorised modification.",
+                    path.display(),
+                    mode & 0o777,
+                );
+            }
+        }
+    }
+    // SEC-05: a size cap before reading, so an unexpectedly large file cannot
+    // exhaust memory
+    const MAX_BLOCKLIST_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_BLOCKLIST_BYTES => {
+            warn!(
+                "SEC-05: Blocklist file {} exceeds {} bytes ({} bytes) — skipping reload \
+                 to prevent memory exhaustion. Reduce file size and retry.",
+                path.display(),
+                MAX_BLOCKLIST_BYTES,
+                meta.len()
+            );
+            return None;
+        }
+        _ => {}
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<Vec<BlocklistEntry>>(&content) {
+            Ok(entries) => Some(entries),
+            Err(e) => {
+                warn!(
+                    "Blocklist file {} is not a list of entries: {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            debug!("Could not read blocklist file {}: {}", path.display(), e);
+            None
+        }
+    }
 }
 
 /// Outcome of the transport-independent security evaluation.
@@ -963,6 +1068,7 @@ impl SecurityState {
             challenger: Arc::new(crate::challenge::Challenger::new()),
             traffic: Arc::new(crate::traffic_shape::TrafficShape::new()),
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
+            synced_ja4: Arc::new(DashMap::new()),
             alt_svc_header: Arc::new(arc_swap::ArcSwap::from_pointee(refusal_alt_svc(config))),
         };
         state.apply_configured_blocks(&config.security.blocked_ips);
@@ -1620,6 +1726,47 @@ impl SecurityState {
         self.connection_rates.remove(&ip);
     }
 
+    /// The synced fingerprint ban that refuses `ja4` from `ip`, if one does.
+    pub fn ja4_ban(&self, ip: IpAddr, ja4: &str) -> Option<BlockedIpInfo> {
+        let bans = self.synced_ja4.get(ja4)?;
+        let now = Instant::now();
+        bans.iter()
+            .find(|(net, expires)| {
+                expires.is_none_or(|at| at > now) && net.is_none_or(|net| net.contains(&ip))
+            })
+            .map(|(_, expires)| BlockedIpInfo {
+                blocked_at: now,
+                expires_at: *expires,
+                reason: BlockReason::DatabaseSync,
+                block_count: 1,
+            })
+    }
+
+    /// The synced fingerprint bans in force, for the admin API: each JA4 and
+    /// where it is banned from (`*`: everywhere).
+    pub fn fingerprint_ban_snapshot(&self) -> Vec<(String, String)> {
+        let now = Instant::now();
+        let mut out: Vec<(String, String)> = self
+            .synced_ja4
+            .iter()
+            .flat_map(|e| {
+                let ja4 = e.key().clone();
+                e.value()
+                    .iter()
+                    .filter(|(_, expires)| expires.is_none_or(|at| at > now))
+                    .map(|(net, _)| {
+                        (
+                            ja4.clone(),
+                            net.map_or_else(|| "*".to_string(), |n| n.to_string()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Snapshot of currently blocked IPs and CIDRs, for the admin API.
     pub fn blocklist_snapshot(&self) -> (Vec<(IpAddr, String)>, Vec<(IpNet, String)>) {
         let ips = self
@@ -1636,168 +1783,187 @@ impl SecurityState {
         (ips, cidrs)
     }
 
-    /// Reload blocklist from JSON files (synced from database).
-    /// Uses the path configured in `security.blocklist_dir` (default: /var/lib/pqcrypta-proxy/blocklists).
+    /// Reload the synced blocklists: `blocked_ips.json` in
+    /// `security.blocklist_dir` (the database's list), and each of
+    /// `security.blocklist_files` (another source's, such as a fleet's shared
+    /// bans).
+    ///
+    /// Every list is a JSON array of `{"ip", "expires_at"}`, an address or a
+    /// CIDR. Their union is the set of `DatabaseSync` blocks: an entry is added,
+    /// an entry already held takes the list's expiry (a ban the source extended
+    /// is extended here), and a `DatabaseSync` block no list names any more is
+    /// released. A list that exists but cannot be read or parsed leaves every
+    /// block as it is this round, so a torn or unreadable file never releases a
+    /// ban; a list that does not exist names nothing.
     pub fn reload_blocklist_from_files(&self) {
-        let blocklist_dir = self.config.read().blocklist_dir.clone();
-        let blocked_ips_file = blocklist_dir.join("blocked_ips.json");
-
-        if !blocked_ips_file.exists() {
-            return;
-        }
-
-        // SR-07: Check that the blocklist file is not world-writable (Unix only).
-        // A world-writable blocklist could let an attacker inject arbitrary block
-        // entries (DoS on legitimate clients) or clear existing blocks (bypass).
-        // Warn loudly so operators can fix the permissions before they cause a
-        // security incident.  The recommended mode is 0640 (owner rw, group r).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(meta) = std::fs::metadata(&blocked_ips_file) {
-                let mode = meta.mode();
-                // Check other-write (bit 1) and other-read (bit 2) and group-write (bit 4)
-                if mode & 0o002 != 0 {
-                    warn!(
-                        "SR-07: Blocklist file {} is world-writable (mode {:o}). \
-                         This allows any local user to tamper with the blocklist. \
-                         Run: chmod 640 {}",
-                        blocked_ips_file.display(),
-                        mode & 0o777,
-                        blocked_ips_file.display(),
-                    );
-                } else if mode & 0o020 != 0 {
-                    warn!(
-                        "SR-07: Blocklist file {} is group-writable (mode {:o}). \
-                         Restrict to mode 640 to prevent unauthorised modification.",
-                        blocked_ips_file.display(),
-                        mode & 0o777,
-                    );
+        let (main, extra) = {
+            let c = self.config.read();
+            (
+                c.blocklist_dir.join("blocked_ips.json"),
+                c.blocklist_files.clone(),
+            )
+        };
+        let mut entries = Vec::new();
+        let mut any = false;
+        for path in std::iter::once(&main).chain(extra.iter()) {
+            if !path.exists() {
+                continue;
+            }
+            any = true;
+            match read_blocklist_file(path) {
+                Some(list) => entries.extend(list),
+                None => {
+                    // Added, never released, until every list reads again
+                    self.apply_blocklist(entries, false);
+                    return;
                 }
             }
         }
-
-        // SEC-05: Enforce a file size cap before reading to prevent memory exhaustion
-        // if the blocklist file is unexpectedly large.
-        const MAX_BLOCKLIST_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
-        match std::fs::metadata(&blocked_ips_file) {
-            Ok(meta) if meta.len() > MAX_BLOCKLIST_BYTES => {
-                warn!(
-                    "SEC-05: Blocklist file {} exceeds {} bytes ({} bytes) — skipping reload \
-                     to prevent memory exhaustion. Reduce file size and retry.",
-                    blocked_ips_file.display(),
-                    MAX_BLOCKLIST_BYTES,
-                    meta.len()
-                );
-                return;
-            }
-            _ => {}
+        if any {
+            self.apply_blocklist(entries, true);
         }
+    }
 
-        match std::fs::read_to_string(&blocked_ips_file) {
-            Ok(content) => {
-                if let Ok(entries) = serde_json::from_str::<Vec<BlocklistEntry>>(&content) {
-                    let mut loaded = 0;
-                    // Entries present in this sync. Used below to reconcile: a
-                    // DatabaseSync block that has disappeared from the file must be
-                    // dropped from memory, or operator unblocks never take effect.
-                    let mut present_ips: HashSet<IpAddr> = HashSet::new();
-                    let mut present_nets: HashSet<IpNet> = HashSet::new();
-                    for entry in entries {
-                        // Calculate expiration from the expires_at field (shared logic)
-                        let expires_at = entry.expires_at.as_ref().and_then(|exp| {
-                            exp.parse::<jiff::Timestamp>().ok().and_then(|exp| {
-                                let left = exp.duration_since(jiff::Timestamp::now());
-                                if left.is_positive() {
-                                    let duration =
-                                        Duration::try_from(left).unwrap_or(Duration::from_hours(1));
-                                    Some(Instant::now() + duration)
-                                } else {
-                                    None // Already expired
-                                }
-                            })
-                        });
-
-                        // Skip entries that are already expired
-                        if entry.expires_at.is_some() && expires_at.is_none() {
-                            continue;
-                        }
-
-                        let block_info = BlockedIpInfo {
-                            blocked_at: Instant::now(),
-                            expires_at,
-                            reason: BlockReason::DatabaseSync,
-                            block_count: 1,
-                        };
-
-                        if entry.ip.contains('/') {
-                            // P2-fix: CIDR entry — parse as IpNet and store in blocked_cidrs.
-                            // The old code stripped the prefix length and only blocked the
-                            // host address, ignoring the subnet entirely.
-                            if let Ok(net) = entry.ip.parse::<IpNet>() {
-                                present_nets.insert(net);
-                                let mut cidrs = self.blocked_cidrs.write();
-                                if !cidrs.iter().any(|(n, _)| n == &net) {
-                                    cidrs.push((net, block_info));
-                                    loaded += 1;
-                                }
-                            }
-                        } else if let Ok(ip) = entry.ip.parse::<IpAddr>() {
-                            // Single-IP entry — existing behaviour.
-                            // Record it as present BEFORE the contains_key short-circuit,
-                            // otherwise the reconcile below would drop the very entries
-                            // this sync just reaffirmed.
-                            present_ips.insert(ip);
-                            if self.blocked_ips.contains_key(&ip) {
-                                continue;
-                            }
-                            self.blocked_ips.insert(ip, block_info);
+    /// Hold `entries` as `DatabaseSync` blocks; with `reconcile`, release the
+    /// `DatabaseSync` blocks they do not name.
+    fn apply_blocklist(&self, entries: Vec<BlocklistEntry>, reconcile: bool) {
+        let mut loaded = 0;
+        let mut present_ips: HashSet<IpAddr> = HashSet::new();
+        let mut present_nets: HashSet<IpNet> = HashSet::new();
+        let mut fingerprints: HashMap<String, Vec<(Option<IpNet>, Option<Instant>)>> =
+            HashMap::new();
+        for entry in entries {
+            // Calculate expiration from the expires_at field (shared logic)
+            let expires_at = entry.expires_at.as_ref().and_then(|exp| {
+                exp.parse::<jiff::Timestamp>().ok().and_then(|exp| {
+                    let left = exp.duration_since(jiff::Timestamp::now());
+                    if left.is_positive() {
+                        let duration = Duration::try_from(left).unwrap_or(Duration::from_hours(1));
+                        Some(Instant::now() + duration)
+                    } else {
+                        None // Already expired
+                    }
+                })
+            });
+            // Skip entries that are already expired
+            if entry.expires_at.is_some() && expires_at.is_none() {
+                continue;
+            }
+            if let Some(ja4) = entry.ja4.as_deref() {
+                let ja4 = ja4.trim().to_ascii_lowercase();
+                let net = match entry.ip.as_deref() {
+                    None => None,
+                    Some(ip) if ip.contains('/') => match ip.parse::<IpNet>() {
+                        Ok(net) => Some(net),
+                        Err(_) => continue,
+                    },
+                    Some(ip) => match ip.parse::<IpAddr>() {
+                        Ok(ip) => Some(IpNet::from(ip)),
+                        Err(_) => continue,
+                    },
+                };
+                if is_ja4(&ja4) {
+                    fingerprints.entry(ja4).or_default().push((net, expires_at));
+                }
+                continue;
+            }
+            let Some(entry_ip) = entry.ip.as_deref() else {
+                continue;
+            };
+            let block_info = BlockedIpInfo {
+                blocked_at: Instant::now(),
+                expires_at,
+                reason: BlockReason::DatabaseSync,
+                block_count: 1,
+            };
+            // An entry held from an earlier round takes this round's expiry
+            // when the lists first name it (a source extended or shortened
+            // the ban); named again by another list, the later expiry holds
+            let merge = |held: &mut BlockedIpInfo, again: bool| {
+                if matches!(held.reason, BlockReason::DatabaseSync) {
+                    held.expires_at = if again {
+                        later(held.expires_at, expires_at)
+                    } else {
+                        expires_at
+                    };
+                }
+            };
+            if entry_ip.contains('/') {
+                // A CIDR entry blocks its whole subnet
+                if let Ok(net) = entry_ip.parse::<IpNet>() {
+                    let again = !present_nets.insert(net);
+                    let mut cidrs = self.blocked_cidrs.write();
+                    match cidrs.iter_mut().find(|(n, _)| n == &net) {
+                        Some((_, held)) => merge(held, again),
+                        None => {
+                            cidrs.push((net, block_info));
                             loaded += 1;
                         }
                     }
-
-                    // Reconcile: drop database-sourced blocks that are no longer in the
-                    // file. Without this the reload only ever ADDED, so clearing a row in
-                    // security_blocklist (or clicking unblock in the threat dashboard)
-                    // left the live block in place until it expired or the proxy
-                    // restarted. Only DatabaseSync entries are touched — blocks the proxy
-                    // raised itself (rate limits, WAF, config `Manual`) are not managed by
-                    // the sync file and must survive.
-                    let mut dropped = 0;
-                    self.blocked_ips.retain(|ip, info| {
-                        let stale = matches!(info.reason, BlockReason::DatabaseSync)
-                            && !present_ips.contains(ip);
-                        if stale {
-                            dropped += 1;
-                        }
-                        !stale
-                    });
-                    {
-                        let mut cidrs = self.blocked_cidrs.write();
-                        cidrs.retain(|(net, info)| {
-                            let stale = matches!(info.reason, BlockReason::DatabaseSync)
-                                && !present_nets.contains(net);
-                            if stale {
-                                dropped += 1;
-                            }
-                            !stale
-                        });
-                    }
-
-                    if loaded > 0 {
-                        info!("Loaded {} blocked IPs/CIDRs from database sync", loaded);
-                    }
-                    if dropped > 0 {
-                        info!(
-                            "Released {} blocked IPs/CIDRs no longer present in database sync",
-                            dropped
-                        );
+                }
+            } else if let Ok(ip) = entry_ip.parse::<IpAddr>() {
+                // Recorded as present before anything else, or the reconcile
+                // below would drop the very entries this sync reaffirmed
+                let again = !present_ips.insert(ip);
+                match self.blocked_ips.get_mut(&ip) {
+                    Some(mut held) => merge(held.value_mut(), again),
+                    None => {
+                        self.blocked_ips.insert(ip, block_info);
+                        loaded += 1;
                     }
                 }
             }
-            Err(e) => {
-                debug!("Could not read blocklist file: {}", e);
+        }
+        if loaded > 0 {
+            info!(
+                "Loaded {} blocked IPs/CIDRs from the synced blocklists",
+                loaded
+            );
+        }
+        // Fingerprint bans are the lists' alone: held as the lists give them
+        // (added to, while a list does not read)
+        if !reconcile {
+            for (ja4, bans) in fingerprints {
+                self.synced_ja4.entry(ja4).or_default().extend(bans);
             }
+            return;
+        }
+        self.synced_ja4
+            .retain(|ja4, _| fingerprints.contains_key(ja4));
+        for (ja4, bans) in fingerprints {
+            self.synced_ja4.insert(ja4, bans);
+        }
+        // Reconcile: drop synced blocks no list names any more. Without this
+        // the reload only ever ADDED, so clearing a row in security_blocklist
+        // (or clicking unblock in the threat dashboard) left the live block in
+        // place until it expired or the proxy restarted. Only DatabaseSync
+        // entries are touched: blocks the proxy raised itself (rate limits,
+        // WAF, config `Manual`) are not managed by the lists and must survive.
+        let mut dropped = 0;
+        self.blocked_ips.retain(|ip, info| {
+            let stale =
+                matches!(info.reason, BlockReason::DatabaseSync) && !present_ips.contains(ip);
+            if stale {
+                dropped += 1;
+            }
+            !stale
+        });
+        {
+            let mut cidrs = self.blocked_cidrs.write();
+            cidrs.retain(|(net, info)| {
+                let stale =
+                    matches!(info.reason, BlockReason::DatabaseSync) && !present_nets.contains(net);
+                if stale {
+                    dropped += 1;
+                }
+                !stale
+            });
+        }
+        if dropped > 0 {
+            info!(
+                "Released {} blocked IPs/CIDRs no longer present in the synced blocklists",
+                dropped
+            );
         }
     }
 
@@ -1859,6 +2025,11 @@ impl SecurityState {
                     is_pentest,
                     ip: view.ip,
                     path: view.path.into(),
+                    ja4: view
+                        .headers
+                        .get("x-ja4-hash")
+                        .and_then(|v| v.to_str().ok())
+                        .map(Into::into),
                     audit: self.audit_logger.clone(),
                 }),
             ),
@@ -1883,7 +2054,12 @@ impl SecurityState {
             // self-checks that carry no browser User-Agent, so without this the
             // bad-bot-UA rules 403'd our own monitoring — the bypass list only
             // suppressed the auto-block counter below, never the Block verdict.
-            || is_pentest;
+            || is_pentest
+            // A crawler operator's own address (a published range, or proven
+            // by a request that named the crawler): search engines render
+            // pages in headless browsers whose User-Agent names no crawler.
+            // Only these identity rules are skipped; attack inspection is not.
+            || self.crawler_verifier.load_full().verified_address(view.ip);
 
         WafRequest {
             method: view.method,
@@ -1909,7 +2085,14 @@ impl SecurityState {
         view: &SecurityRequestView<'_>,
         is_pentest: bool,
     ) -> SecurityDecision {
-        report_waf_verdict(&verdict, view.ip, view.path, self.audit_logger.as_ref());
+        let ja4 = view.headers.get("x-ja4-hash").and_then(|v| v.to_str().ok());
+        report_waf_verdict(
+            &verdict,
+            view.ip,
+            view.path,
+            ja4,
+            self.audit_logger.as_ref(),
+        );
         let WafVerdict::Block { rule, .. } = verdict else {
             return SecurityDecision::Allow;
         };
@@ -2226,6 +2409,20 @@ impl SecurityState {
                         return Err(SecurityDecision::Challenge { page });
                     }
                     None => return Err(SecurityDecision::Blocked(info)),
+                }
+            }
+        }
+
+        // 1b. Synced fingerprint bans (a fleet's: `blocklist_files`). They name
+        // a tool, which others may use too, so neither a verified crawler (its
+        // claimed name or its operator's address) nor an authorised test
+        // source is refused by one.
+        if !policy.error_page && !is_pentest && !is_verified_crawler {
+            if let Some(ja4) = view.headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()) {
+                if let Some(info) = self.ja4_ban(ip, ja4) {
+                    if !self.crawler_verifier.load_full().verified_address(ip) {
+                        return Err(SecurityDecision::Blocked(info));
+                    }
                 }
             }
         }
@@ -2790,6 +2987,8 @@ pub struct PendingWaf {
     /// head's verdict is reported against
     ip: IpAddr,
     path: Box<str>,
+    /// The client's JA4, recorded with the verdict
+    ja4: Option<Box<str>>,
     audit: Option<Arc<AuditLogger>>,
 }
 
@@ -2802,7 +3001,13 @@ impl Drop for PendingWaf {
     fn drop(&mut self) {
         if let Some(head) = self.head.take() {
             let verdict = self.engine.conclude(head, &self.path);
-            report_waf_verdict(&verdict, self.ip, &self.path, self.audit.as_ref());
+            report_waf_verdict(
+                &verdict,
+                self.ip,
+                &self.path,
+                self.ja4.as_deref(),
+                self.audit.as_ref(),
+            );
         }
     }
 }
@@ -2812,6 +3017,7 @@ fn report_waf_verdict(
     verdict: &WafVerdict,
     ip: IpAddr,
     path: &str,
+    ja4: Option<&str>,
     audit: Option<&Arc<AuditLogger>>,
 ) {
     match verdict {
@@ -2833,7 +3039,7 @@ fn report_waf_verdict(
                 path
             );
             if let Some(audit) = audit {
-                audit.log_waf_block(ip, rule.clone(), path, location.clone());
+                audit.log_waf_block(ip, rule.clone(), path, location.clone(), ja4);
             }
         }
         WafVerdict::Detect {
@@ -2854,7 +3060,7 @@ fn report_waf_verdict(
                 path
             );
             if let Some(audit) = audit {
-                audit.log_waf_detect(ip, rule.clone(), path, location.clone());
+                audit.log_waf_detect(ip, rule.clone(), path, location.clone(), ja4);
             }
         }
         WafVerdict::Allow => {}
@@ -4903,6 +5109,143 @@ mod tests {
             "a block the proxy raised itself is not managed by the sync file \
              and must survive the reconcile"
         );
+    }
+
+    /// The lists in `blocklist_files` are held with `blocked_ips.json`: their
+    /// union is blocked, a ban no list names is released, a list that does
+    /// not parse releases nothing, and an entry takes its list's new expiry.
+    #[tokio::test]
+    async fn test_reload_unions_the_listed_blocklist_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("blocked_ips.json");
+        let fleet = dir.path().join("fleet.json");
+
+        let config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        {
+            let mut c = security.config.write();
+            c.blocklist_dir = dir.path().to_path_buf();
+            c.blocklist_files = vec![fleet.clone(), dir.path().join("absent.json")];
+        }
+        let in_main: IpAddr = "203.0.113.30".parse().unwrap();
+        let in_fleet: IpAddr = "203.0.113.31".parse().unwrap();
+        let in_both: IpAddr = "203.0.113.32".parse().unwrap();
+        let soon = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_string();
+        let later_on = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(168)).to_string();
+        let expiry = |ip: &IpAddr| security.blocked_ips.get(ip).map(|i| i.expires_at);
+
+        std::fs::write(
+            &main,
+            format!(r#"[{{"ip":"203.0.113.30","expires_at":null}},{{"ip":"203.0.113.32","expires_at":"{soon}"}}]"#),
+        )
+        .unwrap();
+        std::fs::write(
+            &fleet,
+            format!(r#"[{{"ip":"203.0.113.31","expires_at":"{soon}"}},{{"ip":"203.0.113.32","expires_at":"{later_on}"}}]"#),
+        )
+        .unwrap();
+        security.reload_blocklist_from_files();
+        for ip in [in_main, in_fleet, in_both] {
+            assert!(security.is_blocked(&ip).is_some(), "{ip}");
+        }
+        // Named by two lists, the later expiry holds
+        let both = expiry(&in_both).unwrap().unwrap();
+        assert!(both > Instant::now() + Duration::from_hours(100));
+
+        // The fleet's ban is extended: the held block takes the new expiry
+        std::fs::write(
+            &fleet,
+            format!(r#"[{{"ip":"203.0.113.31","expires_at":"{later_on}"}}]"#),
+        )
+        .unwrap();
+        security.reload_blocklist_from_files();
+        let extended = expiry(&in_fleet).unwrap().unwrap();
+        assert!(extended > Instant::now() + Duration::from_hours(100));
+        // ...and in_both, now named by the main list alone, takes its expiry
+        let shortened = expiry(&in_both).unwrap().unwrap();
+        assert!(shortened < Instant::now() + Duration::from_hours(2));
+
+        // A torn list releases nothing
+        std::fs::write(&fleet, "[{\"ip\":").unwrap();
+        std::fs::write(&main, "[]").unwrap();
+        security.reload_blocklist_from_files();
+        for ip in [in_main, in_fleet, in_both] {
+            assert!(
+                security.is_blocked(&ip).is_some(),
+                "{ip} kept while a list is unreadable"
+            );
+        }
+
+        // Whole again, without the fleet's ban: it is released
+        std::fs::write(&fleet, "[]").unwrap();
+        std::fs::write(&main, r#"[{"ip":"203.0.113.30","expires_at":null}]"#).unwrap();
+        security.reload_blocklist_from_files();
+        assert!(security.is_blocked(&in_main).is_some());
+        assert!(security.is_blocked(&in_fleet).is_none());
+        assert!(security.is_blocked(&in_both).is_none());
+    }
+
+    /// A list entry with a JA4 bans that client fingerprint: from its address
+    /// or network alone when it names one, everywhere when it does not. A
+    /// malformed fingerprint names nothing, and the bans go with the list.
+    #[tokio::test]
+    async fn test_reload_holds_fingerprint_bans() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("blocked_ips.json");
+        let config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        security.config.write().blocklist_dir = dir.path().to_path_buf();
+
+        let tool = "t13d190900_9dc949149365_97f8aa674fd9";
+        let headless = "t13d1516h2_8daaf6152771_02713d6af862";
+        let shared: IpAddr = "104.28.246.147".parse().unwrap();
+        let elsewhere: IpAddr = "198.51.100.40".parse().unwrap();
+        let soon = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_string();
+        std::fs::write(
+            &main,
+            format!(
+                r#"[{{"ja4":"{tool}","expires_at":"{soon}"}},
+                    {{"ip":"104.28.246.147","ja4":"{headless}","expires_at":null}},
+                    {{"ja4":"not-a-ja4","expires_at":null}},
+                    {{"ip":"203.0.113.50","expires_at":null}}]"#
+            ),
+        )
+        .unwrap();
+        security.reload_blocklist_from_files();
+
+        // The tool, from anywhere
+        assert!(security.ja4_ban(elsewhere, tool).is_some());
+        assert!(security.ja4_ban(shared, tool).is_some());
+        // The pair: that tool from that address, and nothing else there
+        assert!(security.ja4_ban(shared, headless).is_some());
+        assert!(security.ja4_ban(elsewhere, headless).is_none());
+        assert!(
+            security.is_blocked(&shared).is_none(),
+            "the address itself is not banned"
+        );
+        assert!(security.ja4_ban(shared, "not-a-ja4").is_none());
+        // An address entry is still an address ban
+        assert!(security
+            .is_blocked(&"203.0.113.50".parse().unwrap())
+            .is_some());
+        assert_eq!(security.fingerprint_ban_snapshot().len(), 2);
+
+        // Gone from the list, gone
+        std::fs::write(&main, r#"[{"ip":"203.0.113.50","expires_at":null}]"#).unwrap();
+        security.reload_blocklist_from_files();
+        assert!(security.ja4_ban(elsewhere, tool).is_none());
+        assert!(security.ja4_ban(shared, headless).is_none());
+    }
+
+    #[test]
+    fn ja4_fingerprints_are_recognised() {
+        assert!(is_ja4("t13d1516h2_8daaf6152771_02713d6af862"));
+        assert!(is_ja4("q13d0312h3_55b375c5d22e_06cda9e17597"));
+        assert!(is_ja4("t13d190900_9dc949149365_97f8aa674fd9"));
+        assert!(!is_ja4("t13d1516h2_8daaf6152771"));
+        assert!(!is_ja4("x13d1516h2_8daaf6152771_02713d6af862"));
+        assert!(!is_ja4("t13d1516h2_8DAAF6152771_02713d6af862"));
+        assert!(!is_ja4("t13d1516h2_8daaf6152771_02713d6af862_x"));
     }
 
     /// A CIDR entry that leaves the sync file must be released too.

@@ -403,6 +403,7 @@
     "blocked_ips": [],
     "blocked_regions": [],
     "blocklist_dir": "/var/lib/pqcrypta-proxy/blocklists",
+    "blocklist_files": [],
     "challenge": {
       "enabled": false,
       "max_number": 100000,
