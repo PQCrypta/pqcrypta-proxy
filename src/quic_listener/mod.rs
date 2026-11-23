@@ -507,6 +507,10 @@ pub(crate) fn install_crypto(
 /// `is_conformance_host`, ran `find_route` (an O(routes) scan -- one route in a
 /// test config, sixty on the live edge, nine of them carrying regexes) and
 /// cloned every policy field. Extracted so the caller can resolve it once.
+/// How long a MoQ session over WebTransport has to finish once its session
+/// has ended (its tasks see the end at once; this bounds a stuck one)
+const MOQ_SESSION_WIND_DOWN: Duration = Duration::from_secs(5);
+
 /// Hand a WebTransport unidirectional stream to its session, or refuse it
 /// (WT_BUFFERED_STREAM_REJECTED) when there is no such session now.
 fn deliver_wt_uni(
@@ -2022,12 +2026,12 @@ impl QuicListener {
                                 let _flight = flight;
                                 let mut session_stream = stream;
                                 tokio::pin!(serve);
-                                let outcome = tokio::select! {
-                                    () = &mut serve => None,
+                                let (served, outcome) = tokio::select! {
+                                    () = &mut serve => (true, None),
                                     _ = async {
                                         while let Ok(Some(_)) = session_stream.recv_data().await {}
-                                    } => None,
-                                    close = close_requests => close.ok(),
+                                    } => (false, None),
+                                    close = close_requests => (false, close.ok()),
                                 };
                                 // WT_CLOSE_SESSION, then the CONNECT
                                 // stream's FIN (section 6)
@@ -2038,6 +2042,20 @@ impl QuicListener {
                                     let _ = session_stream.finish().await;
                                 }
                                 session.end();
+                                // The MoQ session sees its end and finishes,
+                                // noting how; were it dropped instead, its
+                                // cleanup would still run (moq::session's
+                                // `Ended`), without that note
+                                if !served
+                                    && tokio::time::timeout(MOQ_SESSION_WIND_DOWN, &mut serve)
+                                        .await
+                                        .is_err()
+                                {
+                                    debug!(
+                                        "MoQ session from {} still winding down after {:?}: dropped",
+                                        remote_addr, MOQ_SESSION_WIND_DOWN
+                                    );
+                                }
                                 router.unregister_session(session.quarter_stream_id());
                                 drop(wt_open);
                             });

@@ -263,9 +263,9 @@ impl<S: WtSession> Transport for WtTransport<S> {
             .close(u32::try_from(code).unwrap_or(u32::MAX), reason);
     }
     async fn closed(&self) {
-        // The session ends when its accepts do; the connection's end ends it too
-        let conn = self.session.quic_connection().clone();
-        conn.closed().await;
+        // The session's own end: the peer closing it, or its CONNECT stream
+        // ending, comes long before a shared connection's
+        self.session.ended().await;
     }
     fn peer(&self) -> SocketAddr {
         self.peer

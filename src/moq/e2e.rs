@@ -47,6 +47,33 @@ async fn relay() -> Served {
 
 /// `moq` served on a loopback port, with a throwaway certificate.
 fn serve(moq: Arc<Moq>) -> Served {
+    let (server, cert) = server_endpoint();
+    let accept = {
+        let server = server.clone();
+        let moq = Arc::clone(&moq);
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(serve_one(Arc::clone(&moq), incoming));
+            }
+        })
+    };
+    (server, moq, accept, cert)
+}
+
+/// One connection served as the listener serves it.
+async fn serve_one(moq: Arc<Moq>, incoming: quinn::Incoming) {
+    let peer = incoming.remote_address();
+    let Ok(conn) = incoming.await else { return };
+    let alpn = conn
+        .handshake_data()
+        .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|h| h.protocol)
+        .unwrap_or_default();
+    moq.serve_quic(conn, &alpn, peer).await;
+}
+
+/// A loopback QUIC server offering every MOQT version, and its certificate.
+fn server_endpoint() -> (quinn::Endpoint, Vec<u8>) {
     let throwaway = throwaway_cert();
     let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -63,26 +90,7 @@ fn serve(moq: Arc<Moq>) -> Served {
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     )
     .expect("a server port");
-    let accept = {
-        let server = server.clone();
-        let moq = Arc::clone(&moq);
-        tokio::spawn(async move {
-            while let Some(incoming) = server.accept().await {
-                let moq = Arc::clone(&moq);
-                tokio::spawn(async move {
-                    let peer = incoming.remote_address();
-                    let Ok(conn) = incoming.await else { return };
-                    let alpn = conn
-                        .handshake_data()
-                        .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-                        .and_then(|h| h.protocol)
-                        .unwrap_or_default();
-                    moq.serve_quic(conn, &alpn, peer).await;
-                });
-            }
-        })
-    };
-    (server, moq, accept, throwaway.der.to_vec())
+    (server, throwaway.der.to_vec())
 }
 
 /// A client endpoint that trusts the relay's certificate and offers `alpns`.
@@ -757,6 +765,42 @@ async fn an_unknown_alpn_is_refused_in_the_handshake() {
             started.elapsed()
         );
     }
+}
+
+/// A session whose future is dropped part way (the WebTransport CONNECT task
+/// drops it when the CONNECT stream ends, or the close the session asked for
+/// goes out, first) is still unregistered and counted out: before, it stayed
+/// in /moq/sessions and sessions_open for good (2026-11-23)
+#[tokio::test]
+async fn a_session_dropped_part_way_is_still_ended() {
+    let moq = Moq::new(&MoqConfig {
+        enabled: true,
+        publish_key: Some(KEY.into()),
+        ..MoqConfig::default()
+    })
+    .expect("the relay");
+    let (server, cert) = server_endpoint();
+    let incoming = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept().await.expect("a connection") })
+    };
+    let client = tokio::spawn({
+        let server = server.clone();
+        let cert = cert.clone();
+        async move { Client::connect(&server, &cert, Version::Draft23, Setup::default()).await }
+    });
+    let session = tokio::spawn(serve_one(Arc::clone(&moq), incoming.await.unwrap()));
+    let _client = client.await.unwrap();
+    assert_eq!(moq.relay.sessions().len(), 1, "the session is registered");
+    assert_eq!(moq.snapshot().sessions_open, 1);
+
+    session.abort();
+    let _ = session.await;
+    assert!(
+        moq.relay.sessions().is_empty(),
+        "a dropped session is unregistered"
+    );
+    assert_eq!(moq.snapshot().sessions_open, 0, "and counted out");
 }
 
 #[tokio::test]

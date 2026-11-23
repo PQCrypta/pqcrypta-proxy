@@ -44,6 +44,20 @@ pub const REQUEST_OK: u64 = 0x7;
 pub const REQUEST_ERROR: u64 = 0x5;
 
 /// The messages that may open a request stream (section 6.3).
+/// A request type's name, as the draft writes it (for logs).
+pub const fn request_name(kind: u64) -> &'static str {
+    match kind {
+        TRACK_STATUS => "TRACK_STATUS",
+        SUBSCRIBE => "SUBSCRIBE",
+        PUBLISH => "PUBLISH",
+        FETCH => "FETCH",
+        PUBLISH_NAMESPACE => "PUBLISH_NAMESPACE",
+        SUBSCRIBE_NAMESPACE => "SUBSCRIBE_NAMESPACE",
+        SUBSCRIBE_TRACKS => "SUBSCRIBE_TRACKS",
+        _ => "an unknown request",
+    }
+}
+
 pub const REQUEST_TYPES: [u64; 7] = [
     TRACK_STATUS,
     SUBSCRIBE,

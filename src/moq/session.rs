@@ -11,7 +11,7 @@
 //! FETCH to a publisher) go out on streams this session opens.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use futures_util::future::BoxFuture;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::info;
 
 use super::auth::{PublishAuth, TokenCache};
 use super::codec::{read_vi64, Location, Namespace, TrackName};
@@ -155,6 +155,43 @@ pub struct Session<T: Transport> {
     upstream_streams: AtomicU64,
     closing: CancellationToken,
     started: Instant,
+    /// Whether this end's SETUP went out
+    setup_sent: AtomicBool,
+    /// The requests the peer opened, by type ([`message::REQUEST_TYPES`])
+    requests: [AtomicU32; message::REQUEST_TYPES.len()],
+    /// How the session ended, first cause first: a session error this end
+    /// closed it with, or the peer's or the transport's end
+    ended_by: Mutex<Option<String>>,
+}
+
+/// A session's end, however it comes. Its cleanup (the session's
+/// advertisements withdrawn, its tracks left, its registration and count
+/// removed) and its summary line run when this drops: the WebTransport
+/// CONNECT task drops a session's future when the CONNECT stream ends or the
+/// close the session asked for goes out first, and a session whose cleanup
+/// ran only at the end of [`Session::run`] stayed registered, counted open
+/// and subscribed for good (2026-11-23).
+struct Ended<T: Transport>(Arc<Session<T>>);
+
+impl<T: Transport> Drop for Ended<T> {
+    fn drop(&mut self) {
+        let s = &self.0;
+        s.closing.cancel();
+        s.relay.withdraw_session(s.id);
+        let tracks: Vec<Arc<Track>> = s
+            .aliases_in
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, t)| t)
+            .collect();
+        for t in tracks {
+            t.detach_publisher(s.id);
+        }
+        s.relay.unregister_session(s.id);
+        s.relay.stats.sessions_open.fetch_sub(1, Ordering::Relaxed);
+        info!("{}", s.summary());
+    }
 }
 
 /// Why a request stream's exchange ended without a response.
@@ -228,6 +265,9 @@ impl<T: Transport> Session<T> {
             upstream_streams: AtomicU64::new(0),
             closing: CancellationToken::new(),
             started: Instant::now(),
+            setup_sent: AtomicBool::new(false),
+            requests: Default::default(),
+            ended_by: Mutex::new(None),
         })
     }
 
@@ -298,8 +338,19 @@ impl<T: Transport> Session<T> {
             .sessions_open
             .fetch_add(1, Ordering::Relaxed);
         self.relay.register_session(self.info());
+        let _ended = Ended(Arc::clone(&self));
         let result = async {
-            self.send_setup().await?;
+            // Opening the control stream waits on the peer's stream credit;
+            // the session can end first
+            tokio::select! {
+                r = self.send_setup() => r?,
+                () = self.t.closed() => {
+                    self.note_end("the peer ended the session before the relay's SETUP went out");
+                    return Ok(());
+                }
+                () = self.closing.cancelled() => return Ok(()),
+            }
+            self.setup_sent.store(true, Ordering::Release);
             let uni = Arc::clone(&self).accept_uni_loop();
             let bi = Arc::clone(&self).accept_bi_loop();
             let dg = Arc::clone(&self).datagram_loop();
@@ -331,7 +382,10 @@ impl<T: Transport> Session<T> {
                 r = dg => r,
                 r = setup_wait => r,
                 r = drain => r,
-                () = self.t.closed() => Ok(()),
+                () = self.t.closed() => {
+                    self.note_end("the peer ended the session");
+                    Ok(())
+                }
                 () = self.closing.cancelled() => Ok(()),
             }
         }
@@ -339,24 +393,66 @@ impl<T: Transport> Session<T> {
         if let Err(e) = result {
             self.fail(&e);
         }
-        self.closing.cancel();
-        self.relay.withdraw_session(self.id);
-        let tracks: Vec<Arc<Track>> = self
-            .aliases_in
+        // `_ended` cleans up, here or wherever this future is dropped
+    }
+
+    /// The first cause of the session's end, kept for its summary.
+    fn note_end(&self, how: impl Into<String>) {
+        self.ended_by
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain()
-            .map(|(_, t)| t)
+            .get_or_insert_with(|| how.into());
+    }
+
+    /// One line for the session's whole life: who it was, how far setup
+    /// got, what it asked for, and how it ended.
+    fn summary(&self) -> String {
+        let implementation = self
+            .peer_setup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|s| {
+                s.implementation.as_deref().map_or_else(
+                    || "SETUP received".to_string(),
+                    |i| format!("SETUP from {i}"),
+                )
+            });
+        let setup = match (self.setup_sent.load(Ordering::Acquire), implementation) {
+            (true, Some(peer)) => format!("SETUP sent, {peer}"),
+            (true, None) => "SETUP sent, none received".to_string(),
+            (false, Some(peer)) => format!("no SETUP sent, {peer}"),
+            (false, None) => "no SETUP either way".to_string(),
+        };
+        let requests: Vec<String> = message::REQUEST_TYPES
+            .iter()
+            .zip(&self.requests)
+            .filter_map(|(kind, n)| {
+                let n = n.load(Ordering::Relaxed);
+                (n > 0).then(|| format!("{} {n}", message::request_name(*kind)))
+            })
             .collect();
-        for t in tracks {
-            t.detach_publisher(self.id);
-        }
-        self.relay.unregister_session(self.id);
-        self.relay
-            .stats
-            .sessions_open
-            .fetch_sub(1, Ordering::Relaxed);
-        debug!("MoQ session {} from {} ended", self.id, self.t.peer());
+        let ended_by = self
+            .ended_by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| "its transport closed".to_string());
+        format!(
+            "MoQ session {} from {} ({} {}) ended after {:.1} s: {}; {}; {}",
+            self.id,
+            self.t.peer(),
+            self.t.kind(),
+            self.version,
+            self.started.elapsed().as_secs_f64(),
+            setup,
+            if requests.is_empty() {
+                "no requests".to_string()
+            } else {
+                requests.join(", ")
+            },
+            ended_by
+        )
     }
 
     /// Close the session with a session error (section 6.6).
@@ -367,6 +463,7 @@ impl<T: Transport> Session<T> {
             self.t.peer(),
             e
         );
+        self.note_end(format!("the relay closed it with {e}"));
         self.relay
             .stats
             .session_errors
@@ -886,13 +983,14 @@ impl<T: Transport> Session<T> {
         let Some((kind, body)) = read_frame(&mut recv, self.version, limit).await? else {
             return Ok(());
         };
-        if !message::REQUEST_TYPES.contains(&kind) {
+        let Some(slot) = message::REQUEST_TYPES.iter().position(|k| *k == kind) else {
             return Err(SessionError::new(
                 C::UnexpectedMessage,
                 "a request stream that begins with no request",
             )
             .into());
-        }
+        };
+        self.requests[slot].fetch_add(1, Ordering::Relaxed);
         let msg = Message::decode(kind, &body, self.version, &Context::default())?;
         let request_id = match &msg {
             Message::Subscribe(r) | Message::Fetch(r) | Message::TrackStatus(r) => r.request_id,

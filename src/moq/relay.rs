@@ -525,8 +525,17 @@ impl Relay {
             .insert(info.id, info);
     }
 
+    /// A registered session's new details; a session that has ended is not
+    /// brought back by a late update
     pub fn update_session(&self, info: super::session::SessionInfo) {
-        self.register_session(info);
+        if let Some(entry) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&info.id)
+        {
+            *entry = info;
+        }
     }
 
     pub fn unregister_session(&self, id: u64) {
@@ -971,6 +980,36 @@ impl Relay {
 mod tests {
     use super::*;
     use crate::moq::data::Delivery;
+
+    /// A session's late update (its SETUP read after it ended) does not
+    /// register it again
+    #[test]
+    fn an_ended_session_is_not_registered_again_by_an_update() {
+        let relay = Relay::new(Limits::default());
+        let info = || crate::moq::session::SessionInfo {
+            id: 7,
+            peer: "192.0.2.1:443".into(),
+            transport: "webtransport",
+            version: "moqt-23".into(),
+            role: "server",
+            implementation: None,
+            path: Some("/moq".into()),
+            started: None,
+            age_secs: 0,
+        };
+        relay.register_session(info());
+        relay.update_session(crate::moq::session::SessionInfo {
+            implementation: Some("a client".into()),
+            ..info()
+        });
+        assert_eq!(
+            relay.sessions()[0].implementation.as_deref(),
+            Some("a client")
+        );
+        relay.unregister_session(7);
+        relay.update_session(info());
+        assert!(relay.sessions().is_empty());
+    }
 
     fn name() -> TrackName {
         TrackName {
