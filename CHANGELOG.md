@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.21.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.20.0...v0.21.0) (2026-11-23)
+
+
+### Features
+
+* **security:** blocklist_files, further synced lists held with blocked_ips.json ([62221f5](https://github.com/PQCrypta/pqcrypta-proxy/commit/62221f516a06c782edd3fe78d077d91aef0b0408))
+* **security:** fingerprint bans in synced lists; WAF verdicts carry the JA4 ([8ce9c62](https://github.com/PQCrypta/pqcrypta-proxy/commit/8ce9c62114266dc319e4868358e639e02a8c034c))
+
+
+### Bug Fixes
+
+* **admin:** --admin reads only [admin], --moq-token only [moq] ([e942f7c](https://github.com/PQCrypta/pqcrypta-proxy/commit/e942f7c5aa0864d20dc7ba7e4f77c14c1e7cf2ba))
+* **canary:** a cohort gives the canary its share of the clients exactly ([7e21b8c](https://github.com/PQCrypta/pqcrypta-proxy/commit/7e21b8c4ebeb264efdf0fbbc1f83ee4d1f0b697b))
+* **canary:** the cohort book's placement is a three-way enum, not a nested Option (clippy::option_option) ([47406e5](https://github.com/PQCrypta/pqcrypta-proxy/commit/47406e5a3f15c45b7e2958e3fab7518a840956e0))
+* **canary:** the cohort key maps to its placement ([2e7ee0e](https://github.com/PQCrypta/pqcrypta-proxy/commit/2e7ee0ea2cd57a663d57df6b3bdea0e38c0bc299))
+* **ech:** a reload the proxy refuses is logged with the reason, not ended silently by set -e ([532aa91](https://github.com/PQCrypta/pqcrypta-proxy/commit/532aa9115b8b2f3c476f71795d384884b0e54b8f))
+* **pentests:** the integrity preflight counts a tester the fail2ban allowlist names by host name ([cb3fbbf](https://github.com/PQCrypta/pqcrypta-proxy/commit/cb3fbbf1e611b0a0d0c2ca13ca77c2b8da4c5f84))
+* **waf:** a verified crawler's own address skips the user-agent identity rules ([ce02830](https://github.com/PQCrypta/pqcrypta-proxy/commit/ce028309aae58c2943eb9000006f8699eac9719b))
+
 ## [0.20.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.19.1...v0.20.0) (2026-11-23)
 
 
