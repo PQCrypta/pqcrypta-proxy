@@ -13,6 +13,9 @@ build until this reference says so too.
 
 - [Server Configuration](#server-configuration)
 - [MASQUE / CONNECT-UDP](#masque--connect-udp-rfc-9298)
+- [DNS over HTTPS](#dns-over-https)
+- [DNS over QUIC](#dns-over-quic)
+- [Media over QUIC](#media-over-quic)
 - [HTTP/3 Advanced Features](#http3-advanced-features)
 - [TLS Configuration](#tls-configuration)
 - [HTTP Redirect](#http-redirect)
@@ -140,6 +143,95 @@ waf_enabled = false        # base64url DNS messages are not form input
 
 Also add `path` to `[cache] excluded_paths`: an authoritative answer must come
 from the zone as it stands, not from a cached copy.
+
+---
+
+## DNS over QUIC
+
+```toml
+[doq]
+```
+
+DNS over QUIC (RFC 9250) on the QUIC listener. A client that offers `doq` in
+ALPN on the port HTTP/3 answers gets a DNS connection instead of an HTTP/3
+one. This serves the same name server as the DNS over HTTPS gateway, through
+the same checks, for a client whose path carries UDP 443 but not 853 (where
+the name server answers DoQ itself). The protocol is chosen by ALPN, never by
+port: `doq` is in the listener's ALPN list only while `[doq]` is on.
+
+Each query arrives on its own bidirectional stream with Message ID 0. A
+malformed stream, or a unidirectional stream from the client, ends the
+connection with DOQ_PROTOCOL_ERROR. A query over the per-address rate limits
+has its stream reset with DOQ_EXCESSIVE_LOAD. In 0-RTT data, only standard
+queries are forwarded; anything else is answered REFUSED with Extended DNS
+Error 26, "Too Early" (RFC 9250 §4.5). Connections are counted under the `doq`
+protocol in `/metrics`, apart from HTTP/3.
+
+**Disabled by default.** Changes take effect on restart.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Serve DNS over QUIC on the QUIC listener |
+| `upstream` | string | `"127.0.0.1:53"` | The name server, `ip:port`, asked over TCP |
+| `timeout_ms` | u64 | `3000` | Time allowed for the name server's answer; past it the client gets SERVFAIL with Extended DNS Error 22 |
+
+---
+
+## Media over QUIC
+
+```toml
+[moq]
+```
+
+A Media over QUIC relay (draft-ietf-moq-transport): publishers send tracks to
+it and subscribers receive them, with one cache per track and one upstream
+subscription per track however many subscribers it has. The versions it
+speaks are the newest two drafts, currently `moqt-23` and `moqt-22`; a session
+uses the newest one the client also offers. See [MOQ.md](MOQ.md) for the
+protocol, entrances and interoperability.
+
+There are three entrances, all chosen by protocol negotiation, never by port:
+
+- **Native QUIC:** a client offering a MOQT ALPN on the QUIC listener's port.
+  It may name `path` (or one of `extra_paths`) in its SETUP PATH option and a
+  host in AUTHORITY.
+- **WebTransport on the HTTP/3 port:** an extended CONNECT to `path` whose
+  `WT-Available-Protocols` lists a MOQT version. The answer's `WT-Protocol`
+  names the version chosen; a request that offers none is refused with 400.
+- **WebTransport on the WebTransport server's port**, in the same way.
+
+Subscribing is open, held to the per-address rate limits. Publishing (PUBLISH,
+PUBLISH_NAMESPACE) needs an authorization token for the namespace. Tokens are
+signed with `publish_key` and issued with `pqcrypta-proxy --moq-token`. With
+no key, nobody can publish.
+
+**Disabled by default.** Changes take effect on restart. On shutdown, every
+session is sent GOAWAY and given `goaway_timeout_ms` to move.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Run the relay |
+| `path` | string | `"/moq"` | The WebTransport path, and the PATH a native QUIC client may name |
+| `extra_paths` | list | `[""]` | Further PATH values a native QUIC client may name; `""` is the authority's root |
+| `authorities` | list | `[]` | Host names a native QUIC client may name in AUTHORITY; empty accepts any well-formed authority |
+| `upstream` | string | `""` | An upstream relay, `moqt://host[:port]/path`, asked over native QUIC for every namespace no local publisher advertises; `""` for none |
+| `publish_key` | string? | `null` | The key publish tokens are signed with (HMAC-SHA-384), a secret: see [Secrets](#secrets) |
+| `cache_mb` | usize | `256` | The object cache across every track, in MiB; the oldest objects go first |
+| `max_object_kb` | usize | `4096` | The largest object the relay accepts, in KiB; a larger one has its stream stopped with EXCESSIVE_LOAD |
+| `max_tracks` | usize | `100000` | Tracks held at once; unused tracks are dropped first |
+| `rendezvous_max_ms` | u64 | `30000` | The longest a SUBSCRIBE waits for a publisher (its RENDEZVOUS_TIMEOUT is capped at this) |
+| `fill_timeout_ms` | u64 | `5000` | The longest a FETCH waits for objects from upstream (its FILL_TIMEOUT is capped at this) |
+| `goaway_timeout_ms` | u64 | `10000` | The timeout GOAWAY states when the proxy drains |
+| `max_request_updates` | u64 | `16` | MAX_REQUEST_UPDATES sent in SETUP |
+| `max_filter_ranges` | u64 | `64` | MAX_FILTER_RANGES sent in SETUP |
+| `max_auth_token_cache` | u64 | `4096` | MAX_AUTH_TOKEN_CACHE_SIZE sent in SETUP, in bytes |
+| `max_control_message` | u64 | `65535` | MAX_CONTROL_MESSAGE_SIZE sent in SETUP (draft 23); at least 65535 |
+
+```toml
+[moq]
+enabled = true
+publish_key = { credential = "moq-publish-key" }
+```
 
 ---
 
@@ -327,7 +419,7 @@ Each request's `x-tls-library` header names the library that completed its hands
 
 ## Secrets
 
-Every secret setting -- `[admin] auth_token`, `hmac_secret` and `metrics_token`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[security.challenge] secret`, `[acme] eab_hmac_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
+Every secret setting -- `[admin] auth_token`, `hmac_secret` and `metrics_token`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[security.challenge] secret`, `[acme] eab_hmac_key`, `[moq] publish_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
 
 ```toml
 [admin]

@@ -134,6 +134,11 @@ impl MetricsRegistry {
         // Connection metrics
         self.connections.export_prometheus(&mut output);
 
+        // The Media over QUIC relay, where it runs
+        if let Some(moq) = crate::moq::running() {
+            moq.export_prometheus(&mut output);
+        }
+
         // Route metrics
         self.routes.export_prometheus(&mut output);
 
@@ -179,6 +184,7 @@ impl MetricsRegistry {
             traffic: None,
             challenges: None,
             certificates: Vec::new(),
+            moq: crate::moq::running().map(|m| m.snapshot()),
         }
     }
 }
@@ -271,6 +277,9 @@ pub struct MetricsSnapshot {
     /// When each served certificate expires (`tls::MultiDomainCertResolver::expiries`)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<crate::tls::CertificateExpiry>,
+    /// The Media over QUIC relay's figures, where `[moq]` is on
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moq: Option<crate::moq::MoqSnapshot>,
 }
 
 /// [`MetricsSnapshot::challenges`]
@@ -776,6 +785,7 @@ impl ConnectionMetrics {
             connect_udp: opened(ConnectionProtocol::ConnectUdp),
             passthrough: opened(ConnectionProtocol::Passthrough),
             doq: opened(ConnectionProtocol::Doq),
+            moqt: opened(ConnectionProtocol::Moqt),
             open_http3: open(ConnectionProtocol::Http3),
             open_http2: open(ConnectionProtocol::Http2),
             open_http1: open(ConnectionProtocol::Http1),
@@ -783,6 +793,7 @@ impl ConnectionMetrics {
             open_connect_udp: open(ConnectionProtocol::ConnectUdp),
             open_passthrough: open(ConnectionProtocol::Passthrough),
             open_doq: open(ConnectionProtocol::Doq),
+            open_moqt: open(ConnectionProtocol::Moqt),
             handshake_failures: c.handshake_failures.load(Ordering::Relaxed),
         }
     }
@@ -801,10 +812,13 @@ pub enum ConnectionProtocol {
     Passthrough,
     /// DNS over QUIC (RFC 9250): a QUIC connection that negotiated `doq`
     Doq,
+    /// Media over QUIC on native QUIC: a connection that negotiated a MOQT
+    /// version (a MOQT session over WebTransport counts as WebTransport)
+    Moqt,
 }
 
 impl ConnectionProtocol {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Http3,
         Self::Http2,
         Self::Http1,
@@ -812,6 +826,7 @@ impl ConnectionProtocol {
         Self::ConnectUdp,
         Self::Passthrough,
         Self::Doq,
+        Self::Moqt,
     ];
 
     const fn index(self) -> usize {
@@ -823,6 +838,7 @@ impl ConnectionProtocol {
             Self::ConnectUdp => 4,
             Self::Passthrough => 5,
             Self::Doq => 6,
+            Self::Moqt => 7,
         }
     }
 
@@ -835,6 +851,7 @@ impl ConnectionProtocol {
             Self::ConnectUdp => "connect_udp",
             Self::Passthrough => "passthrough",
             Self::Doq => "doq",
+            Self::Moqt => "moqt",
         }
     }
 }
@@ -853,6 +870,7 @@ pub struct ConnectionMetricsSnapshot {
     pub connect_udp: u64,
     pub passthrough: u64,
     pub doq: u64,
+    pub moqt: u64,
     /// Open now, by protocol
     pub open_http3: u64,
     pub open_http2: u64,
@@ -861,6 +879,7 @@ pub struct ConnectionMetricsSnapshot {
     pub open_connect_udp: u64,
     pub open_passthrough: u64,
     pub open_doq: u64,
+    pub open_moqt: u64,
     pub handshake_failures: u64,
 }
 

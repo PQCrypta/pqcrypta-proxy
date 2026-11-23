@@ -235,6 +235,10 @@ pub struct ProxyConfig {
     /// DNS over QUIC (RFC 9250) on the QUIC listener, for the same name server
     #[serde(default)]
     pub doq: DoqConfig,
+    /// Media over QUIC (draft-ietf-moq-transport): a relay on the QUIC
+    /// listener and at a WebTransport path
+    #[serde(default)]
+    pub moq: MoqConfig,
 }
 
 /// Current config schema version supported by this binary
@@ -349,14 +353,138 @@ impl DoqConfig {
     }
 }
 
+/// Media over QUIC Transport (draft-ietf-moq-transport): [`crate::moq`].
+///
+/// A client offering a MOQT ALPN (`moqt-23`,
+/// `moqt-22`: the versions in [`crate::moq::version`]) gets a MOQT session
+/// on the port HTTP/3 answers, and an extended CONNECT to `path` with
+/// `WT-Available-Protocols` gets one over WebTransport, on the HTTP/3 port
+/// and on the WebTransport server's.
+///
+/// Off by default. Subscribing is open; publishing needs a token signed with
+/// `publish_key` (`pqcrypta-proxy --moq-token`), so with no key nobody can
+/// publish and the relay serves only what other relays hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MoqConfig {
+    /// Master switch. Default: false.
+    pub enabled: bool,
+    /// The WebTransport path, which is also the PATH a native QUIC client
+    /// names in SETUP. Default: "/moq".
+    pub path: String,
+    /// Further PATH values native QUIC clients may name (the empty path is
+    /// the authority's root). Default: one entry, the empty path.
+    pub extra_paths: Vec<String>,
+    /// Host names a native QUIC client may name in AUTHORITY; empty accepts
+    /// any well-formed authority. Default: [].
+    pub authorities: Vec<String>,
+    /// An upstream relay, `moqt://host[:port]/path`, asked for every
+    /// namespace no local publisher advertises; empty for none. Default: "".
+    pub upstream: String,
+    /// The key publish tokens are signed with (HMAC-SHA-384): a string, or
+    /// `{ credential = "..." }` / `{ file = "..." }`. Default: none.
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
+    pub publish_key: Option<String>,
+    /// The object cache, across every track, in MiB. Default: 256.
+    pub cache_mb: usize,
+    /// The largest object the relay takes, in KiB. Default: 4096.
+    pub max_object_kb: usize,
+    /// Tracks the relay holds at once. Default: 100000.
+    pub max_tracks: usize,
+    /// The longest a SUBSCRIBE waits for a publisher (RENDEZVOUS_TIMEOUT),
+    /// in milliseconds. Default: 30000.
+    pub rendezvous_max_ms: u64,
+    /// The longest a FETCH waits for upstream objects (FILL_TIMEOUT), in
+    /// milliseconds. Default: 5000.
+    pub fill_timeout_ms: u64,
+    /// GOAWAY's timeout when the proxy drains, in milliseconds. Default:
+    /// 10000.
+    pub goaway_timeout_ms: u64,
+    /// MAX_REQUEST_UPDATES sent in SETUP. Default: 16.
+    pub max_request_updates: u64,
+    /// MAX_FILTER_RANGES sent in SETUP. Default: 64.
+    pub max_filter_ranges: u64,
+    /// MAX_AUTH_TOKEN_CACHE_SIZE sent in SETUP, in bytes. Default: 4096.
+    pub max_auth_token_cache: u64,
+    /// MAX_CONTROL_MESSAGE_SIZE sent in SETUP (draft 23), in bytes; at least
+    /// 65535. Default: 65535.
+    pub max_control_message: u64,
+}
+
+impl Default for MoqConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "/moq".to_string(),
+            extra_paths: vec![String::new()],
+            authorities: Vec::new(),
+            upstream: String::new(),
+            publish_key: None,
+            cache_mb: 256,
+            max_object_kb: 4096,
+            max_tracks: 100_000,
+            rendezvous_max_ms: 30_000,
+            fill_timeout_ms: 5_000,
+            goaway_timeout_ms: 10_000,
+            max_request_updates: 16,
+            max_filter_ranges: 64,
+            max_auth_token_cache: 4096,
+            max_control_message: 65_535,
+        }
+    }
+}
+
+impl MoqConfig {
+    /// The checks `ProxyConfig::validate` runs when MoQ is on.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.path.starts_with('/') {
+            return Err(anyhow::anyhow!(
+                "moq.path must start with '/': {:?}",
+                self.path
+            ));
+        }
+        if let Some(p) = self
+            .extra_paths
+            .iter()
+            .find(|p| !(p.is_empty() || p.starts_with('/')))
+        {
+            return Err(anyhow::anyhow!(
+                "moq.extra_paths entries are empty or start with '/': {:?}",
+                p
+            ));
+        }
+        if self.cache_mb == 0 || self.max_object_kb == 0 || self.max_tracks == 0 {
+            return Err(anyhow::anyhow!(
+                "moq.cache_mb, max_object_kb and max_tracks must be more than 0"
+            ));
+        }
+        if self.max_object_kb.saturating_mul(1024) > self.cache_mb.saturating_mul(1 << 20) {
+            return Err(anyhow::anyhow!(
+                "moq.max_object_kb is larger than the whole cache"
+            ));
+        }
+        if !self.upstream.is_empty() {
+            crate::moq::upstream::UpstreamUri::parse(&self.upstream)?;
+        }
+        if self.max_control_message < 65_535 {
+            return Err(anyhow::anyhow!("moq.max_control_message must be at least 65535 (draft-ietf-moq-transport section 9.1.8)"));
+        }
+        Ok(())
+    }
+}
+
 impl ProxyConfig {
     /// The application protocols the QUIC listener serves, by ALPN: HTTP/3,
-    /// and DNS over QUIC where it is on. A name the listener does not serve
-    /// is refused with no_application_protocol (RFC 9001 section 8.1).
+    /// DNS over QUIC where it is on, and every MOQT version where MoQ is on.
+    /// A name the listener does not serve is refused with
+    /// no_application_protocol (RFC 9001 section 8.1).
     pub fn quic_applications(&self) -> Vec<Vec<u8>> {
         let mut names = vec![b"h3".to_vec()];
         if self.doq.enabled {
             names.push(crate::doq::ALPN.to_vec());
+        }
+        if self.moq.enabled {
+            names.extend(crate::moq::version::Version::alpns());
         }
         names
     }
@@ -773,6 +901,7 @@ impl Default for ProxyConfig {
             conformance: ConformanceConfig::default(),
             doh: DohConfig::default(),
             doq: DoqConfig::default(),
+            moq: MoqConfig::default(),
         }
     }
 }
@@ -5198,6 +5327,9 @@ impl ProxyConfig {
 
         if self.doh.enabled {
             self.doh.validate()?;
+        }
+        if self.moq.enabled {
+            self.moq.validate()?;
         }
         if self.doq.enabled {
             self.doq.validate()?;

@@ -143,3 +143,15 @@ fn ticketer() -> &'static PqcTicketer {
     static TICKETER: OnceLock<PqcTicketer> = OnceLock::new();
     TICKETER.get_or_init(|| PqcTicketer::new(3600).expect("a ticketer"))
 }
+
+/// A MoQ control message body (draft-ietf-moq-transport section 9): decoded
+/// as the type and version its first two bytes pick, and re-encoded to
+/// itself.
+pub fn moq_control(data: &[u8]) {
+    crate::moq::check::control(data);
+}
+
+/// MoQ datagrams, subgroup streams and FETCH streams (section 11).
+pub fn moq_data(data: &[u8]) {
+    crate::moq::check::data(data);
+}

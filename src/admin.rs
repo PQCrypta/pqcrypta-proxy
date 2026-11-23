@@ -332,6 +332,10 @@ impl AdminServer {
             .route("/blocklist/unblock/{ip}", post(blocklist_unblock_handler))
             .route("/cache", get(cache_stats_handler))
             .route("/cache/purge", post(cache_purge_handler))
+            .route("/moq", get(moq_handler))
+            .route("/moq/sessions", get(moq_sessions_handler))
+            .route("/moq/tracks", get(moq_tracks_handler))
+            .route("/moq/namespaces", get(moq_namespaces_handler))
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 auth_middleware,
@@ -2016,6 +2020,34 @@ async fn cache_stats_handler(State(state): State<Arc<AdminState>>) -> Json<Cache
         size_bytes,
         max_size_bytes: config.cache.max_size_mb * 1024 * 1024,
     })
+}
+
+/// `GET /moq`: the Media over QUIC relay's figures; 404 where `[moq]` is off.
+async fn moq_handler() -> Result<Json<crate::moq::MoqSnapshot>, StatusCode> {
+    crate::moq::running()
+        .map(|m| Json(m.snapshot()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `GET /moq/sessions`: every MoQ session open now.
+async fn moq_sessions_handler() -> Result<Json<Vec<crate::moq::session::SessionInfo>>, StatusCode> {
+    crate::moq::running()
+        .map(|m| Json(m.relay.sessions()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `GET /moq/tracks`: the tracks the relay holds.
+async fn moq_tracks_handler() -> Result<Json<Vec<crate::moq::TrackView>>, StatusCode> {
+    crate::moq::running()
+        .map(|m| Json(m.tracks_view()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `GET /moq/namespaces`: the namespaces publishers advertise.
+async fn moq_namespaces_handler() -> Result<Json<Vec<String>>, StatusCode> {
+    crate::moq::running()
+        .map(|m| Json(m.namespaces_view()))
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// `POST /cache/purge` — drop cached responses.

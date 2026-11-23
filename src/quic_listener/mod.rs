@@ -962,6 +962,11 @@ impl QuicListener {
         } else {
             None
         };
+        // The node's MoQ relay, shared with every listener and the
+        // WebTransport server, its requests held to the same rate limits
+        if let Some(moq) = crate::moq::start(&config.moq)? {
+            let _ = moq.settings.limiter.set(Arc::clone(&advanced_rate_limiter));
+        }
 
         Ok(Self {
             endpoint,
@@ -1284,6 +1289,21 @@ impl QuicListener {
                 .await;
             }
             return Ok(());
+        }
+        // Media over QUIC on native QUIC: a MOQT version is in the ALPN list
+        // only when `[moq]` is on. Served once the handshake completes, so
+        // nothing replayable in 0-RTT starts a subscription upstream
+        // (draft-ietf-moq-transport section 6.3.1).
+        if let (Some(alpn), Some(moq)) = (negotiated.as_deref(), crate::moq::running()) {
+            if crate::moq::version::Version::from_alpn(alpn).is_some() {
+                let _open = metrics
+                    .connections
+                    .connection_opened(ConnectionProtocol::Moqt);
+                if established.await {
+                    moq.serve_quic(connection, alpn, remote_addr).await;
+                }
+                return Ok(());
+            }
         }
         let _open = metrics
             .connections
@@ -1936,6 +1956,93 @@ impl QuicListener {
                             "WebTransport CONNECT request for {} from {} (host: {:?})",
                             path, remote_addr, host
                         );
+
+                        // Media over QUIC over WebTransport: the version is
+                        // the one WT-Available-Protocols and WT-Protocol
+                        // agree (draft-ietf-moq-transport section 6.2.1,
+                        // draft-ietf-webtrans-http3 section 3.3)
+                        if let Some(moq) = crate::moq::running().filter(|m| path == m.path) {
+                            let offered = request
+                                .headers()
+                                .get("wt-available-protocols")
+                                .and_then(|v| v.to_str().ok());
+                            let mut stream = stream;
+                            let Some((version, wt_protocol)) =
+                                crate::moq::negotiate_webtransport(offered)
+                            else {
+                                log_outcome(http::StatusCode::BAD_REQUEST);
+                                let refused = http::Response::builder()
+                                    .status(http::StatusCode::BAD_REQUEST)
+                                    .header("content-type", "text/plain")
+                                    .body(())?;
+                                if stream.send_response(refused).await.is_ok() {
+                                    let _ = stream
+                                        .send_data(Bytes::from_static(
+                                            b"WT-Available-Protocols names no MOQT version this relay speaks\n",
+                                        ))
+                                        .await;
+                                    let _ = stream.finish().await;
+                                }
+                                continue;
+                            };
+                            let response = http::Response::builder()
+                                .status(http::StatusCode::OK)
+                                .header("wt-protocol", wt_protocol)
+                                .body(())?;
+                            if stream.send_response(response).await.is_err() {
+                                continue;
+                            }
+                            log_outcome(http::StatusCode::OK);
+                            let wt_open = metrics
+                                .connections
+                                .connection_opened(ConnectionProtocol::WebTransport);
+                            let session_id = stream.send_id().into_inner();
+                            let (session, feed) = crate::wt_session::H3Session::new(
+                                session_id,
+                                quic_connection.clone(),
+                            );
+                            let router = datagram_router
+                                .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
+                                .clone();
+                            router.route_webtransport(
+                                session.quarter_stream_id(),
+                                feed.datagram_sender(),
+                            );
+                            wt_sessions.retain(|_, feed| !feed.has_ended());
+                            wt_sessions.insert(session_id, feed);
+                            let close_requests = session.close_requests();
+                            let serve = moq.serve_webtransport(
+                                Arc::clone(&session),
+                                remote_addr,
+                                version,
+                                path.clone(),
+                            );
+                            let flight = activity.begin();
+                            tokio::spawn(async move {
+                                let _flight = flight;
+                                let mut session_stream = stream;
+                                tokio::pin!(serve);
+                                let outcome = tokio::select! {
+                                    () = &mut serve => None,
+                                    _ = async {
+                                        while let Ok(Some(_)) = session_stream.recv_data().await {}
+                                    } => None,
+                                    close = close_requests => close.ok(),
+                                };
+                                // WT_CLOSE_SESSION, then the CONNECT
+                                // stream's FIN (section 6)
+                                if let Some((code, reason)) = outcome {
+                                    let capsule =
+                                        crate::wt_session::close_session_capsule(code, &reason);
+                                    let _ = session_stream.send_data(capsule).await;
+                                    let _ = session_stream.finish().await;
+                                }
+                                session.end();
+                                router.unregister_session(session.quarter_stream_id());
+                                drop(wt_open);
+                            });
+                            continue;
+                        }
 
                         // Reject WebTransport sessions for hosts/paths with no matching WT route.
                         // Without this check the proxy accepts every CONNECT unconditionally,

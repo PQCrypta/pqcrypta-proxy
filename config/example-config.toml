@@ -132,6 +132,38 @@ path = "/dns-query"
 timeout_ms = 3000
 
 # =============================
+# DNS over QUIC (RFC 9250)
+# =============================
+# The same name server, for a client that offers `doq` in ALPN on the QUIC
+# listener's port (UDP 443): the protocol is chosen by ALPN, not by port.
+# Disabled by default.
+[doq]
+enabled = false
+# The name server, asked over TCP.
+upstream = "127.0.0.1:53"
+# Time allowed for the name server's answer (ms); past it, SERVFAIL with
+# Extended DNS Error 22.
+timeout_ms = 3000
+
+# =============================
+# Media over QUIC (draft-ietf-moq-transport)
+# =============================
+# A MoQ relay: native QUIC for a client offering a MOQT ALPN (moqt-23,
+# moqt-22) on the QUIC listener's port, and WebTransport at `path` on the
+# HTTP/3 port and the WebTransport server's. Subscribing is open; publishing
+# needs a token signed with `publish_key` (pqcrypta-proxy --moq-token PREFIX).
+# See docs/MOQ.md. Disabled by default.
+[moq]
+enabled = false
+path = "/moq"
+# The key publish tokens are signed with; a credential, never the key itself.
+# publish_key = { credential = "moq-publish-key" }
+# Another relay asked for every namespace no local publisher advertises.
+# upstream = "moqt://origin.example.com/moq"
+cache_mb = 256
+max_object_kb = 4096
+
+# =============================
 # TLS Configuration
 # =============================
 [tls]

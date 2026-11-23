@@ -325,6 +325,26 @@
     "private_target_clients": [],
     "session_idle_timeout_secs": 60
   },
+  "moq": {
+    "authorities": [],
+    "cache_mb": 256,
+    "enabled": false,
+    "extra_paths": [
+      ""
+    ],
+    "fill_timeout_ms": 5000,
+    "goaway_timeout_ms": 10000,
+    "max_auth_token_cache": 4096,
+    "max_control_message": 65535,
+    "max_filter_ranges": 64,
+    "max_object_kb": 4096,
+    "max_request_updates": 16,
+    "max_tracks": 100000,
+    "path": "/moq",
+    "publish_key": null,
+    "rendezvous_max_ms": 30000,
+    "upstream": ""
+  },
   "ocsp": {
     "cache_duration_secs": 3600,
     "enabled": false,
