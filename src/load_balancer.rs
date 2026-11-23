@@ -356,6 +356,14 @@ struct CohortBook {
 /// its key, as before
 const COHORT_BOOK_MAX: usize = 1 << 20;
 
+/// Where a cohort's book puts a client
+enum Placement<T> {
+    Canary(T),
+    Stable,
+    /// The book is full: the hash of its key places it
+    Unbooked,
+}
+
 impl CohortBook {
     /// The canary `key` is on, placing it if it is new or if a canary's
     /// share has risen past what it holds.
@@ -364,7 +372,7 @@ impl CohortBook {
         key: [u8; 16],
         shares: &[(T, u32)],
         id: impl Fn(&T) -> &str,
-    ) -> Option<Option<T>> {
+    ) -> Placement<T> {
         let seen = self.members.len() as u64;
         let find = |name: &str| {
             shares
@@ -375,7 +383,7 @@ impl CohortBook {
         match self.members.get(&key) {
             // On a canary still taking traffic; one that has left sends it
             // to the stable servers while it is away
-            Some(Some(name)) => return Some(find(name)),
+            Some(Some(name)) => return find(name).map_or(Placement::Stable, Placement::Canary),
             Some(None) => {
                 // A stable client moves to a canary below its share
                 for (canary, percent) in shares {
@@ -383,15 +391,15 @@ impl CohortBook {
                     if have * 100 < u64::from(*percent) * seen {
                         self.members.insert(key, Some(id(canary).to_string()));
                         *self.on.entry(id(canary).to_string()).or_default() += 1;
-                        return Some(Some(canary.clone()));
+                        return Placement::Canary(canary.clone());
                     }
                 }
-                return Some(None);
+                return Placement::Stable;
             }
             None => {}
         }
         if self.members.len() >= COHORT_BOOK_MAX {
-            return None;
+            return Placement::Unbooked;
         }
         let with_this = seen + 1;
         for (canary, percent) in shares {
@@ -399,11 +407,11 @@ impl CohortBook {
             if have < (u64::from(*percent) * with_this).div_ceil(100) {
                 self.members.insert(key, Some(id(canary).to_string()));
                 *self.on.entry(id(canary).to_string()).or_default() += 1;
-                return Some(Some(canary.clone()));
+                return Placement::Canary(canary.clone());
             }
         }
         self.members.insert(key, None);
-        Some(None)
+        Placement::Stable
     }
 }
 
@@ -1507,8 +1515,9 @@ impl BackendPool {
             book.place(key, &shares, |s| s.id.as_str())
         });
         let server = match placed {
-            Some(side) => side?,
-            None => {
+            Some(Placement::Canary(server)) => server,
+            Some(Placement::Stable) => return None,
+            Some(Placement::Unbooked) | None => {
                 let roll = cohort_roll(canary_cfg, ctx, &shares[0].0.id, range)
                     .unwrap_or_else(|| rand::random_range(0..range));
                 canary_for_roll(&shares, roll)?.clone()
