@@ -4599,7 +4599,21 @@ impl Connection {
                     // error, and `move_to_drained` then yields `error: None`
                     // for a state whose error was already read -- which the
                     // driver asserts cannot happen.
-                    if self.side.is_client() {
+                    //
+                    // A server says so too while the handshake runs, for a
+                    // packet on the path the connection began on: nothing
+                    // migrates before the handshake is confirmed (RFC 9000
+                    // section 9), and what it sends there is bounded by the
+                    // anti-amplification limit (section 8.1) -- exactly what
+                    // the Initial close for an error in the first packet
+                    // already sends (`Endpoint::accept`). Without it, a
+                    // ClientHello spanning two Initial packets (a hybrid
+                    // post-quantum key share does) that the TLS stack refuses
+                    // -- no common ALPN, group or signature scheme -- got no
+                    // answer, and the client waited out its idle timeout.
+                    let original_path = path_id == PathId::ZERO
+                        && self.path_data(PathId::ZERO).network_path == network_path;
+                    if self.side.is_client() || (self.state.is_handshake() && original_path) {
                         self.connection_close_pending = true;
                     }
                     self.state.move_to_closed(err);

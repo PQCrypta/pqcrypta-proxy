@@ -25,6 +25,10 @@ when the proxy builds noq as a dependency.
 - `Connection::is_settled`: nothing queued or unacknowledged, so a stream-level
   signal (a STOP_SENDING) reaches the peer before a close.
 - A client that rejects the server's handshake says so with CONNECTION_CLOSE.
+- A server that rejects a ClientHello spanning two Initial packets (a hybrid
+  post-quantum key share makes most ClientHellos this size) says so with
+  CONNECTION_CLOSE too, on the path the connection began on, within the
+  anti-amplification limit; upstream n0-computer/noq#892.
 - 1-RTT frames sent as 0.5-RTT data right behind the server's Handshake flight
   (an HTTP/3 server's SETTINGS arrive with the handshake), and no stall after a
   HelloRetryRequest.
