@@ -447,6 +447,18 @@ pub trait NamespacePublisher: Send + Sync + 'static {
         track: Arc<Track>,
         new_group_request: Option<u64>,
     ) -> futures_util::future::BoxFuture<'static, Result<(), (u64, String)>>;
+    /// FETCH `start..=end` of `track` through this publisher (section
+    /// 3.2.3): what the cache lacks of a track in the namespace, whether or
+    /// not the relay is subscribed to it now. A finished track's upstream
+    /// subscription ends with its last object, and every FETCH past the
+    /// cache came back Unknown.
+    fn fetch_through(
+        &self,
+        track: TrackName,
+        start: Location,
+        end: Location,
+        timeout: Duration,
+    ) -> futures_util::future::BoxFuture<'static, Option<mpsc::Receiver<super::data::FetchEntry>>>;
     fn session_id(&self) -> u64;
 }
 

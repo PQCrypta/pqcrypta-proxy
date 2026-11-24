@@ -888,6 +888,207 @@ async fn path_and_authority_from_a_native_client_are_checked() {
 /// Two relays as one (section 7): a subscriber at the edge gets a track
 /// published at the origin through the edge's upstream session, and a FETCH
 /// at the edge for objects only the origin holds is filled from upstream.
+/// A publisher of a finished track, as the music origin is: the relay's
+/// SUBSCRIBE is answered with the track's Largest Object and ended at once
+/// (PUBLISH_DONE, the track complete), and each FETCH from its objects.
+async fn serve_finished_track(conn: quinn::Connection, v: Version, objects: Vec<Object>) {
+    while let Ok(Ok((mut send, recv))) = tokio::time::timeout(WAIT, conn.accept_bi()).await {
+        let conn = conn.clone();
+        let objects = objects.clone();
+        tokio::spawn(async move {
+            let mut recv = BufReader::new(recv);
+            let Some((kind, body)) = read_frame(&mut recv, v, 1 << 20).await.ok().flatten() else {
+                return;
+            };
+            match Message::decode(kind, &body, v, &Context::default()).unwrap() {
+                Message::Subscribe(_) => {
+                    let ok = Message::SubscribeOk {
+                        track_alias: 5,
+                        params: Params {
+                            largest_object: objects.last().map(|o| o.location),
+                            ..Params::default()
+                        },
+                        properties: Bytes::new(),
+                    };
+                    send.write_all(&ok.encode(v)).await.unwrap();
+                    let done = Message::PublishDone {
+                        status: super::error::DoneCode::TrackEnded as u64,
+                        stream_count: 0,
+                        reason: "the track is complete".into(),
+                    };
+                    send.write_all(&done.encode(v)).await.unwrap();
+                    let _ = send.finish();
+                }
+                Message::Fetch(req) => {
+                    let (start, end) = req
+                        .params
+                        .location_filter
+                        .expect("a range")
+                        .bounds(objects.last().map(|o| o.location));
+                    let end = end.expect("an end");
+                    let ok = Message::RequestOk {
+                        params: Params::default(),
+                        properties: Bytes::new(),
+                    };
+                    send.write_all(&ok.encode(v)).await.unwrap();
+                    let mut out = conn.open_uni().await.unwrap();
+                    let mut buf = Vec::new();
+                    put_vi64(&mut buf, STREAM_FETCH_HEADER);
+                    put_vi64(&mut buf, req.request_id);
+                    let mut state = FetchState::default();
+                    for o in objects
+                        .iter()
+                        .filter(|o| start <= o.location && o.location <= end)
+                    {
+                        state.encode(
+                            &mut buf,
+                            &FetchEntry::Object(o.clone()),
+                            GroupOrder::Ascending,
+                            v,
+                        );
+                    }
+                    out.write_all(&buf).await.unwrap();
+                    let _ = out.finish();
+                    let _ = send.finish();
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+/// FETCH `start..=end` of `t` at the relay: the payloads, in order, of every
+/// entry, an End of Range as its kind.
+async fn fetch_all(
+    server: &quinn::Endpoint,
+    cert: &[u8],
+    v: Version,
+    t: &TrackName,
+    start: Location,
+    end: Location,
+) -> Vec<Result<Bytes, String>> {
+    let mut fetcher = Client::connect(server, cert, v, Setup::default()).await;
+    let id = fetcher.id();
+    let (_fs, _fr, kind, _) = fetcher
+        .request(Message::Fetch(TrackRequest {
+            request_id: id,
+            track: t.clone(),
+            params: Params {
+                location_filter: Some(LocationFilter::AbsoluteRange { start, end }),
+                ..Params::default()
+            },
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+    let recv = tokio::time::timeout(WAIT, fetcher.conn.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut r = BufReader::new(recv);
+    assert_eq!(read_vi64(&mut r).await.unwrap(), Some(STREAM_FETCH_HEADER));
+    assert_eq!(read_vi64(&mut r).await.unwrap(), Some(id));
+    let mut state = FetchState::default();
+    let mut entries = Vec::new();
+    while let Some(e) =
+        tokio::time::timeout(WAIT, state.read(&mut r, GroupOrder::Ascending, v, 1 << 20))
+            .await
+            .unwrap()
+            .unwrap()
+    {
+        entries.push(match e {
+            FetchEntry::Object(o) => Ok(o.payload),
+            other => Err(format!("{other:?}")),
+        });
+    }
+    entries
+}
+
+/// A FETCH past what the relay has cached of a finished track is filled
+/// from the publisher that advertised its namespace, though the relay's
+/// subscription to the track has ended: /music/'s songs came back with
+/// every group the cache lacked marked Unknown, once each song's first
+/// group was cached and its upstream subscription had ended (0.22.1).
+#[tokio::test]
+async fn a_fetch_past_the_cache_is_filled_by_the_namespace_s_publisher() {
+    let (server, moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let t = track();
+    let mut publisher = Client::connect(&server, &cert, v, Setup::default()).await;
+    let id = publisher.id();
+    let (_ps, _pr, kind, _) = publisher
+        .request(Message::PublishNamespace(PrefixRequest {
+            request_id: id,
+            prefix: t.namespace.clone(),
+            params: Params {
+                auth_tokens: vec![token_for(&t.namespace)],
+                ..Params::default()
+            },
+        }))
+        .await;
+    assert_eq!(kind, message::REQUEST_OK);
+    const PAYLOADS: [&[u8]; 9] = [
+        b"a0", b"a1", b"a2", b"b0", b"b1", b"b2", b"c0", b"c1", b"c2",
+    ];
+    let objects: Vec<Object> = PAYLOADS
+        .iter()
+        .enumerate()
+        .map(|(i, p)| object(i as u64 / 3, i as u64 % 3, p))
+        .collect();
+    let serving = tokio::spawn(serve_finished_track(
+        publisher.conn.clone(),
+        v,
+        objects.clone(),
+    ));
+
+    // The first group: the relay learns the track and caches it
+    let first = fetch_all(
+        &server,
+        &cert,
+        v,
+        &t,
+        Location::new(0, 0),
+        Location::new(0, 2),
+    )
+    .await;
+    assert_eq!(
+        first,
+        PAYLOADS[..3]
+            .iter()
+            .map(|p| Ok(Bytes::from_static(p)))
+            .collect::<Vec<_>>()
+    );
+    // The upstream subscription has ended with the track
+    let tracked = moq.relay.existing(&t).expect("the relay knows the track");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while tracked.has_publisher() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the subscription ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The whole track: the cached group, and the rest from the publisher
+    let all = fetch_all(
+        &server,
+        &cert,
+        v,
+        &t,
+        Location::new(0, 0),
+        Location::new(2, 2),
+    )
+    .await;
+    assert_eq!(
+        all,
+        PAYLOADS
+            .iter()
+            .map(|p| Ok(Bytes::from_static(p)))
+            .collect::<Vec<_>>(),
+        "every object, none marked Unknown"
+    );
+    serving.abort();
+}
+
 #[tokio::test]
 async fn an_edge_relay_serves_the_origin_s_tracks() {
     let (origin, _o, _oa, origin_cert) = relay().await;

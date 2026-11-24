@@ -183,6 +183,22 @@ impl NamespacePublisher for UpstreamPublisher {
         })
     }
 
+    fn fetch_through(
+        &self,
+        track: super::codec::TrackName,
+        start: super::codec::Location,
+        end: super::codec::Location,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'static, Option<tokio::sync::mpsc::Receiver<super::data::FetchEntry>>> {
+        let link = Arc::clone(&self.0);
+        Box::pin(async move {
+            link.session()
+                .await
+                .ok()?
+                .fetch_upstream(track, start, end, timeout)
+        })
+    }
+
     fn session_id(&self) -> u64 {
         // Not a session of this relay's: its advertisement is never withdrawn
         // with one
