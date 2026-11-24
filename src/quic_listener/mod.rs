@@ -2551,7 +2551,7 @@ mod pending_read_tests {
     /// its SETUP on the way (2026-11-24).
     #[tokio::test]
     async fn a_pending_read_gives_back_the_stream_and_its_data() {
-        use h3::quic::{Connection as _, RecvStream as _};
+        use h3::quic::RecvStream as _;
 
         let throwaway = throwaway_cert();
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
