@@ -5,9 +5,7 @@
 
 ### Bug Fixes
 
-* **moq:** a session's cleanup runs however it ends, a WebTransport session's end is its own, and each session ends with one log line ([2f2d91b](https://github.com/PQCrypta/pqcrypta-proxy/commit/2f2d91bf0f4e2ee306d355a7f6ed6fd230f747c2))
-* **moq:** a session's cleanup runs however it ends, a WebTransport session's end is its own, and each session ends with one log line ([b65bb76](https://github.com/PQCrypta/pqcrypta-proxy/commit/b65bb76dc86e13664c996b88d8f8b45ffef92f76))
-* **moq:** a session's cleanup runs however it ends, a WebTransport session's end is its own, and each session ends with one log line ([4cc6187](https://github.com/PQCrypta/pqcrypta-proxy/commit/4cc618751bf67c3ab0562b7f5ad5a5fd0dfde2d6))
+* **moq:** a session's cleanup runs however it ends, a WebTransport session's end is its own, and each session ends with one log line ([#284](https://github.com/PQCrypta/pqcrypta-proxy/pull/284))
 
 ## [0.21.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.0...v0.21.1) (2026-11-23)
 

@@ -522,13 +522,48 @@ fn deliver_wt_uni(
     use h3::quic::RecvStream as _;
     let feed = sessions.get(&session).filter(|feed| !feed.has_ended());
     match feed {
-        Some(feed) => match stream.into_inner() {
-            Some(recv) => feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv)),
-            None => debug!("WebTransport stream with a read in flight: dropped"),
+        Some(feed) => match stream.into_inner_or_pending() {
+            Ok(recv) => feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv)),
+            // h3 read past the header and the rest has not come: the stream
+            // goes to its session with that read's data once it does
+            Err(pending) => {
+                let feed = feed.clone();
+                tokio::spawn(async move {
+                    if let Some((prefix, recv)) = after_pending_read(prefix, pending).await {
+                        feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv));
+                    }
+                });
+            }
         },
         None => {
+            // No such session: refused, whether or not a read is pending
             stream.stop_sending(u64::from(crate::wt_session::WT_BUFFERED_STREAM_REJECTED));
             sessions.remove(&session);
+        }
+    }
+}
+
+/// A WebTransport stream whose read h3 left pending: the stream, and what
+/// arrived before and with that read, once it completes; `None` where the
+/// peer reset it first.
+async fn after_pending_read(
+    prefix: Bytes,
+    pending: h3_quinn::PendingRead,
+) -> Option<(Bytes, quinn::RecvStream)> {
+    let (recv, read) = pending.await;
+    match read {
+        Ok(Some(more)) if prefix.is_empty() => Some((more, recv)),
+        Ok(Some(more)) => {
+            let mut joined = Vec::with_capacity(prefix.len() + more.len());
+            joined.extend_from_slice(&prefix);
+            joined.extend_from_slice(&more);
+            Some((Bytes::from(joined), recv))
+        }
+        // Finished: what arrived is all of it
+        Ok(None) => Some((prefix, recv)),
+        Err(e) => {
+            debug!("WebTransport stream ended before its first data: {}", e);
+            None
         }
     }
 }
@@ -551,11 +586,22 @@ fn deliver_wt_bi(
         sessions.remove(&session);
         return;
     };
-    match (send.into_inner(), recv.into_inner()) {
-        (Some(send), Some(recv)) => {
-            feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv));
+    let Some(send) = send.into_inner() else {
+        // Nothing has been written to a stream the peer just opened
+        debug!("WebTransport stream with a write in flight: dropped");
+        return;
+    };
+    match recv.into_inner_or_pending() {
+        Ok(recv) => feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv)),
+        // As deliver_wt_uni: the stream goes once its pending read completes
+        Err(pending) => {
+            let feed = feed.clone();
+            tokio::spawn(async move {
+                if let Some((prefix, recv)) = after_pending_read(prefix, pending).await {
+                    feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv));
+                }
+            });
         }
-        _ => debug!("WebTransport stream with I/O in flight: dropped"),
     }
 }
 
@@ -2488,6 +2534,83 @@ async fn application_protocol(
         .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
         .and_then(|d| d.protocol.clone());
     (protocol, Box::pin(std::future::ready(accepted)))
+}
+
+#[cfg(test)]
+mod pending_read_tests {
+    use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    /// A stream whose first data comes after its header: a read of it is
+    /// left pending, and into_inner_or_pending gives that read back, which
+    /// yields the stream and the data when it comes. into_inner gave None
+    /// there, and the listener dropped a browser's MoQ control stream with
+    /// its SETUP on the way (2026-11-24).
+    #[tokio::test]
+    async fn a_pending_read_gives_back_the_stream_and_its_data() {
+        use h3::quic::RecvStream as _;
+
+        let throwaway = throwaway_cert();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("QUIC server"),
+            )),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("a server port");
+        let addr = server.local_addr().expect("its address");
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTo(throwaway.der.clone(), provider)))
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let client = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        )));
+        let (client_conn, server_conn) = tokio::join!(
+            async { client.connect(addr, "localhost").unwrap().await.unwrap() },
+            async { server.accept().await.unwrap().await.unwrap() }
+        );
+
+        // The header's worth first, the rest later
+        let mut send = client_conn.open_uni().await.unwrap();
+        send.write_all(b"h").await.unwrap();
+        let mut h3conn = h3_quinn::Connection::new(server_conn);
+        let mut recv = std::future::poll_fn(|cx| {
+            h3::quic::Connection::<bytes::Bytes>::poll_accept_recv(&mut h3conn, cx)
+        })
+        .await
+        .unwrap();
+        let first = std::future::poll_fn(|cx| recv.poll_data(cx))
+            .await
+            .unwrap()
+            .expect("the first byte");
+        assert_eq!(&first[..], b"h");
+        // Read on past it: nothing yet, so the read is left pending
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(recv.poll_data(&mut cx), Poll::Pending));
+        let Err(pending) = recv.into_inner_or_pending() else {
+            panic!("the stream is inside its pending read");
+        };
+        send.write_all(b"ello").await.unwrap();
+        let (_stream, read) = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("the read completes");
+        assert_eq!(&read.unwrap().expect("data")[..], b"ello");
+    }
 }
 
 #[cfg(test)]

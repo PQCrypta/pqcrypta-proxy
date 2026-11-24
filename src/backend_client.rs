@@ -101,8 +101,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub enum BackendBody {
     /// HTTP/1.1 or HTTP/2 (hyper)
     Hyper(Incoming),
-    /// HTTP/3
-    H3(H3Body),
+    /// HTTP/3, boxed: its stream state is several times hyper's body
+    H3(Box<H3Body>),
 }
 
 impl Body for BackendBody {
@@ -117,7 +117,7 @@ impl Body for BackendBody {
             Self::Hyper(body) => std::pin::Pin::new(body)
                 .poll_frame(cx)
                 .map(|f| f.map(|r| r.map_err(Into::into))),
-            Self::H3(body) => std::pin::Pin::new(body).poll_frame(cx),
+            Self::H3(body) => std::pin::Pin::new(body.as_mut()).poll_frame(cx),
         }
     }
 
@@ -1111,12 +1111,12 @@ where
         match response_side.recv_response().await {
             Ok(resp) => Ok((
                 resp.map(|()| {
-                    BackendBody::H3(H3Body {
+                    BackendBody::H3(Box::new(H3Body {
                         recv: response_side,
                         data_done: false,
                         done: false,
                         upload,
-                    })
+                    }))
                 }),
                 Lease {
                     tx: None,
