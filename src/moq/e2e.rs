@@ -803,6 +803,26 @@ async fn a_session_dropped_part_way_is_still_ended() {
     assert_eq!(moq.snapshot().sessions_open, 0, "and counted out");
 }
 
+/// A peer that ends its session (here its whole connection) takes its
+/// control stream with it: that is the session's end, not the
+/// CLOSED_CONTROL_STREAM error, and no session error is counted
+#[tokio::test]
+async fn a_session_that_ends_is_no_closed_control_stream_error() {
+    let (server, moq, _accept, cert) = relay().await;
+    let c = Client::connect(&server, &cert, Version::Draft23, Setup::default()).await;
+    assert_eq!(moq.snapshot().sessions_open, 1);
+    c.conn.close(0u32.into(), b"done");
+    for _ in 0..100 {
+        if moq.snapshot().sessions_open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let s = moq.snapshot();
+    assert_eq!(s.sessions_open, 0, "the session ended");
+    assert_eq!(s.session_errors, 0, "and not as a session error");
+}
+
 #[tokio::test]
 async fn a_second_control_stream_and_an_unknown_stream_type_close_the_session() {
     let (server, _moq, _accept, cert) = relay().await;

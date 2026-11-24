@@ -396,6 +396,18 @@ impl<T: Transport> Session<T> {
         // `_ended` cleans up, here or wherever this future is dropped
     }
 
+    /// Whether the session's transport ends within two round trips (at least
+    /// 50 ms, at most a second). A control stream that ends with its session
+    /// (WT_CLOSE_SESSION, CONNECTION_CLOSE, a lost connection) is the
+    /// session's end, not the CLOSED_CONTROL_STREAM error, which is for a
+    /// peer that closes its control stream and goes on; the two arrive
+    /// together, in either order.
+    async fn ends_within_a_round_trip(&self) -> bool {
+        let rtt = self.t.quic().rtt(quinn::PathId::ZERO).unwrap_or_default();
+        let grace = (rtt * 2).clamp(Duration::from_millis(50), Duration::from_secs(1));
+        tokio::time::timeout(grace, self.t.closed()).await.is_ok()
+    }
+
     /// The first cause of the session's end, kept for its summary.
     fn note_end(&self, how: impl Into<String>) {
         self.ended_by
@@ -670,7 +682,7 @@ impl<T: Transport> Session<T> {
                     ));
                 }
                 Ok(None) | Err(FrameError::Io(_)) => {
-                    if self.closing.is_cancelled() {
+                    if self.closing.is_cancelled() || self.ends_within_a_round_trip().await {
                         return Ok(());
                     }
                     return Err(SessionError::new(
