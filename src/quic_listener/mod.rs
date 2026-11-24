@@ -1905,12 +1905,11 @@ impl QuicListener {
                         method, path, remote_addr, host, protocol_ext
                     );
 
-                    // Check for WebTransport CONNECT (RFC 9220)
-                    // WebTransport uses Extended CONNECT with :protocol = webtransport
+                    // WebTransport: extended CONNECT whose :protocol is
+                    // `webtransport-h3` (draft-ietf-webtrans-http3-17
+                    // section 3.2) or the earlier drafts' `webtransport`
                     let is_webtransport = method == http::Method::CONNECT
-                        && protocol_ext
-                            .map(|p| p == &Protocol::WEB_TRANSPORT)
-                            .unwrap_or(false);
+                        && protocol_ext.is_some_and(Protocol::is_webtransport);
 
                     // RFC 9220: WebSocket over HTTP/3 uses Extended CONNECT with :protocol = websocket
                     let is_ws_h3 = method == http::Method::CONNECT

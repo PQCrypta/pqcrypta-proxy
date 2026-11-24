@@ -918,6 +918,24 @@ where
                         }
                     }
 
+                    //= draft-ietf-webtrans-http3-17 section 3.1
+                    //# Clients MUST treat values greater than "1" as a
+                    //# connection error of type H3_SETTINGS_ERROR.
+                    // (A client's own value has no meaning to a server, which
+                    // ignores it.)
+                    if self.shared_state().is_client() {
+                        if let Some(value) = settings.get(frame::SettingId::WT_ENABLED) {
+                            if value > 1 {
+                                return Poll::Ready(Err(self.handle_connection_error(
+                                    InternalConnectionError::new(
+                                        Code::H3_SETTINGS_ERROR,
+                                        format!("SETTINGS_WT_ENABLED carries {value}"),
+                                    ),
+                                )));
+                            }
+                        }
+                    }
+
                     self.got_peer_settings = true;
                     self.set_settings((&settings).into());
 

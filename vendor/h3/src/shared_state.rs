@@ -18,6 +18,10 @@ use crate::{config::Settings, error::internal_error::ErrorOrigin};
 pub struct SharedState {
     /// The settings, sent by the peer
     settings: OnceLock<Settings>,
+    /// Becomes true when the peer's settings arrive, for whoever waits on
+    /// them (WebTransport draft 17 section 3.1: a server processes no
+    /// WebTransport request before the client's SETTINGS)
+    settings_arrived: tokio::sync::watch::Sender<bool>,
     /// The connection error
     connection_error: OnceLock<ErrorOrigin>,
     /// The connection is closing
@@ -125,6 +129,20 @@ impl SharedState {
         Some(field)
     }
     /// Mark this state as belonging to a client endpoint.
+    /// The peer's settings, once they have arrived
+    pub(crate) fn peer_settings(&self) -> Option<Settings> {
+        self.settings.get().copied()
+    }
+
+    /// Resolves when the peer's settings have arrived, or at once if they
+    /// have; it stays pending on a connection that ends before them
+    pub(crate) fn peer_settings_arrived(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let mut arrived = self.settings_arrived.subscribe();
+        async move {
+            let _ = arrived.wait_for(|a| *a).await;
+        }
+    }
+
     pub(crate) fn set_is_client(&self) {
         self.is_client
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -227,6 +245,7 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             settings: OnceLock::new(),
+            settings_arrived: tokio::sync::watch::channel(false).0,
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
@@ -309,6 +328,7 @@ pub trait ConnectionState {
     /// Set the settings
     fn set_settings(&self, settings: Settings) {
         let _ = self.shared_state().settings.set(settings);
+        self.shared_state().settings_arrived.send_replace(true);
     }
 
     /// Returns the waker for the connection

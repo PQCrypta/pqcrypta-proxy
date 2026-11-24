@@ -82,6 +82,51 @@ pub struct Settings {
     pub(crate) qpack_blocked_streams: u64,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
+    /// SETTINGS_WT_ENABLED (draft-ietf-webtrans-http3-17 section 3.1): a
+    /// server's support for WebTransport, and a client's for draft 17
+    pub(crate) wt_enabled: bool,
+    /// SETTINGS_WT_INITIAL_MAX_STREAMS_UNI (section 5.6.2); 0 is not sent
+    pub(crate) wt_initial_max_streams_uni: u64,
+    /// SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI (section 5.6.2); 0 is not sent
+    pub(crate) wt_initial_max_streams_bidi: u64,
+    /// SETTINGS_WT_INITIAL_MAX_DATA (section 5.6.4); 0 is not sent
+    pub(crate) wt_initial_max_data: u64,
+}
+
+impl Settings {
+    /// SETTINGS_WT_ENABLED: support for draft-ietf-webtrans-http3-17
+    pub fn wt_enabled(&self) -> bool {
+        self.wt_enabled
+    }
+
+    /// SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, 0 where absent
+    pub fn wt_initial_max_streams_uni(&self) -> u64 {
+        self.wt_initial_max_streams_uni
+    }
+
+    /// SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, 0 where absent
+    pub fn wt_initial_max_streams_bidi(&self) -> u64 {
+        self.wt_initial_max_streams_bidi
+    }
+
+    /// SETTINGS_WT_INITIAL_MAX_DATA, 0 where absent
+    pub fn wt_initial_max_data(&self) -> u64 {
+        self.wt_initial_max_data
+    }
+
+    /// Whether these settings declare the intent to use WebTransport flow
+    /// control: any initial limit other than 0 (section 5.1). Flow control
+    /// is on when both ends' settings do.
+    pub fn wt_flow_control(&self) -> bool {
+        self.wt_initial_max_streams_uni != 0
+            || self.wt_initial_max_streams_bidi != 0
+            || self.wt_initial_max_data != 0
+    }
+
+    /// SETTINGS_WEBTRANSPORT_MAX_SESSIONS (the earlier drafts), 0 where absent
+    pub fn max_webtransport_sessions(&self) -> u64 {
+        self.max_webtransport_sessions
+    }
 }
 
 impl From<&frame::Settings> for Settings {
@@ -112,6 +157,19 @@ impl From<&frame::Settings> for Settings {
                 .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                 .map(|value| value != 0)
                 .unwrap_or(defaults.enable_extended_connect),
+            wt_enabled: settings
+                .get(frame::SettingId::WT_ENABLED)
+                .map(|value| value != 0)
+                .unwrap_or(defaults.wt_enabled),
+            wt_initial_max_streams_uni: settings
+                .get(frame::SettingId::WT_INITIAL_MAX_STREAMS_UNI)
+                .unwrap_or(defaults.wt_initial_max_streams_uni),
+            wt_initial_max_streams_bidi: settings
+                .get(frame::SettingId::WT_INITIAL_MAX_STREAMS_BIDI)
+                .unwrap_or(defaults.wt_initial_max_streams_bidi),
+            wt_initial_max_data: settings
+                .get(frame::SettingId::WT_INITIAL_MAX_DATA)
+                .unwrap_or(defaults.wt_initial_max_data),
         }
     }
 }
@@ -134,6 +192,10 @@ impl TryFrom<Config> for frame::Settings {
                     max_webtransport_sessions,
                     qpack_max_table_capacity,
                     qpack_blocked_streams,
+                    wt_enabled,
+                    wt_initial_max_streams_uni,
+                    wt_initial_max_streams_bidi,
+                    wt_initial_max_data,
                 },
         } = value;
 
@@ -186,6 +248,25 @@ impl TryFrom<Config> for frame::Settings {
             frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
             max_webtransport_sessions,
         )?;
+        if wt_enabled {
+            settings.insert(frame::SettingId::WT_ENABLED, 1)?;
+        }
+        // An absent limit is 0 (section 5.6); a 0 is not spent on the wire
+        for (id, value) in [
+            (
+                frame::SettingId::WT_INITIAL_MAX_STREAMS_UNI,
+                wt_initial_max_streams_uni,
+            ),
+            (
+                frame::SettingId::WT_INITIAL_MAX_STREAMS_BIDI,
+                wt_initial_max_streams_bidi,
+            ),
+            (frame::SettingId::WT_INITIAL_MAX_DATA, wt_initial_max_data),
+        ] {
+            if value != 0 {
+                settings.insert(id, value)?;
+            }
+        }
 
         Ok(settings)
     }
@@ -201,6 +282,10 @@ impl Default for Settings {
             qpack_max_table_capacity: 0,
             qpack_blocked_streams: 0,
             max_webtransport_sessions: 0,
+            wt_enabled: false,
+            wt_initial_max_streams_uni: 0,
+            wt_initial_max_streams_bidi: 0,
+            wt_initial_max_data: 0,
         }
     }
 }

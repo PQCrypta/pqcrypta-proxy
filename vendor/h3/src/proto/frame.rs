@@ -561,7 +561,11 @@ impl SettingId {
                 | SettingId::ENABLE_CONNECT_PROTOCOL
                 | SettingId::ENABLE_WEBTRANSPORT
                 | SettingId::WEBTRANSPORT_MAX_SESSIONS
-                | SettingId::H3_DATAGRAM,
+                | SettingId::H3_DATAGRAM
+                | SettingId::WT_ENABLED
+                | SettingId::WT_INITIAL_MAX_STREAMS_UNI
+                | SettingId::WT_INITIAL_MAX_STREAMS_BIDI
+                | SettingId::WT_INITIAL_MAX_DATA,
         )
     }
 
@@ -618,6 +622,14 @@ setting_identifiers! {
     // computing a session limit, serialising it, and putting it somewhere no
     // client reads.
     WEBTRANSPORT_MAX_SESSIONS = 0xc671706a,
+
+    // draft-ietf-webtrans-http3-17 section 9.2: WebTransport support (a
+    // server's; a client sends it to name its draft, section 3.1), and the
+    // initial per-session flow control limits (section 5.6)
+    WT_ENABLED = 0x20b8933b,
+    WT_INITIAL_MAX_STREAMS_UNI = 0x2b64,
+    WT_INITIAL_MAX_STREAMS_BIDI = 0x2b65,
+    WT_INITIAL_MAX_DATA = 0x2b61,
 }
 
 /// How many settings one SETTINGS frame can carry.
@@ -630,8 +642,9 @@ setting_identifiers! {
 /// `Settings::try_from` fails, and the call site turns that into an internal
 /// error whose own comment says it should be impossible.
 ///
-/// Room to spare rather than exactly enough, for the same reason.
-const SETTINGS_LEN: usize = 12;
+/// Room to spare rather than exactly enough, for the same reason: twelve was
+/// exactly enough once WebTransport draft 17's four settings were added.
+const SETTINGS_LEN: usize = 16;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {

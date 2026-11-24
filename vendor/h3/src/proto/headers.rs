@@ -489,7 +489,7 @@ impl Pseudo {
         //
         // See: [https://www.rfc-editor.org/rfc/rfc8441#section-4]
         let protocol = if method == Method::CONNECT {
-            ext.get::<Protocol>().copied()
+            ext.get::<Protocol>().cloned()
         } else {
             None
         };
