@@ -3511,3 +3511,303 @@ mod connect_parity_tests {
         );
     }
 }
+
+/// The whole QUIC listener on a loopback port, as a node runs it (its
+/// connection loop included), and clients against it: the draft-17
+/// WebTransport rules the loop applies to a connection.
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use crate::conformance::zero_rtt::PinnedTo;
+    use std::net::Ipv4Addr;
+
+    /// A listener on 127.0.0.1 with a throwaway certificate and `[moq]` on;
+    /// the certificate's DER, for the client to pin, and the sender that
+    /// stops it
+    async fn listener() -> (SocketAddr, Vec<u8>, mpsc::Sender<()>) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "pqcrypta-listener-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The resolver reads <domain>.crt and <domain>.key pairs
+        std::fs::write(dir.join("localhost.crt"), cert.cert.pem()).unwrap();
+        std::fs::write(dir.join("localhost.key"), cert.signing_key.serialize_pem()).unwrap();
+        let mut config = ProxyConfig::default();
+        config.server.bind_address = "127.0.0.1".into();
+        config.server.udp_port = 0;
+        config.tls.cert_path = dir.join("localhost.crt");
+        config.tls.key_path = dir.join("localhost.key");
+        config.moq.enabled = true;
+        let tls = Arc::new(
+            TlsProvider::new(
+                &config.tls,
+                &config.pqc,
+                config.client_auth(),
+                config.quic_applications(),
+            )
+            .unwrap(),
+        );
+        let (stop, stop_rx) = mpsc::channel(1);
+        let (_reload, reload_rx) = mpsc::channel(8);
+        let listener = QuicListener::new(
+            Arc::new(config.clone()),
+            tls,
+            stop_rx,
+            reload_rx,
+            Arc::new(MetricsRegistry::new()),
+            Arc::new(SecurityState::new(&config)),
+            Arc::new(AdvancedRateLimiter::new(
+                config.advanced_rate_limiting.clone(),
+            )),
+            Arc::new(LoadBalancer::new(Arc::new(config.load_balancer.clone()))),
+            crate::cache::shared(&config.cache),
+            Arc::new(EarlyHintsState::from_http3_config(&config.http3)),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(listener.run());
+        (addr, cert.cert.der().to_vec(), stop)
+    }
+
+    /// A QUIC connection to the listener, ALPN h3
+    async fn connect(addr: SocketAddr, der: &[u8]) -> (quinn::Connection, quinn::Endpoint) {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTo(der.to_vec().into(), provider)))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )));
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        (conn, endpoint)
+    }
+
+    /// A WebTransport CONNECT to the relay's entrance, draft 17's token
+    fn wt_connect() -> http::Request<()> {
+        let mut r = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://localhost/moq")
+            .header("wt-available-protocols", "\"moqt-23\"")
+            .body(())
+            .unwrap();
+        r.extensions_mut().insert(Protocol::WEB_TRANSPORT_H3);
+        r
+    }
+
+    /// Draft-ietf-webtrans-http3-17 section 5.1: a draft-17 client that
+    /// declares no flow control has one session per connection; a second
+    /// CONNECT while it lasts is reset with H3_REQUEST_REJECTED, and once it
+    /// has ended, another is served.
+    #[tokio::test]
+    async fn a_second_session_without_flow_control_is_rejected() {
+        let (addr, der, _stop) = listener().await;
+        let (conn, _endpoint) = connect(addr, &der).await;
+        let (mut driver, mut send) = h3::client::builder()
+            .enable_extended_connect(true)
+            .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let wait = Duration::from_secs(5);
+        let mut first = send.send_request(wt_connect()).await.unwrap();
+        let response = tokio::time::timeout(wait, first.recv_response())
+            .await
+            .expect("the first session's answer")
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut second = send.send_request(wt_connect()).await.unwrap();
+        let refused = tokio::time::timeout(wait, second.recv_response())
+            .await
+            .expect("the second session's answer");
+        let error = refused.expect_err("a second session is not served");
+        assert!(
+            format!("{error:?}").contains("H3_REQUEST_REJECTED"),
+            "reset with H3_REQUEST_REJECTED: {error:?}"
+        );
+
+        // The first ended (its CONNECT stream finished): another is served
+        first.finish().await.unwrap();
+        drop(first);
+        let mut third = None;
+        for _ in 0..20 {
+            let mut s = send.send_request(wt_connect()).await.unwrap();
+            if let Ok(Ok(r)) = tokio::time::timeout(wait, s.recv_response()).await {
+                third = Some((r.status(), s));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            third.map(|(status, _)| status),
+            Some(http::StatusCode::OK),
+            "a session once the first has ended"
+        );
+    }
+
+    /// A QPACK string literal of `s` (RFC 9204 section 4.1.2), its length on
+    /// `prefix` bits (at most 7) with `flags` above them, no Huffman coding
+    fn qpack_string(out: &mut Vec<u8>, flags: u8, prefix: u32, s: &[u8]) {
+        let max = (1u8 << prefix) - 1;
+        match u8::try_from(s.len()) {
+            Ok(n) if n < max => out.push(flags | n),
+            _ => {
+                out.push(flags | max);
+                let mut rest = s.len() - usize::from(max);
+                while rest >= 128 {
+                    out.push(u8::try_from(rest % 128).expect("below 128") | 0x80);
+                    rest /= 128;
+                }
+                out.push(u8::try_from(rest).expect("below 128"));
+            }
+        }
+        out.extend_from_slice(s);
+    }
+
+    /// A QUIC varint (RFC 9000 section 16), in its fewest bytes
+    fn varint(out: &mut Vec<u8>, v: u64) {
+        if let Ok(b) = u8::try_from(v)
+            .map_err(drop)
+            .and_then(|b| if b < 64 { Ok(b) } else { Err(()) })
+        {
+            out.push(b);
+        } else if let Ok(w) =
+            u16::try_from(v)
+                .map_err(drop)
+                .and_then(|w| if w < 0x4000 { Ok(w) } else { Err(()) })
+        {
+            out.extend_from_slice(&(w | 0x4000).to_be_bytes());
+        } else if let Ok(w) =
+            u32::try_from(v)
+                .map_err(drop)
+                .and_then(|w| if w < 0x4000_0000 { Ok(w) } else { Err(()) })
+        {
+            out.extend_from_slice(&(w | 0x8000_0000).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(v | 0xc000_0000_0000_0000).to_be_bytes());
+        }
+    }
+
+    /// The payload of the first HEADERS frame in `bytes`, once it is whole;
+    /// frames of other types before it are passed over
+    fn first_headers(bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut at = 0;
+        loop {
+            let (kind, n) = read_varint(bytes.get(at..)?)?;
+            at += n;
+            let (len, n) = read_varint(bytes.get(at..)?)?;
+            at += n;
+            let payload = bytes.get(at..at + usize::try_from(len).ok()?)?;
+            at += payload.len();
+            if kind == 0x01 {
+                return Some(payload.to_vec());
+            }
+        }
+    }
+
+    /// A QUIC varint at the start of `b`, and its length
+    fn read_varint(b: &[u8]) -> Option<(u64, usize)> {
+        let first = *b.first()?;
+        let len = 1usize << (first >> 6);
+        let bytes = b.get(..len)?;
+        let mut v = u64::from(first & 0x3f);
+        for byte in &bytes[1..] {
+            v = (v << 8) | u64::from(*byte);
+        }
+        Some((v, len))
+    }
+
+    /// Draft-ietf-webtrans-http3-17 section 3.1: a server processes no
+    /// WebTransport request before the client's SETTINGS. A CONNECT sent
+    /// before them is held (no answer while they have not come), and served
+    /// once they arrive.
+    #[tokio::test]
+    async fn a_webtransport_request_waits_for_the_client_s_settings() {
+        let (addr, der, _stop) = listener().await;
+        let (conn, _endpoint) = connect(addr, &der).await;
+        // The CONNECT's field section (RFC 9204): no dynamic table; :method
+        // CONNECT and :scheme https from the static table (15, 23),
+        // :authority and :path by static name (0, 1), the rest literal
+        // (an indexed static field line is 0xc0 | its index: 0xcf, 0xd7)
+        let mut fields = vec![0x00, 0x00, 0xcf, 0xd7];
+        fields.push(0x50);
+        qpack_string(&mut fields, 0, 7, b"localhost");
+        fields.push(0x51);
+        qpack_string(&mut fields, 0, 7, b"/moq");
+        for (name, value) in [
+            (&b":protocol"[..], &b"webtransport-h3"[..]),
+            (b"wt-available-protocols", b"\"moqt-23\""),
+        ] {
+            qpack_string(&mut fields, 0x20, 3, name);
+            qpack_string(&mut fields, 0, 7, value);
+        }
+        let mut headers = Vec::new();
+        varint(&mut headers, 0x01);
+        varint(&mut headers, fields.len() as u64);
+        headers.extend_from_slice(&fields);
+        let (mut req_send, mut req_recv) = conn.open_bi().await.unwrap();
+        req_send.write_all(&headers).await.unwrap();
+
+        // No SETTINGS yet: no answer
+        let mut first = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), req_recv.read(&mut first))
+                .await
+                .is_err(),
+            "a WebTransport request answered before the client's SETTINGS"
+        );
+
+        // The control stream and its SETTINGS: SETTINGS_H3_DATAGRAM 1,
+        // SETTINGS_WT_ENABLED 1
+        let mut settings = Vec::new();
+        for (id, value) in [(0x33u64, 1u64), (0x20b8_933b, 1)] {
+            varint(&mut settings, id);
+            varint(&mut settings, value);
+        }
+        let mut control = Vec::new();
+        varint(&mut control, 0x00);
+        varint(&mut control, 0x04);
+        varint(&mut control, settings.len() as u64);
+        control.extend_from_slice(&settings);
+        let mut control_stream = conn.open_uni().await.unwrap();
+        control_stream.write_all(&control).await.unwrap();
+
+        // Now the answer: its HEADERS frame (frames of unknown types, such
+        // as GREASE, skipped: RFC 9114 section 9), whose field section's
+        // first line is :status 200 from the static table (index 25)
+        let mut answer = Vec::new();
+        let headers = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 512];
+            loop {
+                if let Some(fields) = first_headers(&answer) {
+                    return fields;
+                }
+                let n = req_recv.read(&mut buf).await.unwrap().unwrap_or(0);
+                assert!(n > 0, "the stream ended with no HEADERS: {answer:02x?}");
+                answer.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("no answer once the SETTINGS came");
+        // The two-byte field section prefix, then :status 200
+        assert_eq!(
+            headers.get(2),
+            // 0xc0 | 25
+            Some(&0xd9),
+            ":status 200: {headers:02x?}"
+        );
+        drop(control_stream);
+    }
+}
