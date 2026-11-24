@@ -24,6 +24,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::wt_flow::{Capsule, CapsuleReader, Flow, FlowError, StreamSlot};
+
 /// The session has ended: no more streams or datagrams come from it.
 #[derive(Debug, Clone)]
 pub struct WtClosed(pub String);
@@ -301,10 +303,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
 pub struct H3Session {
     session_id: u64,
     connection: quinn::Connection,
-    bi: Mutex<mpsc::Receiver<(quinn::SendStream, Prefixed<quinn::RecvStream>)>>,
-    uni: Mutex<mpsc::Receiver<Prefixed<quinn::RecvStream>>>,
+    bi: Mutex<mpsc::Receiver<(H3Send, H3Recv)>>,
+    uni: Mutex<mpsc::Receiver<H3Recv>>,
     datagrams: Mutex<mpsc::Receiver<Bytes>>,
     ended: CancellationToken,
+    /// Its flow control (draft-ietf-webtrans-http3-17 section 5)
+    flow: Arc<Flow>,
     /// Where a close goes: the task holding the CONNECT stream writes the
     /// WT_CLOSE_SESSION capsule there
     closer: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<(u32, String)>>>,
@@ -314,17 +318,137 @@ pub struct H3Session {
 /// session's streams and datagrams.
 #[derive(Clone)]
 pub struct H3SessionFeed {
-    bi: mpsc::Sender<(quinn::SendStream, Prefixed<quinn::RecvStream>)>,
-    uni: mpsc::Sender<Prefixed<quinn::RecvStream>>,
+    session_id: u64,
+    bi: mpsc::Sender<(H3Send, H3Recv)>,
+    uni: mpsc::Sender<H3Recv>,
     datagrams: mpsc::Sender<Bytes>,
     ended: CancellationToken,
+    flow: Arc<Flow>,
+}
+
+/// The WebTransport stream header a peer's stream begins with: its signal
+/// value (two bytes as a varint, 0x54 or 0x41) and the session ID. QUIC's
+/// final size counts it; the session's data limit does not (section 5.6.4).
+const fn peer_header_len(session_id: u64) -> u64 {
+    2 + match session_id {
+        0..=0x3f => 1,
+        0x40..=0x3fff => 2,
+        0x4000..=0x3fff_ffff => 4,
+        _ => 8,
+    }
+}
+
+/// A WebTransport stream's sending half on the HTTP/3 port: its writes held
+/// to the session's flow control (section 5.6.4), and reset with
+/// WT_SESSION_GONE if it outlives the session (section 6).
+pub struct H3Send {
+    inner: quinn::SendStream,
+    flow: Arc<Flow>,
+    ended: CancellationToken,
+    /// The peer's stream it is half of, counted until both halves are done
+    _slot: Option<StreamSlot>,
+}
+
+/// A WebTransport stream's receiving half on the HTTP/3 port: what it reads
+/// counted against the session's data limit, a reset stream's final size
+/// included (section 5.4), and stopped with WT_SESSION_GONE if it outlives
+/// the session (section 6).
+pub struct H3Recv {
+    inner: Prefixed<quinn::RecvStream>,
+    flow: Arc<Flow>,
+    ended: CancellationToken,
+    /// The stream header's length where the peer opened it, 0 otherwise
+    header: u64,
+    /// Stream Body counted so far
+    read: u64,
+    _slot: Option<StreamSlot>,
+}
+
+impl AsyncWrite for H3Send {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let room = match this.flow.reserve(buf.len(), cx) {
+            Poll::Ready(n) => n,
+            Poll::Pending => return Poll::Pending,
+        };
+        let written = Pin::new(&mut this.inner).poll_write(cx, &buf[..room]);
+        match &written {
+            Poll::Ready(Ok(n)) => this.flow.unreserve(room - n),
+            _ => this.flow.unreserve(room),
+        }
+        written
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for H3Send {
+    fn drop(&mut self) {
+        if self.ended.is_cancelled() {
+            let _ = self.inner.reset(quinn::VarInt::from_u32(WT_SESSION_GONE));
+        }
+    }
+}
+
+impl AsyncRead for H3Recv {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let read = Pin::new(&mut this.inner).poll_read(cx, buf);
+        let counted = match &read {
+            Poll::Ready(Ok(())) => (buf.filled().len() - before) as u64,
+            // A reset stream counts its final size, which the peer counted
+            // as sent, read or not (section 5.4)
+            Poll::Ready(Err(_)) => this
+                .inner
+                .inner
+                .reset_final_size()
+                .map_or(0, |size| size.saturating_sub(this.header + this.read)),
+            Poll::Pending => 0,
+        };
+        this.read += counted;
+        if let Err(e) = this.flow.peer_data(counted) {
+            this.flow.violate(e.clone());
+            return Poll::Ready(Err(std::io::Error::other(e.to_string())));
+        }
+        read
+    }
+}
+
+impl Drop for H3Recv {
+    fn drop(&mut self) {
+        if self.ended.is_cancelled() {
+            let _ = self
+                .inner
+                .inner
+                .stop(quinn::VarInt::from_u32(WT_SESSION_GONE));
+        }
+    }
 }
 
 impl H3Session {
     /// A session for the CONNECT that was stream `session_id` of
     /// `connection`, the feed the accept loop delivers to it through, and the
     /// receiver its datagrams are routed to.
-    pub fn new(session_id: u64, connection: quinn::Connection) -> (Arc<Self>, H3SessionFeed) {
+    pub fn new(
+        session_id: u64,
+        connection: quinn::Connection,
+        flow: Arc<Flow>,
+    ) -> (Arc<Self>, H3SessionFeed) {
         let (bi_tx, bi_rx) = mpsc::channel(STREAM_QUEUE);
         let (uni_tx, uni_rx) = mpsc::channel(STREAM_QUEUE);
         let (dg_tx, dg_rx) = mpsc::channel(DATAGRAM_QUEUE);
@@ -337,15 +461,32 @@ impl H3Session {
                 uni: Mutex::new(uni_rx),
                 datagrams: Mutex::new(dg_rx),
                 ended: ended.clone(),
+                flow: Arc::clone(&flow),
                 closer: std::sync::Mutex::new(None),
             }),
             H3SessionFeed {
+                session_id,
                 bi: bi_tx,
                 uni: uni_tx,
                 datagrams: dg_tx,
                 ended,
+                flow,
             },
         )
+    }
+
+    /// Its flow control.
+    pub fn flow(&self) -> &Arc<Flow> {
+        &self.flow
+    }
+
+    fn sending(&self, inner: quinn::SendStream, slot: Option<StreamSlot>) -> H3Send {
+        H3Send {
+            inner,
+            flow: Arc::clone(&self.flow),
+            ended: self.ended.clone(),
+            _slot: slot,
+        }
     }
 
     /// The Quarter Stream ID its datagrams carry (RFC 9297 section 2.1).
@@ -385,24 +526,73 @@ impl H3SessionFeed {
     }
 
     /// Hand a bidirectional stream to the session; refused with
-    /// WT_BUFFERED_STREAM_REJECTED when it cannot take one now.
-    pub fn deliver_bi(&self, send: quinn::SendStream, recv: Prefixed<quinn::RecvStream>) {
-        if let Err(e) = self.bi.try_send((send, recv)) {
+    /// WT_BUFFERED_STREAM_REJECTED when it cannot take one now, and the
+    /// session closed with WT_FLOW_CONTROL_ERROR when it is one more than the
+    /// peer may open (section 5.6.2).
+    pub fn deliver_bi(&self, mut send: quinn::SendStream, mut recv: Prefixed<quinn::RecvStream>) {
+        let slot = match self.flow.peer_opened(true) {
+            Ok(slot) => slot,
+            Err(e) => {
+                let code = quinn::VarInt::from_u32(WT_BUFFERED_STREAM_REJECTED);
+                let _ = send.reset(code);
+                let _ = recv.inner.stop(code);
+                self.flow.violate(e);
+                return;
+            }
+        };
+        let pair = (
+            H3Send {
+                inner: send,
+                flow: Arc::clone(&self.flow),
+                ended: self.ended.clone(),
+                _slot: Some(slot.clone()),
+            },
+            self.receiving(recv, peer_header_len(self.session_id), Some(slot)),
+        );
+        if let Err(e) = self.bi.try_send(pair) {
             let (mut send, mut recv) = e.into_inner();
             let code = quinn::VarInt::from_u32(WT_BUFFERED_STREAM_REJECTED);
-            let _ = send.reset(code);
-            let _ = recv.inner.stop(code);
+            let _ = send.inner.reset(code);
+            let _ = recv.inner.inner.stop(code);
         }
     }
 
     /// Hand a unidirectional stream to the session; refused as
     /// [`Self::deliver_bi`].
-    pub fn deliver_uni(&self, recv: Prefixed<quinn::RecvStream>) {
+    pub fn deliver_uni(&self, mut recv: Prefixed<quinn::RecvStream>) {
+        let slot = match self.flow.peer_opened(false) {
+            Ok(slot) => slot,
+            Err(e) => {
+                let _ = recv
+                    .inner
+                    .stop(quinn::VarInt::from_u32(WT_BUFFERED_STREAM_REJECTED));
+                self.flow.violate(e);
+                return;
+            }
+        };
+        let recv = self.receiving(recv, peer_header_len(self.session_id), Some(slot));
         if let Err(e) = self.uni.try_send(recv) {
             let mut recv = e.into_inner();
             let _ = recv
                 .inner
+                .inner
                 .stop(quinn::VarInt::from_u32(WT_BUFFERED_STREAM_REJECTED));
+        }
+    }
+
+    fn receiving(
+        &self,
+        inner: Prefixed<quinn::RecvStream>,
+        header: u64,
+        slot: Option<StreamSlot>,
+    ) -> H3Recv {
+        H3Recv {
+            inner,
+            flow: Arc::clone(&self.flow),
+            ended: self.ended.clone(),
+            header,
+            read: 0,
+            _slot: slot,
         }
     }
 
@@ -414,8 +604,8 @@ impl H3SessionFeed {
 }
 
 impl WtSession for H3Session {
-    type Send = quinn::SendStream;
-    type Recv = Prefixed<quinn::RecvStream>;
+    type Send = H3Send;
+    type Recv = H3Recv;
 
     async fn accept_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
         self.next(&self.bi).await
@@ -426,6 +616,12 @@ impl WtSession for H3Session {
     }
 
     async fn open_uni(&self) -> Result<Self::Send, WtClosed> {
+        // No stream once the session has ended (section 6), and none beyond
+        // what the peer allows (section 5.6.2)
+        tokio::select! {
+            () = self.flow.open(false) => {}
+            () = self.ended.cancelled() => return Err(WtClosed("the session ended".into())),
+        }
         let mut send = self
             .connection
             .open_uni()
@@ -438,10 +634,14 @@ impl WtSession for H3Session {
         send.write_all(&header)
             .await
             .map_err(|e| WtClosed(e.to_string()))?;
-        Ok(send)
+        Ok(self.sending(send, None))
     }
 
     async fn open_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
+        tokio::select! {
+            () = self.flow.open(true) => {}
+            () = self.ended.cancelled() => return Err(WtClosed("the session ended".into())),
+        }
         let (mut send, recv) = self
             .connection
             .open_bi()
@@ -454,22 +654,32 @@ impl WtSession for H3Session {
         send.write_all(&header)
             .await
             .map_err(|e| WtClosed(e.to_string()))?;
-        Ok((send, Prefixed::new(Bytes::new(), recv)))
+        // The peer's direction carries no header: all of it is Stream Body
+        let recv = H3Recv {
+            inner: Prefixed::new(Bytes::new(), recv),
+            flow: Arc::clone(&self.flow),
+            ended: self.ended.clone(),
+            header: 0,
+            read: 0,
+            _slot: None,
+        };
+        Ok((self.sending(send, None), recv))
     }
 
     fn reset(&self, send: &mut Self::Send, code: u32) {
-        let header = wt_header_len(send.id(), quinn::Side::Server, self.session_id);
-        reset_wt_stream(send, code, header);
+        let header = wt_header_len(send.inner.id(), quinn::Side::Server, self.session_id);
+        reset_wt_stream(&mut send.inner, code, header);
     }
 
     fn stop(recv: &mut Self::Recv, code: u32) {
         let _ = recv
             .inner
+            .inner
             .stop(quinn::VarInt::from_u64(wt_application_code(code)).expect("below 2^62"));
     }
 
     fn set_priority(send: &Self::Send, priority: i32) {
-        let _ = send.set_priority(priority);
+        let _ = send.inner.set_priority(priority);
     }
 
     fn close(&self, code: u32, reason: &str) {
@@ -491,6 +701,10 @@ impl WtSession for H3Session {
     }
 
     fn send_datagram(&self, payload: &[u8]) -> Result<(), WtClosed> {
+        // None once the session has ended (section 6)
+        if self.ended.is_cancelled() {
+            return Err(WtClosed("the session ended".into()));
+        }
         let mut datagram = Vec::with_capacity(payload.len() + 8);
         put_varint(&mut datagram, self.quarter_stream_id());
         datagram.extend_from_slice(payload);
@@ -519,6 +733,112 @@ impl WtSession for H3Session {
 
 /// A QUIC variable-length integer (RFC 9000 section 16), in its shortest
 /// form; `value` is below 2^62.
+// ── A session's CONNECT stream (h3) ──────────────────────────────────────────
+
+/// How the task that holds a session's CONNECT stream ended it.
+#[derive(Debug)]
+pub enum SessionEnd {
+    /// The handler finished first
+    Served,
+    /// The handler closed it: WT_CLOSE_SESSION sent, then FIN
+    Closed { code: u32 },
+    /// The peer sent WT_CLOSE_SESSION
+    PeerClosed { code: u32, reason: String },
+    /// The peer finished or reset the CONNECT stream
+    StreamEnded,
+    /// A session error: the CONNECT stream reset with its code (section 5.6)
+    Error(FlowError),
+}
+
+/// Hold a WebTransport session's CONNECT stream for its life
+/// (draft-ietf-webtrans-http3-17 sections 5.6 and 6): the peer's capsules
+/// read (flow control, WT_CLOSE_SESSION, WT_DRAIN_SESSION) and this side's
+/// written (`capsules`, which [`Flow`] fills), while `serve` runs the
+/// session; then the session ended and `serve` let finish within
+/// `wind_down`. A close the handler asks for ([`WtSession::close`],
+/// `close_requests`) goes out as WT_CLOSE_SESSION and FIN; a session error
+/// resets the stream with its code.
+pub async fn hold_connect_stream<F: Future>(
+    stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    session: &H3Session,
+    mut capsules: mpsc::UnboundedReceiver<Bytes>,
+    mut close_requests: tokio::sync::oneshot::Receiver<(u32, String)>,
+    serve: F,
+    wind_down: Duration,
+) -> (Option<F::Output>, SessionEnd) {
+    let (mut send, mut recv) = stream.split();
+    let flow = Arc::clone(&session.flow);
+    // The peer's half: its capsules, until it ends, closes the session or a
+    // session error is raised, which stops it with the error's code
+    let reading = async move {
+        let mut reader = CapsuleReader::default();
+        let violation = flow.violation();
+        tokio::pin!(violation);
+        let end = 'read: loop {
+            let data = tokio::select! {
+                e = &mut violation => break 'read SessionEnd::Error(e),
+                data = recv.recv_data() => data,
+            };
+            let Ok(Some(mut data)) = data else {
+                break SessionEnd::StreamEnded;
+            };
+            let data = data.copy_to_bytes(data.remaining());
+            let read = match reader.push(data) {
+                Ok(read) => read,
+                Err(e) => break SessionEnd::Error(e),
+            };
+            for (kind, value) in read {
+                match flow.capsule(kind, &value) {
+                    Ok(Capsule::Close { code, reason }) => {
+                        break 'read SessionEnd::PeerClosed { code, reason };
+                    }
+                    Ok(Capsule::Drain) => {
+                        tracing::debug!("WebTransport session drained by the peer");
+                    }
+                    Ok(Capsule::Handled) => {}
+                    Err(e) => break 'read SessionEnd::Error(e),
+                }
+            }
+        };
+        if let SessionEnd::Error(e) = &end {
+            recv.stop_sending(h3::error::Code::from(e.code));
+        }
+        end
+    };
+    tokio::pin!(serve, reading);
+    let mut closable = true;
+    let (mut output, end) = loop {
+        tokio::select! {
+            out = &mut serve => break (Some(out), SessionEnd::Served),
+            end = &mut reading => break (None, end),
+            close = &mut close_requests, if closable => match close {
+                Ok((code, reason)) => {
+                    let _ = send.send_data(close_session_capsule(code, &reason)).await;
+                    break (None, SessionEnd::Closed { code });
+                }
+                // No handler can close it any more; its end comes otherwise
+                Err(_) => closable = false,
+            },
+            Some(capsule) = capsules.recv() => {
+                let _ = send.send_data(capsule).await;
+            }
+        }
+    };
+    match &end {
+        SessionEnd::Error(e) => send.stop_stream(h3::error::Code::from(e.code)),
+        // The peer's close is answered with this side's end of the stream
+        // (section 6); the handler's own close and end likewise
+        _ => {
+            let _ = send.finish().await;
+        }
+    }
+    session.end();
+    if output.is_none() {
+        output = tokio::time::timeout(wind_down, &mut serve).await.ok();
+    }
+    (output, end)
+}
+
 fn put_varint(out: &mut Vec<u8>, value: u64) {
     let (len, tag) = match value {
         0..=0x3f => (1, 0x00),
