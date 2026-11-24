@@ -2544,15 +2544,14 @@ mod pending_read_tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    /// A stream whose first data comes after its header: a read of it is
-    /// left pending, and into_inner_or_pending gives that read back, which
-    /// yields the stream and the data when it comes. into_inner gave None
-    /// there, and the listener dropped a browser's MoQ control stream with
-    /// its SETUP on the way (2026-11-24).
-    #[tokio::test]
-    async fn a_pending_read_gives_back_the_stream_and_its_data() {
-        use h3::quic::RecvStream as _;
-
+    /// A client and a server connection over loopback QUIC (ALPN h3), with
+    /// their endpoints, which must outlive them.
+    async fn connected() -> (
+        quinn::Connection,
+        quinn::Connection,
+        quinn::Endpoint,
+        quinn::Endpoint,
+    ) {
         let throwaway = throwaway_cert();
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -2584,7 +2583,18 @@ mod pending_read_tests {
             async { client.connect(addr, "localhost").unwrap().await.unwrap() },
             async { server.accept().await.unwrap().await.unwrap() }
         );
+        (client_conn, server_conn, client, server)
+    }
 
+    /// A stream whose first data comes after its header: a read of it is
+    /// left pending, and into_inner_or_pending gives that read back, which
+    /// yields the stream and the data when it comes. into_inner gave None
+    /// there, and the listener dropped the stream (2026-11-24).
+    #[tokio::test]
+    async fn a_pending_read_gives_back_the_stream_and_its_data() {
+        use h3::quic::RecvStream as _;
+
+        let (client_conn, server_conn, _client, _server) = connected().await;
         // The header's worth first, the rest later
         let mut send = client_conn.open_uni().await.unwrap();
         send.write_all(b"h").await.unwrap();
@@ -2610,6 +2620,42 @@ mod pending_read_tests {
             .await
             .expect("the read completes");
         assert_eq!(&read.unwrap().expect("data")[..], b"ello");
+    }
+
+    /// A WebTransport stream that arrives alone, no request after it, is
+    /// accepted: h3 reads incoming unidirectional streams while polling for
+    /// requests, queued this one, and left nothing to wake the accept for
+    /// it, so it waited for some other stream (2026-11-24: a browser's MoQ
+    /// SETUP, sent with nothing after it, never reached the relay)
+    #[tokio::test]
+    async fn a_webtransport_stream_alone_is_accepted() {
+        let (client_conn, server_conn, _client, _server) = connected().await;
+        let mut h3: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
+            h3::server::builder()
+                .enable_extended_connect(true)
+                .enable_webtransport(true)
+                .build(h3_quinn::Connection::new(server_conn))
+                .await
+                .unwrap();
+        // WT_STREAM's unidirectional type (0x54, a two-byte varint),
+        // session 0, and one byte of data
+        let mut send = client_conn.open_uni().await.unwrap();
+        send.write_all(&[0x40, 0x54, 0x00, b'x']).await.unwrap();
+        // Taken on the poll that reads it. The deadline is checked first: a
+        // timeout that polls the accept when it fires would wake it itself
+        // and hide the missing wakeup (without the fix the accept returned
+        // only when such a timer fired; for a browser's session, nothing did)
+        let accepted = tokio::select! {
+            biased;
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                panic!("not accepted: nothing woke the accept for the stream")
+            }
+            accepted = h3.accept_any() => accepted.unwrap(),
+        };
+        let Some(h3::server::Accepted::WebTransportUni { session, .. }) = accepted else {
+            panic!("a WebTransport stream");
+        };
+        assert_eq!(session, 0);
     }
 }
 

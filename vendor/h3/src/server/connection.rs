@@ -192,8 +192,23 @@ where
                 let (session, stream) = waiting.remove(0);
                 return Poll::Ready(Ok(Next::<C, B>::Uni(session, stream)));
             }
-            self.poll_accept_request_stream_internal(cx)
-                .map(|accepted| accepted.map(Next::<C, B>::Bidi))
+            let polled = self
+                .poll_accept_request_stream_internal(cx)
+                .map(|accepted| accepted.map(Next::<C, B>::Bidi));
+            // Polling for requests also reads the incoming unidirectional
+            // streams, and may have queued a WebTransport one just now. Its
+            // data is all read, so nothing would wake this future for it:
+            // a stream that arrived alone (a browser's MoQ SETUP, with no
+            // request after it) waited until some other stream came
+            // (2026-11-24). It is taken here instead.
+            if polled.is_pending() {
+                let waiting = &mut self.inner.accepted_streams_mut().wt_uni_streams;
+                if !waiting.is_empty() {
+                    let (session, stream) = waiting.remove(0);
+                    return Poll::Ready(Ok(Next::<C, B>::Uni(session, stream)));
+                }
+            }
+            polled
         })
         .await?;
         match next {
