@@ -749,6 +749,12 @@ mod tests {
             f.capsule(WT_MAX_DATA, &[0x40, 0x10]).unwrap_err().reason,
             "a WT_MAX_DATA that does not increase"
         );
+        // OURS' 4 streams are the peer's initial limits here: 4 again does
+        // not increase them
+        assert_eq!(
+            f.capsule(WT_MAX_STREAMS_UNI, &[4]).unwrap_err().reason,
+            "a WT_MAX_STREAMS that does not increase"
+        );
         let mut big = Vec::new();
         put_varint(&mut big, (1 << 60) + 1);
         assert!(f.capsule(WT_MAX_STREAMS_BIDI, &big).is_err());
