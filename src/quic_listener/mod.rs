@@ -2641,7 +2641,10 @@ mod pending_read_tests {
         // session 0, and one byte of data
         let mut send = client_conn.open_uni().await.unwrap();
         send.write_all(&[0x40, 0x54, 0x00, b'x']).await.unwrap();
-        let accepted = tokio::time::timeout(Duration::from_secs(3), h3.accept_any())
+        // Taken on the poll that reads it. Without the fix some timer of the
+        // connection's woke the accept after about 3 s on loopback, and
+        // nothing did for a browser's session
+        let accepted = tokio::time::timeout(Duration::from_secs(1), h3.accept_any())
             .await
             .expect("accepted with no other stream to wake it")
             .unwrap();
