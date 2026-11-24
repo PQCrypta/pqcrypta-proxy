@@ -361,6 +361,9 @@ where
 pub struct RecvStream {
     stream: Option<noq::RecvStream>,
     read_chunk_fut: ReadChunkFuture,
+    /// A STOP_SENDING asked for while a read held the stream, sent when the
+    /// read gives it back
+    stop: Option<VarInt>,
     /// Read from the stream when it is wrapped: `stream` is moved into the
     /// read future while a read is pending, and the answer never changes.
     is_0rtt: bool,
@@ -371,6 +374,39 @@ impl RecvStream {
     /// read past what the caller was given).
     pub fn into_inner(self) -> Option<noq::RecvStream> {
         self.stream
+    }
+
+    /// The noq stream, or the read still pending on it, which gives the
+    /// stream back with what it read once it completes.
+    ///
+    /// A read is pending when the caller has read past what arrived: h3
+    /// parsing a WebTransport stream's header asks for more and gets nothing
+    /// yet, where the peer sent the header and its first data apart. Taking
+    /// the stream with [`Self::into_inner`] then gave `None`, and the caller
+    /// dropped a stream whose data was on its way (2026-11-24: a browser's
+    /// MoQ SETUP, written right after the stream was opened, never reached
+    /// the relay).
+    pub fn into_inner_or_pending(self) -> Result<noq::RecvStream, PendingRead> {
+        match self.stream {
+            Some(stream) => Ok(stream),
+            None => Err(PendingRead(self.read_chunk_fut, self.stop)),
+        }
+    }
+}
+
+/// A read still pending on a stream ([`RecvStream::into_inner_or_pending`]):
+/// the stream and what the read gave, once it completes.
+pub struct PendingRead(ReadChunkFuture, Option<VarInt>);
+
+impl Future for PendingRead {
+    type Output = (noq::RecvStream, Result<Option<Bytes>, noq::ReadError>);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let (mut stream, read) = ready!(self.0.poll(cx));
+        if let Some(code) = self.1.take() {
+            stream.stop(code).ok();
+        }
+        Poll::Ready((stream, read))
     }
 }
 
@@ -387,6 +423,7 @@ impl RecvStream {
             stream: Some(stream),
             // Should only allocate once the first time it's used
             read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
+            stop: None,
         }
     }
 }
@@ -407,18 +444,25 @@ impl quic::RecvStream for RecvStream {
             })
         };
 
-        let (stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
+        let (mut stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
+        if let Some(code) = self.stop.take() {
+            stream.stop(code).ok();
+        }
         self.stream = Some(stream);
         Poll::Ready(Ok(chunk.map_err(convert_read_error_to_stream_error)?))
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
-        self.stream
-            .as_mut()
-            .unwrap()
-            .stop(VarInt::from_u64(error_code).expect("invalid error_code"))
-            .ok();
+        let code = VarInt::from_u64(error_code).expect("invalid error_code");
+        // A pending read holds the stream: the stop waits for it, where
+        // unwrapping the absent stream panicked the caller's task
+        match self.stream.as_mut() {
+            Some(stream) => {
+                stream.stop(code).ok();
+            }
+            None => self.stop = Some(code),
+        }
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]

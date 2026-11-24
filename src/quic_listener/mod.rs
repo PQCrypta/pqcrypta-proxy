@@ -522,13 +522,48 @@ fn deliver_wt_uni(
     use h3::quic::RecvStream as _;
     let feed = sessions.get(&session).filter(|feed| !feed.has_ended());
     match feed {
-        Some(feed) => match stream.into_inner() {
-            Some(recv) => feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv)),
-            None => debug!("WebTransport stream with a read in flight: dropped"),
+        Some(feed) => match stream.into_inner_or_pending() {
+            Ok(recv) => feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv)),
+            // h3 read past the header and the rest has not come: the stream
+            // goes to its session with that read's data once it does
+            Err(pending) => {
+                let feed = feed.clone();
+                tokio::spawn(async move {
+                    if let Some((prefix, recv)) = after_pending_read(prefix, pending).await {
+                        feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv));
+                    }
+                });
+            }
         },
         None => {
+            // No such session: refused, whether or not a read is pending
             stream.stop_sending(u64::from(crate::wt_session::WT_BUFFERED_STREAM_REJECTED));
             sessions.remove(&session);
+        }
+    }
+}
+
+/// A WebTransport stream whose read h3 left pending: the stream, and what
+/// arrived before and with that read, once it completes; `None` where the
+/// peer reset it first.
+async fn after_pending_read(
+    prefix: Bytes,
+    pending: h3_quinn::PendingRead,
+) -> Option<(Bytes, quinn::RecvStream)> {
+    let (recv, read) = pending.await;
+    match read {
+        Ok(Some(more)) if prefix.is_empty() => Some((more, recv)),
+        Ok(Some(more)) => {
+            let mut joined = Vec::with_capacity(prefix.len() + more.len());
+            joined.extend_from_slice(&prefix);
+            joined.extend_from_slice(&more);
+            Some((Bytes::from(joined), recv))
+        }
+        // Finished: what arrived is all of it
+        Ok(None) => Some((prefix, recv)),
+        Err(e) => {
+            debug!("WebTransport stream ended before its first data: {}", e);
+            None
         }
     }
 }
@@ -551,11 +586,22 @@ fn deliver_wt_bi(
         sessions.remove(&session);
         return;
     };
-    match (send.into_inner(), recv.into_inner()) {
-        (Some(send), Some(recv)) => {
-            feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv));
+    let Some(send) = send.into_inner() else {
+        // Nothing has been written to a stream the peer just opened
+        debug!("WebTransport stream with a write in flight: dropped");
+        return;
+    };
+    match recv.into_inner_or_pending() {
+        Ok(recv) => feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv)),
+        // As deliver_wt_uni: the stream goes once its pending read completes
+        Err(pending) => {
+            let feed = feed.clone();
+            tokio::spawn(async move {
+                if let Some((prefix, recv)) = after_pending_read(prefix, pending).await {
+                    feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv));
+                }
+            });
         }
-        _ => debug!("WebTransport stream with I/O in flight: dropped"),
     }
 }
 
