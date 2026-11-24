@@ -655,7 +655,7 @@ mod tests {
         let a2 = a.clone();
         drop(a);
         drop(b);
-        assert!(sent(&mut rx).is_empty(), "one stream still open");
+        assert_eq!(sent(&mut rx), [], "one stream still open");
         drop(a2);
         assert_eq!(sent(&mut rx), [(WT_MAX_STREAMS_BIDI, 6)]);
     }
@@ -665,7 +665,7 @@ mod tests {
     fn the_peer_s_data_is_held_to_the_limit() {
         let (f, mut rx) = flow(OURS);
         f.peer_data(400).unwrap();
-        assert!(sent(&mut rx).is_empty());
+        assert_eq!(sent(&mut rx), []);
         f.peer_data(200).unwrap();
         assert_eq!(sent(&mut rx), [(WT_MAX_DATA, 1600)]);
         assert_eq!(f.peer_data(1001).unwrap_err().code, WT_FLOW_CONTROL_ERROR);

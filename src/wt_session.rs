@@ -338,9 +338,10 @@ const fn peer_header_len(session_id: u64) -> u64 {
     }
 }
 
-/// A WebTransport stream's sending half on the HTTP/3 port: its writes held
-/// to the session's flow control (section 5.6.4), and reset with
-/// WT_SESSION_GONE if it outlives the session (section 6).
+/// A WebTransport stream's sending half on the HTTP/3 port.
+///
+/// Its writes are held to the session's flow control (section 5.6.4), and
+/// it is reset with WT_SESSION_GONE if it outlives the session (section 6).
 pub struct H3Send {
     inner: quinn::SendStream,
     flow: Arc<Flow>,
@@ -349,10 +350,11 @@ pub struct H3Send {
     _slot: Option<StreamSlot>,
 }
 
-/// A WebTransport stream's receiving half on the HTTP/3 port: what it reads
-/// counted against the session's data limit, a reset stream's final size
-/// included (section 5.4), and stopped with WT_SESSION_GONE if it outlives
-/// the session (section 6).
+/// A WebTransport stream's receiving half on the HTTP/3 port.
+///
+/// What it reads is counted against the session's data limit, a reset
+/// stream's final size included (section 5.4), and it is stopped with
+/// WT_SESSION_GONE if it outlives the session (section 6).
 pub struct H3Recv {
     inner: Prefixed<quinn::RecvStream>,
     flow: Arc<Flow>,
@@ -749,8 +751,9 @@ pub enum SessionEnd {
     Error(FlowError),
 }
 
-/// Hold a WebTransport session's CONNECT stream for its life
-/// (draft-ietf-webtrans-http3-17 sections 5.6 and 6): the peer's capsules
+/// Hold a WebTransport session's CONNECT stream for its life.
+///
+/// Draft-ietf-webtrans-http3-17 sections 5.6 and 6: the peer's capsules are
 /// read (flow control, WT_CLOSE_SESSION, WT_DRAIN_SESSION) and this side's
 /// written (`capsules`, which [`Flow`] fills), while `serve` runs the
 /// session; then the session ended and `serve` let finish within
