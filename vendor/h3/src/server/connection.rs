@@ -104,6 +104,17 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
+    /// The client's SETTINGS, once they have arrived
+    pub fn peer_settings(&self) -> Option<crate::Settings> {
+        self.inner.shared.peer_settings()
+    }
+
+    /// Resolves when the client's SETTINGS have arrived (at once if they
+    /// have), while the connection is driven elsewhere
+    pub fn peer_settings_arrived(&self) -> impl std::future::Future<Output = ()> + use<C, B> {
+        self.inner.shared.peer_settings_arrived()
+    }
+
     /// Create a new HTTP/3 server connection with default settings
     ///
     /// Use a custom [`super::builder::Builder`] with [`super::builder::builder()`] to create a connection

@@ -184,7 +184,7 @@ impl Recv {
         }
     }
 
-    fn final_offset(&self) -> Option<u64> {
+    pub(super) fn final_offset(&self) -> Option<u64> {
         match self.state {
             RecvState::Recv { size } => size,
             RecvState::ResetRecvd { size, .. } => Some(size),

@@ -507,9 +507,46 @@ pub(crate) fn install_crypto(
 /// `is_conformance_host`, ran `find_route` (an O(routes) scan -- one route in a
 /// test config, sixty on the live edge, nine of them carrying regexes) and
 /// cloned every policy field. Extracted so the caller can resolve it once.
-/// How long a MoQ session over WebTransport has to finish once its session
-/// has ended (its tasks see the end at once; this bounds a stuck one)
-const MOQ_SESSION_WIND_DOWN: Duration = Duration::from_secs(5);
+/// The Stream Body bytes a WebTransport session may send before this server
+/// grants more (SETTINGS_WT_INITIAL_MAX_DATA): twice the connection's own
+/// receive window, so QUIC's flow control binds first
+const WT_INITIAL_MAX_DATA: u64 = 16 << 20;
+
+/// The initial WebTransport limits this server declares in SETTINGS
+/// (draft-ietf-webtrans-http3-17 section 5.6): as many streams per session as
+/// the connection allows, and [`WT_INITIAL_MAX_DATA`].
+fn wt_initial_limits(config: &ProxyConfig) -> crate::wt_flow::Limits {
+    crate::wt_flow::Limits {
+        streams_uni: u64::from(config.server.max_uni_streams_per_connection),
+        streams_bidi: u64::from(config.server.max_streams_per_connection),
+        data: WT_INITIAL_MAX_DATA,
+    }
+}
+
+/// A WebTransport session's flow control, on when the client's SETTINGS
+/// declare limits as this server's do (section 5.1), and where its capsules
+/// go out.
+fn session_flow(
+    ours: crate::wt_flow::Limits,
+    peer: Option<h3::Settings>,
+) -> (
+    Arc<crate::wt_flow::Flow>,
+    tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let enabled = peer.is_some_and(|s| s.wt_flow_control());
+    let peer = peer.map_or_else(Default::default, |s| crate::wt_flow::Limits {
+        streams_uni: s.wt_initial_max_streams_uni(),
+        streams_bidi: s.wt_initial_max_streams_bidi(),
+        data: s.wt_initial_max_data(),
+    });
+    (crate::wt_flow::Flow::new(enabled, ours, peer, tx), rx)
+}
+
+/// How long a WebTransport session's handler (MoQ, or a route's) has to
+/// finish once the session has ended: it sees the end at once, and this
+/// bounds a stuck one
+const WT_SESSION_WIND_DOWN: Duration = Duration::from_secs(5);
 
 /// Hand a WebTransport unidirectional stream to its session, or refuse it
 /// (WT_BUFFERED_STREAM_REJECTED) when there is no such session now.
@@ -1373,12 +1410,21 @@ impl QuicListener {
         // while decoding: h3's default was no limit, so a request of tens of
         // thousands of one-octet field lines was decoded in full (QPACK
         // "header accordions", FoxIO, October 2026).
+        let wt_limits = wt_initial_limits(&config);
         let h3_built = h3::server::builder()
             .max_field_section_size(config.security.max_header_size as u64)
             .enable_webtransport(true)
             .enable_extended_connect(true)
             .enable_datagram(true)
             .max_webtransport_sessions(config.server.webtransport_max_sessions_per_origin as u64)
+            // draft-ietf-webtrans-http3-17 section 3.1, beside the earlier
+            // drafts' two settings, which clients of those drafts read
+            .wt_enabled(true)
+            .wt_initial_limits(
+                wt_limits.streams_uni,
+                wt_limits.streams_bidi,
+                wt_limits.data,
+            )
             .build(H3Connection::new(connection.clone()))
             .await;
 
@@ -1730,11 +1776,32 @@ impl QuicListener {
         // listeners give a request's header (`server.max_idle_timeout_secs`).
         let mut resolving = futures_util::stream::FuturesUnordered::new();
         let header_wait = Duration::from_secs(config.server.max_idle_timeout_secs.max(1));
+        // WebTransport requests that came before the client's SETTINGS,
+        // waiting for them (draft-ietf-webtrans-http3-17 section 3.1: a
+        // server processes none before), the connection served meanwhile
+        let mut awaiting_settings = futures_util::stream::FuturesUnordered::new();
+        // What this connection's SETTINGS declared (the builder's own)
+        let wt_limits = wt_initial_limits(&config);
 
         loop {
             let step = tokio::select! {
                 Some(resolved) = resolving.next(), if !resolving.is_empty() => {
                     Step::Resolved(resolved)
+                }
+                Some(held) = awaiting_settings.next(), if !awaiting_settings.is_empty() => {
+                    match held {
+                        Some((request, stream)) => {
+                            Step::Resolved(Ok(Ok(h3::server::Resolved::Request(request, stream))))
+                        }
+                        None => {
+                            // Dropping the stream resets it
+                            debug!(
+                                "WebTransport request from {} with no SETTINGS within {:?}",
+                                remote_addr, header_wait
+                            );
+                            continue;
+                        }
+                    }
                 }
                 accepted = h3.accept_any() => Step::Accepted(accepted),
                 () = crate::memory_pressure::idle_at_relief(&mut relief, &activity),
@@ -1849,6 +1916,22 @@ impl QuicListener {
                         continue;
                     }
 
+                    if h3.peer_settings().is_none()
+                        && request
+                            .extensions()
+                            .get::<Protocol>()
+                            .is_some_and(Protocol::is_webtransport)
+                    {
+                        let arrived = h3.peer_settings_arrived();
+                        awaiting_settings.push(async move {
+                            tokio::time::timeout(header_wait, arrived)
+                                .await
+                                .ok()
+                                .map(|()| (request, stream))
+                        });
+                        continue;
+                    }
+
                     // A session or tunnel opened from 0-RTT is one a replayed
                     // flight could open as well, and none of them is a request
                     // the route gate's safe-method list can vouch for. RFC 8470
@@ -1905,12 +1988,11 @@ impl QuicListener {
                         method, path, remote_addr, host, protocol_ext
                     );
 
-                    // Check for WebTransport CONNECT (RFC 9220)
-                    // WebTransport uses Extended CONNECT with :protocol = webtransport
+                    // WebTransport: extended CONNECT whose :protocol is
+                    // `webtransport-h3` (draft-ietf-webtrans-http3-17
+                    // section 3.2) or the earlier drafts' `webtransport`
                     let is_webtransport = method == http::Method::CONNECT
-                        && protocol_ext
-                            .map(|p| p == &Protocol::WEB_TRANSPORT)
-                            .unwrap_or(false);
+                        && protocol_ext.is_some_and(Protocol::is_webtransport);
 
                     // RFC 9220: WebSocket over HTTP/3 uses Extended CONNECT with :protocol = websocket
                     let is_ws_h3 = method == http::Method::CONNECT
@@ -2007,11 +2089,59 @@ impl QuicListener {
                             path, remote_addr, host
                         );
 
+                        // A draft-17 client (its `webtransport-h3` token, or
+                        // its SETTINGS_WT_ENABLED) may have one session per
+                        // connection without flow control, which needs both
+                        // ends to declare initial limits (draft-ietf-webtrans-
+                        // http3-17 section 5.1): a further CONNECT is reset
+                        // with H3_REQUEST_REJECTED
+                        let peer_settings = h3.peer_settings();
+                        let draft17 = protocol_ext == Some(&Protocol::WEB_TRANSPORT_H3)
+                            || peer_settings.is_some_and(|s| s.wt_enabled());
+                        let flow_control = peer_settings.is_some_and(|s| s.wt_flow_control());
+                        if draft17
+                            && !flow_control
+                            && wt_sessions.values().any(|feed| !feed.has_ended())
+                        {
+                            debug!(
+                                "WebTransport CONNECT from {}: a second session without flow control, reset H3_REQUEST_REJECTED",
+                                remote_addr
+                            );
+                            let mut stream = stream;
+                            stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                            stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+                            continue;
+                        }
+
                         // Media over QUIC over WebTransport: the version is
                         // the one WT-Available-Protocols and WT-Protocol
                         // agree (draft-ietf-moq-transport section 6.2.1,
                         // draft-ietf-webtrans-http3 section 3.3)
                         if let Some(moq) = crate::moq::running().filter(|m| path == m.path) {
+                            // A browser's Origin is verified (draft-ietf-
+                            // webtrans-http3-17 section 3.2); a client that
+                            // sends none is not a browser
+                            let origin = request
+                                .headers()
+                                .get(http::header::ORIGIN)
+                                .map(|o| o.to_str().unwrap_or("null").to_string());
+                            if let Some(origin) = origin.filter(|o| {
+                                !moq.origin_allowed(o, uri.authority().map(|a| a.as_str()))
+                            }) {
+                                debug!(
+                                    "MoQ WebTransport session from {} refused: Origin {} not allowed",
+                                    remote_addr, origin
+                                );
+                                log_outcome(http::StatusCode::FORBIDDEN);
+                                let mut stream = stream;
+                                let refused = http::Response::builder()
+                                    .status(http::StatusCode::FORBIDDEN)
+                                    .body(())?;
+                                if stream.send_response(refused).await.is_ok() {
+                                    let _ = stream.finish().await;
+                                }
+                                continue;
+                            }
                             let offered = request
                                 .headers()
                                 .get("wt-available-protocols")
@@ -2047,9 +2177,11 @@ impl QuicListener {
                                 .connections
                                 .connection_opened(ConnectionProtocol::WebTransport);
                             let session_id = stream.send_id().into_inner();
+                            let (flow, capsules) = session_flow(wt_limits, peer_settings);
                             let (session, feed) = crate::wt_session::H3Session::new(
                                 session_id,
                                 quic_connection.clone(),
+                                flow,
                             );
                             let router = datagram_router
                                 .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
@@ -2070,38 +2202,23 @@ impl QuicListener {
                             let flight = activity.begin();
                             tokio::spawn(async move {
                                 let _flight = flight;
-                                let mut session_stream = stream;
-                                tokio::pin!(serve);
-                                let (served, outcome) = tokio::select! {
-                                    () = &mut serve => (true, None),
-                                    _ = async {
-                                        while let Ok(Some(_)) = session_stream.recv_data().await {}
-                                    } => (false, None),
-                                    close = close_requests => (false, close.ok()),
-                                };
-                                // WT_CLOSE_SESSION, then the CONNECT
-                                // stream's FIN (section 6)
-                                if let Some((code, reason)) = outcome {
-                                    let capsule =
-                                        crate::wt_session::close_session_capsule(code, &reason);
-                                    let _ = session_stream.send_data(capsule).await;
-                                    let _ = session_stream.finish().await;
-                                }
-                                session.end();
                                 // The MoQ session sees its end and finishes,
                                 // noting how; were it dropped instead, its
                                 // cleanup would still run (moq::session's
-                                // `Ended`), without that note
-                                if !served
-                                    && tokio::time::timeout(MOQ_SESSION_WIND_DOWN, &mut serve)
-                                        .await
-                                        .is_err()
-                                {
-                                    debug!(
-                                        "MoQ session from {} still winding down after {:?}: dropped",
-                                        remote_addr, MOQ_SESSION_WIND_DOWN
-                                    );
-                                }
+                                // `Ended`)
+                                let (_, end) = crate::wt_session::hold_connect_stream(
+                                    stream,
+                                    &session,
+                                    capsules,
+                                    close_requests,
+                                    serve,
+                                    WT_SESSION_WIND_DOWN,
+                                )
+                                .await;
+                                debug!(
+                                    "MoQ WebTransport session from {} ended: {:?}",
+                                    remote_addr, end
+                                );
                                 router.unregister_session(session.quarter_stream_id());
                                 drop(wt_open);
                             });
@@ -2182,8 +2299,12 @@ impl QuicListener {
                         // it is served as the WebTransport server serves its
                         // own (webtransport_server::serve_session).
                         let session_id = stream.send_id().into_inner();
-                        let (session, feed) =
-                            crate::wt_session::H3Session::new(session_id, quic_connection.clone());
+                        let (flow, capsules) = session_flow(wt_limits, peer_settings);
+                        let (session, feed) = crate::wt_session::H3Session::new(
+                            session_id,
+                            quic_connection.clone(),
+                            flow,
+                        );
                         let router = datagram_router
                             .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
                             .clone();
@@ -2204,32 +2325,32 @@ impl QuicListener {
                             backend_pool.clone(),
                             Some((*security).clone()),
                         );
+                        let close_requests = session.close_requests();
                         let flight = activity.begin();
                         tokio::spawn(async move {
                             let _flight = flight;
                             // The CONNECT stream IS the session (Chrome tears
                             // the session down when it is finished or reset):
-                            // held for the session's life, and read, since the
-                            // session ends when the client finishes it.
-                            let mut session_stream = stream;
+                            // held for the session's life, its capsules read
+                            // and written (crate::wt_session::hold_connect_stream)
                             debug!(
                                 "WebTransport session active for {} on path {}",
                                 remote_addr, path
                             );
-                            let client_ended = async {
-                                while let Ok(Some(_)) = session_stream.recv_data().await {}
-                            };
-                            tokio::select! {
-                                served = serve => {
-                                    if let Err(e) = served {
-                                        debug!("WebTransport session for {} ended: {}", remote_addr, e);
-                                    }
-                                }
-                                () = client_ended => {}
+                            let (served, end) = crate::wt_session::hold_connect_stream(
+                                stream,
+                                &session,
+                                capsules,
+                                close_requests,
+                                serve,
+                                WT_SESSION_WIND_DOWN,
+                            )
+                            .await;
+                            if let Some(Err(e)) = served {
+                                debug!("WebTransport session for {} ended: {}", remote_addr, e);
                             }
-                            session.end();
                             router.unregister_session(session.quarter_stream_id());
-                            debug!("WebTransport session ended for {}", remote_addr);
+                            debug!("WebTransport session ended for {}: {:?}", remote_addr, end);
                             drop(wt_open);
                         });
                     } else if is_connect_udp {

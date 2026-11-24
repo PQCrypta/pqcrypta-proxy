@@ -7,6 +7,7 @@ pub mod client;
 mod config;
 //pub mod error;
 pub mod ext;
+pub use config::Settings;
 pub mod quic;
 
 pub mod server;

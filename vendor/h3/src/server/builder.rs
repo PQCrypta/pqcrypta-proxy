@@ -108,6 +108,29 @@ impl Builder {
         self
     }
 
+    /// Sends SETTINGS_WT_ENABLED: WebTransport as draft-ietf-webtrans-http3-17
+    /// defines it (section 3.1)
+    pub fn wt_enabled(&mut self, value: bool) -> &mut Self {
+        self.config.settings.wt_enabled = value;
+        self
+    }
+
+    /// The initial WebTransport flow control limits per session: unidirectional
+    /// and bidirectional streams, and Stream Body bytes (draft-ietf-webtrans-
+    /// http3-17 section 5.6). Any of them other than 0 declares the intent to
+    /// use flow control (section 5.1); a 0 is not sent.
+    pub fn wt_initial_limits(
+        &mut self,
+        streams_uni: u64,
+        streams_bidi: u64,
+        data: u64,
+    ) -> &mut Self {
+        self.config.settings.wt_initial_max_streams_uni = streams_uni;
+        self.config.settings.wt_initial_max_streams_bidi = streams_bidi;
+        self.config.settings.wt_initial_max_data = data;
+        self
+    }
+
     /// Indicates that the client or server supports HTTP/3 datagrams
     ///
     /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>

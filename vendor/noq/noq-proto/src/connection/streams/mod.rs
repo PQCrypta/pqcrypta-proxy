@@ -199,6 +199,22 @@ impl RecvStream<'_> {
         Ok(recv.assembler.bytes_read())
     }
 
+    /// The stream's final size, once the peer has set it: with its FIN, or
+    /// with RESET_STREAM (RFC 9000 section 4.5)
+    ///
+    /// An application whose own flow control counts a stream's data (as
+    /// WebTransport's session limit does, draft-ietf-webtrans-http3 section
+    /// 5.4) counts a reset stream's final size, which the peer counted,
+    /// rather than what it read.
+    pub fn final_size(&self) -> Option<u64> {
+        self.state
+            .recv
+            .get(&self.id)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_open_recv())
+            .and_then(|s| s.final_offset())
+    }
+
     /// Check whether this stream has been reset by the peer, returning the reset error code if so
     ///
     /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will

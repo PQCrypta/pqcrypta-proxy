@@ -326,6 +326,7 @@
     "session_idle_timeout_secs": 60
   },
   "moq": {
+    "allowed_origins": [],
     "authorities": [],
     "cache_mb": 256,
     "enabled": false,

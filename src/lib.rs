@@ -204,6 +204,7 @@ pub mod waf;
 pub mod waf_crs;
 pub mod webtransport_server;
 pub mod ws_tunnel;
+pub mod wt_flow;
 pub mod wt_session;
 
 // Re-export commonly used types

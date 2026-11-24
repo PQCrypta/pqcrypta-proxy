@@ -209,6 +209,30 @@ USE_ALIAS and USE_VALUE are supported, with these errors:
 
 ## WebTransport details
 
+- **Drafts:** the HTTP/3 port speaks draft-ietf-webtrans-http3-17 beside the
+  earlier drafts that browsers use today. It sends SETTINGS_WT_ENABLED with
+  the earlier drafts' two settings, and takes `:protocol` as `webtransport-h3`
+  (draft 17) or `webtransport`. A WebTransport request that comes before the
+  client's SETTINGS waits for them (section 3.1).
+- **Origin:** a browser's Origin is verified at `/moq`: a page on the origin
+  the request names, one `[moq] allowed_origins` lists, or any with `"*"`;
+  others get 403 (section 3.2). A client that sends no Origin is not a
+  browser and is not asked.
+- **Flow control (section 5):** the relay declares initial limits per
+  session (SETTINGS_WT_INITIAL_MAX_STREAMS_UNI and _BIDI, the connection's
+  own stream limits; SETTINGS_WT_INITIAL_MAX_DATA, 16 MiB). Where the client
+  declares limits too, each side is held to the other's: a stream or a byte
+  past the limit closes the session with WT_FLOW_CONTROL_ERROR, credit goes
+  back with WT_MAX_STREAMS and WT_MAX_DATA as streams close and data is
+  read, and the relay waits for credit, saying WT_STREAMS_BLOCKED or
+  WT_DATA_BLOCKED once per limit. Without flow control a draft-17 client has
+  one session per connection; a second CONNECT is reset with
+  H3_REQUEST_REJECTED.
+- **Capsules:** the CONNECT stream's capsules are read: WT_CLOSE_SESSION ends
+  the session with its code, WT_DRAIN_SESSION is noted, and WT_MAX_STREAM_DATA
+  and WT_STREAM_DATA_BLOCKED (HTTP/2's) are a session error. When a session
+  ends, its streams are reset and stopped with WT_SESSION_GONE, and no stream
+  or datagram is opened after it (section 6).
 - **Error codes:** stream error codes on WebTransport are carried in HTTP/3's
   WT_APPLICATION_ERROR range (draft-ietf-webtrans-http3 section 4.4) on both
   WebTransport ports.

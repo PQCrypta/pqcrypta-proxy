@@ -22,6 +22,11 @@ when the proxy builds noq as a dependency.
   handshake is established, an invalid transport parameter, a PATH_CHALLENGE
   probe, the peer's per-stream limit (`SendStream::peer_max_data`), 0-RTT
   counted per connection.
+- `RecvStream::reset_final_size` (and the proto handle's `final_size`): the
+  final size a peer's RESET_STREAM gave, kept when the reset is read, so an
+  application flow control that counts a stream's data (WebTransport's
+  session limit, draft-ietf-webtrans-http3 section 5.4) counts what the peer
+  counted.
 - `Connection::is_settled`: nothing queued or unacknowledged, so a stream-level
   signal (a STOP_SENDING) reaches the peer before a close.
 - A client that rejects the server's handshake says so with CONNECTION_CLOSE.

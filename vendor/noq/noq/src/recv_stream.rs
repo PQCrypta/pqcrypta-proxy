@@ -55,6 +55,9 @@ pub struct RecvStream {
     is_0rtt: bool,
     all_data_read: bool,
     reset: Option<VarInt>,
+    /// The final size the peer's RESET_STREAM gave, kept when the reset is
+    /// read (the stream's state is discarded then)
+    reset_final_size: Option<u64>,
 }
 
 impl RecvStream {
@@ -65,6 +68,7 @@ impl RecvStream {
             is_0rtt,
             all_data_read: false,
             reset: None,
+            reset_final_size: None,
         }
     }
 
@@ -327,6 +331,13 @@ impl RecvStream {
         conn.inner.recv_stream(self.stream).bytes_read()
     }
 
+    /// The final size the peer's RESET_STREAM gave this stream, once a read
+    /// has returned the reset (RFC 9000 section 4.5): the data the peer
+    /// counts as sent on it, read or not
+    pub fn reset_final_size(&self) -> Option<u64> {
+        self.reset_final_size
+    }
+
     /// Completes when the stream has been reset by the peer or otherwise closed
     ///
     /// Yields `Some` with the reset error code when the stream is reset by the peer. Yields `None`
@@ -404,6 +415,8 @@ impl RecvStream {
             Some(code) => ReadStatus::Failed(None, Reset(code)),
             None => {
                 let mut recv = conn.inner.recv_stream(self.stream);
+                // Known once the peer set it; kept if this read finds a reset
+                let final_size = recv.final_size();
                 let mut chunks = recv.read(ordered).map_err(|e| match e {
                     ReadableError::ClosedStream => ReadError::ClosedStream,
                     ReadableError::IllegalOrderedRead => ReadError::ClosedStream,
@@ -411,6 +424,9 @@ impl RecvStream {
                 let status = read_fn(&mut chunks);
                 if chunks.finalize().should_transmit() {
                     conn.wake();
+                }
+                if matches!(status, ReadStatus::Failed(_, Reset(_))) {
+                    self.reset_final_size = final_size;
                 }
                 status
             }
