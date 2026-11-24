@@ -2589,9 +2589,11 @@ mod pending_read_tests {
         let mut send = client_conn.open_uni().await.unwrap();
         send.write_all(b"h").await.unwrap();
         let mut h3conn = h3_quinn::Connection::new(server_conn);
-        let mut recv = std::future::poll_fn(|cx| h3conn.poll_accept_recv(cx))
-            .await
-            .unwrap();
+        let mut recv = std::future::poll_fn(|cx| {
+            h3::quic::Connection::<bytes::Bytes>::poll_accept_recv(&mut h3conn, cx)
+        })
+        .await
+        .unwrap();
         let first = std::future::poll_fn(|cx| recv.poll_data(cx))
             .await
             .unwrap()
