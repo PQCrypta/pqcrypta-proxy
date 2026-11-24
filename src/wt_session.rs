@@ -375,7 +375,8 @@ impl AsyncWrite for H3Send {
             Poll::Ready(n) => n,
             Poll::Pending => return Poll::Pending,
         };
-        let written = Pin::new(&mut this.inner).poll_write(cx, &buf[..room]);
+        // tokio's AsyncWrite, not quinn's own poll_write (a WriteError)
+        let written = AsyncWrite::poll_write(Pin::new(&mut this.inner), cx, &buf[..room]);
         match &written {
             Poll::Ready(Ok(n)) => this.flow.unreserve(room - n),
             _ => this.flow.unreserve(room),
@@ -384,11 +385,11 @@ impl AsyncWrite for H3Send {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        AsyncWrite::poll_flush(Pin::new(&mut self.get_mut().inner), cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.get_mut().inner), cx)
     }
 }
 
@@ -731,8 +732,6 @@ impl WtSession for H3Session {
     }
 }
 
-/// A QUIC variable-length integer (RFC 9000 section 16), in its shortest
-/// form; `value` is below 2^62.
 // ── A session's CONNECT stream (h3) ──────────────────────────────────────────
 
 /// How the task that holds a session's CONNECT stream ended it.
@@ -839,6 +838,8 @@ pub async fn hold_connect_stream<F: Future>(
     (output, end)
 }
 
+/// A QUIC variable-length integer (RFC 9000 section 16), in its shortest
+/// form; `value` is below 2^62.
 fn put_varint(out: &mut Vec<u8>, value: u64) {
     let (len, tag) = match value {
         0..=0x3f => (1, 0x00),

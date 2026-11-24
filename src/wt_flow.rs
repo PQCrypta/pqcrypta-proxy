@@ -179,8 +179,12 @@ impl Flow {
     /// Resolves with the first session error raised.
     pub async fn violation(&self) -> FlowError {
         let mut raised = self.violated.subscribe();
-        match raised.wait_for(Option::is_some).await {
-            Ok(e) => e.clone().unwrap_or(FlowError::flow("a session error")),
+        let first = raised
+            .wait_for(Option::is_some)
+            .await
+            .map(|e| e.clone().unwrap_or(FlowError::flow("a session error")));
+        match first {
+            Ok(e) => e,
             // The sender lives in `self`, which outlives this borrow
             Err(_) => std::future::pending().await,
         }

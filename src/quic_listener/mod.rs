@@ -1780,6 +1780,8 @@ impl QuicListener {
         // waiting for them (draft-ietf-webtrans-http3-17 section 3.1: a
         // server processes none before), the connection served meanwhile
         let mut awaiting_settings = futures_util::stream::FuturesUnordered::new();
+        // What this connection's SETTINGS declared (the builder's own)
+        let wt_limits = wt_initial_limits(&config);
 
         loop {
             let step = tokio::select! {
