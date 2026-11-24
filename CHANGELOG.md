@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.2...v0.22.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **moq:** a silent publisher of a namespace does not hold a FETCH ([e19aff5](https://github.com/PQCrypta/pqcrypta-proxy/commit/e19aff54b5ae666e1323fcabecf51a824143c7f1))
+
 ## [0.22.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.1...v0.22.2) (2026-11-24)
 
 
