@@ -856,6 +856,148 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    /// A WebTransport session's CONNECT stream end to end, over loopback QUIC
+    /// with the vendored h3 on both ends: the client's WT_MAX_DATA reaches
+    /// the session's flow control, the session's own capsule reaches the
+    /// client, and the client's WT_CLOSE_SESSION ends the session with its
+    /// code and message (draft-ietf-webtrans-http3-17 sections 5.6 and 6)
+    #[tokio::test]
+    async fn the_connect_stream_carries_capsules_both_ways() {
+        use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
+        use crate::wt_flow::{capsule, capsule_u64, Limits, WT_MAX_DATA, WT_MAX_STREAMS_UNI};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let throwaway = throwaway_cert();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("QUIC server"),
+            )),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("a server port");
+        let addr = server.local_addr().expect("its address");
+
+        let peer = Limits {
+            streams_uni: 1,
+            streams_bidi: 1,
+            data: 10,
+        };
+        let serving = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut h3 = h3::server::builder()
+                .enable_extended_connect(true)
+                .enable_webtransport(true)
+                .build(h3_quinn::Connection::new(conn.clone()))
+                .await
+                .unwrap();
+            let resolver = h3.accept().await.unwrap().expect("the CONNECT");
+            let (request, mut stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(
+                request.extensions().get::<h3::ext::Protocol>(),
+                Some(&h3::ext::Protocol::WEB_TRANSPORT_H3)
+            );
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+            let (tx, rx) = mpsc::unbounded_channel();
+            let flow = Flow::new(true, peer, peer, tx.clone());
+            let (session, _feed) = H3Session::new(stream.send_id().into_inner(), conn, flow);
+            // The session's own capsule, out before anything else
+            tx.send(capsule_u64(WT_MAX_STREAMS_UNI, 9)).unwrap();
+            let close_requests = session.close_requests();
+            let (_, end) = hold_connect_stream(
+                stream,
+                &session,
+                rx,
+                close_requests,
+                std::future::pending::<()>(),
+                Duration::from_millis(10),
+            )
+            .await;
+            // The client's WT_MAX_DATA raised what this side may send
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let room = session.flow().reserve(100, &mut cx);
+            drop(h3);
+            (end, room)
+        });
+
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTo(throwaway.der.clone(), provider)))
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let client = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        )));
+        let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send) = h3::client::builder()
+            .enable_extended_connect(true)
+            .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let mut connect = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://localhost/moq")
+            .body(())
+            .unwrap();
+        connect
+            .extensions_mut()
+            .insert(h3::ext::Protocol::WEB_TRANSPORT_H3);
+        let mut stream = send.send_request(connect).await.unwrap();
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        // The session's capsule comes to the client
+        let mut reader = CapsuleReader::default();
+        let mut got = Vec::new();
+        while got.is_empty() {
+            let mut data = tokio::time::timeout(Duration::from_secs(5), stream.recv_data())
+                .await
+                .expect("the session's capsule")
+                .unwrap()
+                .expect("data");
+            got = reader.push(data.copy_to_bytes(data.remaining())).unwrap();
+        }
+        assert_eq!(got[0].0, WT_MAX_STREAMS_UNI);
+
+        stream
+            .send_data(capsule_u64(WT_MAX_DATA, 5000))
+            .await
+            .unwrap();
+        let mut close = 7u32.to_be_bytes().to_vec();
+        close.extend_from_slice(b"bye");
+        stream
+            .send_data(capsule(crate::wt_flow::WT_CLOSE_SESSION, &close))
+            .await
+            .unwrap();
+        let (end, room) = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the session ends")
+            .unwrap();
+        match end {
+            SessionEnd::PeerClosed { code, reason } => {
+                assert_eq!((code, reason.as_str()), (7, "bye"));
+            }
+            other => panic!("ended otherwise: {other:?}"),
+        }
+        assert_eq!(room, Poll::Ready(100), "WT_MAX_DATA 5000 was applied");
+    }
+
     #[test]
     fn varints_take_the_shortest_form() {
         let enc = |v| {
