@@ -1035,6 +1035,20 @@ mod tests {
             .unwrap();
         stream.send_data(close_capsule(7, b"bye")).await.unwrap();
         stream.finish().await.unwrap();
+        // The session answers with the end of its side (section 6: the
+        // recipient closes or resets the stream)
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match stream.recv_data().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return true,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("the session's end of the stream");
+        assert!(ended, "closed with FIN");
         let (end, room) = tokio::time::timeout(Duration::from_secs(5), serving)
             .await
             .expect("the session ends")
