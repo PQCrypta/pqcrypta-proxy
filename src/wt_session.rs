@@ -816,7 +816,7 @@ pub async fn hold_connect_stream<F: Future>(
                                 }
                             }
                         };
-                        if let Ok(false) = tokio::time::timeout(CLOSE_FIN_WAIT, fin).await {
+                        if tokio::time::timeout(CLOSE_FIN_WAIT, fin).await == Ok(false) {
                             break 'read SessionEnd::Error(after());
                         }
                         break 'read SessionEnd::PeerClosed { code, reason };
@@ -894,13 +894,16 @@ mod tests {
     /// server's session, held by [`hold_connect_stream`] with flow control
     /// granting and held to `limits`, `first` queued for the client before
     /// anything else, giving how it ended and what may be written after
-    /// (100 bytes asked).
+    /// (100 bytes asked). The server keeps its connection until `release`
+    /// fires, so what it sent last reaches the client before the connection
+    /// goes.
     async fn loopback_session(
         limits: Limits,
         first: Bytes,
     ) -> (
         h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         tokio::task::JoinHandle<(SessionEnd, Poll<usize>)>,
+        tokio::sync::oneshot::Sender<()>,
         quinn::Endpoint,
     ) {
         use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
@@ -922,6 +925,7 @@ mod tests {
         )
         .expect("a server port");
         let addr = server.local_addr().expect("its address");
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let serving = tokio::spawn(async move {
             let conn = server.accept().await.unwrap().await.unwrap();
             let mut h3 = h3::server::builder()
@@ -956,6 +960,7 @@ mod tests {
             .await;
             let mut cx = Context::from_waker(std::task::Waker::noop());
             let room = session.flow().reserve(100, &mut cx);
+            let _ = tokio::time::timeout(Duration::from_secs(5), released).await;
             drop(h3);
             (end, room)
         });
@@ -991,7 +996,7 @@ mod tests {
         let mut stream = send.send_request(connect).await.unwrap();
         let response = stream.recv_response().await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
-        (stream, serving, client)
+        (stream, serving, release, client)
     }
 
     fn close_capsule(code: u32, message: &[u8]) -> Bytes {
@@ -1013,7 +1018,7 @@ mod tests {
             streams_bidi: 1,
             data: 10,
         };
-        let (mut stream, serving, _client) =
+        let (mut stream, serving, release, _client) =
             loopback_session(limits, capsule_u64(WT_MAX_STREAMS_UNI, 9)).await;
 
         // The session's capsule comes to the client
@@ -1049,6 +1054,7 @@ mod tests {
         .await
         .expect("the session's end of the stream");
         assert!(ended, "closed with FIN");
+        let _ = release.send(());
         let (end, room) = tokio::time::timeout(Duration::from_secs(5), serving)
             .await
             .expect("the session ends")
@@ -1071,8 +1077,9 @@ mod tests {
             streams_bidi: 1,
             data: 10,
         };
-        let (mut stream, serving, _client) =
+        let (mut stream, serving, release, _client) =
             loopback_session(limits, capsule_u64(WT_MAX_DATA, 10)).await;
+        let _ = release.send(());
         stream.send_data(close_capsule(7, b"bye")).await.unwrap();
         stream
             .send_data(capsule_u64(WT_MAX_DATA, 5000))
