@@ -736,6 +736,10 @@ impl WtSession for H3Session {
 
 // ── A session's CONNECT stream (h3) ──────────────────────────────────────────
 
+/// How long the peer's FIN may take after its WT_CLOSE_SESSION, which it
+/// sends at once (draft-ietf-webtrans-http3-17 section 6)
+const CLOSE_FIN_WAIT: Duration = Duration::from_secs(1);
+
 /// How the task that holds a session's CONNECT stream ended it.
 #[derive(Debug)]
 pub enum SessionEnd {
@@ -789,9 +793,32 @@ pub async fn hold_connect_stream<F: Future>(
                 Ok(read) => read,
                 Err(e) => break SessionEnd::Error(e),
             };
-            for (kind, value) in read {
+            let count = read.len();
+            for (at, (kind, value)) in read.into_iter().enumerate() {
                 match flow.capsule(kind, &value) {
                     Ok(Capsule::Close { code, reason }) => {
+                        // Section 6: the peer's FIN follows at once, and any
+                        // stream data after the capsule resets the stream
+                        // with H3_MESSAGE_ERROR
+                        let after = || FlowError {
+                            code: crate::wt_flow::H3_MESSAGE_ERROR,
+                            reason: "stream data after WT_CLOSE_SESSION",
+                        };
+                        if at + 1 < count || reader.has_pending() {
+                            break 'read SessionEnd::Error(after());
+                        }
+                        let fin = async {
+                            loop {
+                                match recv.recv_data().await {
+                                    Ok(Some(data)) if data.has_remaining() => return false,
+                                    Ok(Some(_)) => {}
+                                    _ => return true,
+                                }
+                            }
+                        };
+                        if let Ok(false) = tokio::time::timeout(CLOSE_FIN_WAIT, fin).await {
+                            break 'read SessionEnd::Error(after());
+                        }
                         break 'read SessionEnd::PeerClosed { code, reason };
                     }
                     Ok(Capsule::Drain) => {
@@ -860,15 +887,23 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
-    /// A WebTransport session's CONNECT stream end to end, over loopback QUIC
-    /// with the vendored h3 on both ends: the client's WT_MAX_DATA reaches
-    /// the session's flow control, the session's own capsule reaches the
-    /// client, and the client's WT_CLOSE_SESSION ends the session with its
-    /// code and message (draft-ietf-webtrans-http3-17 sections 5.6 and 6)
-    #[tokio::test]
-    async fn the_connect_stream_carries_capsules_both_ways() {
+    use crate::wt_flow::{capsule, capsule_u64, Limits, WT_CLOSE_SESSION, WT_MAX_DATA};
+
+    /// A session over loopback QUIC with the vendored h3 on both ends: the
+    /// client's CONNECT stream, after a 200 for `webtransport-h3`; and the
+    /// server's session, held by [`hold_connect_stream`] with flow control
+    /// granting and held to `limits`, `first` queued for the client before
+    /// anything else, giving how it ended and what may be written after
+    /// (100 bytes asked).
+    async fn loopback_session(
+        limits: Limits,
+        first: Bytes,
+    ) -> (
+        h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        tokio::task::JoinHandle<(SessionEnd, Poll<usize>)>,
+        quinn::Endpoint,
+    ) {
         use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
-        use crate::wt_flow::{capsule, capsule_u64, Limits, WT_MAX_DATA, WT_MAX_STREAMS_UNI};
         use std::net::{Ipv4Addr, SocketAddr};
 
         let throwaway = throwaway_cert();
@@ -887,12 +922,6 @@ mod tests {
         )
         .expect("a server port");
         let addr = server.local_addr().expect("its address");
-
-        let peer = Limits {
-            streams_uni: 1,
-            streams_bidi: 1,
-            data: 10,
-        };
         let serving = tokio::spawn(async move {
             let conn = server.accept().await.unwrap().await.unwrap();
             let mut h3 = h3::server::builder()
@@ -912,10 +941,9 @@ mod tests {
                 .await
                 .unwrap();
             let (tx, rx) = mpsc::unbounded_channel();
-            let flow = Flow::new(true, peer, peer, tx.clone());
+            let flow = Flow::new(true, limits, limits, tx.clone());
             let (session, _feed) = H3Session::new(stream.send_id().into_inner(), conn, flow);
-            // The session's own capsule, out before anything else
-            tx.send(capsule_u64(WT_MAX_STREAMS_UNI, 9)).unwrap();
+            tx.send(first).unwrap();
             let close_requests = session.close_requests();
             let (_, end) = hold_connect_stream(
                 stream,
@@ -926,9 +954,7 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await;
-            // The client's WT_MAX_DATA raised what this side may send
-            let waker = std::task::Waker::noop();
-            let mut cx = Context::from_waker(waker);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
             let room = session.flow().reserve(100, &mut cx);
             drop(h3);
             (end, room)
@@ -965,6 +991,30 @@ mod tests {
         let mut stream = send.send_request(connect).await.unwrap();
         let response = stream.recv_response().await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
+        (stream, serving, client)
+    }
+
+    fn close_capsule(code: u32, message: &[u8]) -> Bytes {
+        let mut value = code.to_be_bytes().to_vec();
+        value.extend_from_slice(message);
+        capsule(WT_CLOSE_SESSION, &value)
+    }
+
+    /// A WebTransport session's CONNECT stream end to end: the session's own
+    /// capsule reaches the client, the client's WT_MAX_DATA reaches the
+    /// session's flow control, and its WT_CLOSE_SESSION then FIN end the
+    /// session with its code and message (draft-ietf-webtrans-http3-17
+    /// sections 5.6 and 6)
+    #[tokio::test]
+    async fn the_connect_stream_carries_capsules_both_ways() {
+        use crate::wt_flow::WT_MAX_STREAMS_UNI;
+        let limits = Limits {
+            streams_uni: 1,
+            streams_bidi: 1,
+            data: 10,
+        };
+        let (mut stream, serving, _client) =
+            loopback_session(limits, capsule_u64(WT_MAX_STREAMS_UNI, 9)).await;
 
         // The session's capsule comes to the client
         let mut reader = CapsuleReader::default();
@@ -983,12 +1033,8 @@ mod tests {
             .send_data(capsule_u64(WT_MAX_DATA, 5000))
             .await
             .unwrap();
-        let mut close = 7u32.to_be_bytes().to_vec();
-        close.extend_from_slice(b"bye");
-        stream
-            .send_data(capsule(crate::wt_flow::WT_CLOSE_SESSION, &close))
-            .await
-            .unwrap();
+        stream.send_data(close_capsule(7, b"bye")).await.unwrap();
+        stream.finish().await.unwrap();
         let (end, room) = tokio::time::timeout(Duration::from_secs(5), serving)
             .await
             .expect("the session ends")
@@ -1000,6 +1046,32 @@ mod tests {
             other => panic!("ended otherwise: {other:?}"),
         }
         assert_eq!(room, Poll::Ready(100), "WT_MAX_DATA 5000 was applied");
+    }
+
+    /// Stream data after WT_CLOSE_SESSION resets the CONNECT stream with
+    /// H3_MESSAGE_ERROR (draft-ietf-webtrans-http3-17 section 6)
+    #[tokio::test]
+    async fn data_after_wt_close_session_is_a_message_error() {
+        let limits = Limits {
+            streams_uni: 1,
+            streams_bidi: 1,
+            data: 10,
+        };
+        let (mut stream, serving, _client) =
+            loopback_session(limits, capsule_u64(WT_MAX_DATA, 10)).await;
+        stream.send_data(close_capsule(7, b"bye")).await.unwrap();
+        stream
+            .send_data(capsule_u64(WT_MAX_DATA, 5000))
+            .await
+            .unwrap();
+        let (end, _) = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the session ends")
+            .unwrap();
+        match end {
+            SessionEnd::Error(e) => assert_eq!(e.code, crate::wt_flow::H3_MESSAGE_ERROR),
+            other => panic!("ended otherwise: {other:?}"),
+        }
     }
 
     #[test]
