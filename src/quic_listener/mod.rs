@@ -2630,12 +2630,13 @@ mod pending_read_tests {
     #[tokio::test]
     async fn a_webtransport_stream_alone_is_accepted() {
         let (client_conn, server_conn, _client, _server) = connected().await;
-        let mut h3 = h3::server::builder()
-            .enable_extended_connect(true)
-            .enable_webtransport(true)
-            .build(h3_quinn::Connection::new(server_conn))
-            .await
-            .unwrap();
+        let mut h3: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
+            h3::server::builder()
+                .enable_extended_connect(true)
+                .enable_webtransport(true)
+                .build(h3_quinn::Connection::new(server_conn))
+                .await
+                .unwrap();
         // WT_STREAM's unidirectional type (0x54, a two-byte varint),
         // session 0, and one byte of data
         let mut send = client_conn.open_uni().await.unwrap();
