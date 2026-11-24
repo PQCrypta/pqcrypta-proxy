@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.0...v0.22.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **webtransport:** WT_CLOSE_SESSION's message is at most 1024 bytes of UTF-8, and stream data after it resets the CONNECT stream with H3_MESSAGE_ERROR (draft-ietf-webtrans-http3-17 section 6); the session's end waits a moment for the peer's FIN, which follows at once ([9bf8053](https://github.com/PQCrypta/pqcrypta-proxy/commit/9bf8053311d8c0eac79917926f6d1dd1bde56868))
+
 ## [0.22.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.4...v0.22.0) (2026-11-24)
 
 
