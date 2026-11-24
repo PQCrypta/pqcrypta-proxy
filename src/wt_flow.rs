@@ -364,8 +364,24 @@ impl Flow {
                     });
                 }
                 let code = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
-                let reason = String::from_utf8_lossy(&value[4..]).into_owned();
-                return Ok(Capsule::Close { code, reason });
+                // Section 6: a message past 1024 bytes, or not UTF-8, resets
+                // the stream with H3_MESSAGE_ERROR
+                if value.len() - 4 > CLOSE_MESSAGE_MAX {
+                    return Err(FlowError {
+                        code: H3_MESSAGE_ERROR,
+                        reason: "a WT_CLOSE_SESSION message over 1024 bytes",
+                    });
+                }
+                let Ok(reason) = std::str::from_utf8(&value[4..]) else {
+                    return Err(FlowError {
+                        code: H3_MESSAGE_ERROR,
+                        reason: "a WT_CLOSE_SESSION message that is not UTF-8",
+                    });
+                };
+                return Ok(Capsule::Close {
+                    code,
+                    reason: reason.to_string(),
+                });
             }
             WT_DRAIN_SESSION => return Ok(Capsule::Drain),
             WT_MAX_STREAM_DATA | WT_STREAM_DATA_BLOCKED => {
@@ -449,6 +465,9 @@ impl Flow {
 /// H3_MESSAGE_ERROR (RFC 9114 section 8.1): a malformed capsule
 pub const H3_MESSAGE_ERROR: u64 = 0x10e;
 
+/// The longest Application Error Message WT_CLOSE_SESSION carries (section 6)
+const CLOSE_MESSAGE_MAX: usize = 1024;
+
 /// A stream the peer opened, counted until both its halves are dropped.
 #[derive(Clone, Debug)]
 pub struct StreamSlot(Arc<SlotInner>);
@@ -529,6 +548,11 @@ pub struct CapsuleReader {
 }
 
 impl CapsuleReader {
+    /// Whether bytes of a capsule not yet whole are held, or being skipped.
+    pub fn has_pending(&self) -> bool {
+        !self.buf.is_empty() || self.skipping > 0
+    }
+
     /// The capsules `data` completes, or the session error a malformed or
     /// oversized one is.
     pub fn push(&mut self, mut data: Bytes) -> Result<Vec<(u64, Bytes)>, FlowError> {
@@ -725,6 +749,12 @@ mod tests {
             f.capsule(WT_MAX_DATA, &[0x40, 0x10]).unwrap_err().reason,
             "a WT_MAX_DATA that does not increase"
         );
+        // OURS' 4 streams are the peer's initial limits here: 4 again does
+        // not increase them
+        assert_eq!(
+            f.capsule(WT_MAX_STREAMS_UNI, &[4]).unwrap_err().reason,
+            "a WT_MAX_STREAMS that does not increase"
+        );
         let mut big = Vec::new();
         put_varint(&mut big, (1 << 60) + 1);
         assert!(f.capsule(WT_MAX_STREAMS_BIDI, &big).is_err());
@@ -737,6 +767,27 @@ mod tests {
         assert_eq!(off.capsule(WT_MAX_DATA, &[0]).unwrap(), Capsule::Handled);
         assert!(off.peer_opened(false).is_ok());
         assert!(off.peer_data(u64::MAX / 2).is_ok());
+    }
+
+    /// WT_CLOSE_SESSION's message: up to 1024 bytes of UTF-8, or the stream
+    /// is reset with H3_MESSAGE_ERROR (section 6)
+    #[test]
+    fn a_close_message_is_utf8_and_at_most_1024_bytes() {
+        let (f, _rx) = flow(OURS);
+        let close = |message: &[u8]| {
+            let mut v = 9u32.to_be_bytes().to_vec();
+            v.extend_from_slice(message);
+            f.capsule(WT_CLOSE_SESSION, &v)
+        };
+        assert_eq!(
+            close(&[b'a'; 1024]).unwrap(),
+            Capsule::Close {
+                code: 9,
+                reason: "a".repeat(1024)
+            }
+        );
+        assert_eq!(close(&[b'a'; 1025]).unwrap_err().code, H3_MESSAGE_ERROR);
+        assert_eq!(close(&[0xff, 0xfe]).unwrap_err().code, H3_MESSAGE_ERROR);
     }
 
     /// Capsules come whole however the data is split, unknown ones skipped
