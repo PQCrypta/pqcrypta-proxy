@@ -2641,13 +2641,17 @@ mod pending_read_tests {
         // session 0, and one byte of data
         let mut send = client_conn.open_uni().await.unwrap();
         send.write_all(&[0x40, 0x54, 0x00, b'x']).await.unwrap();
-        // Taken on the poll that reads it. Without the fix some timer of the
-        // connection's woke the accept after about 3 s on loopback, and
-        // nothing did for a browser's session
-        let accepted = tokio::time::timeout(Duration::from_secs(1), h3.accept_any())
-            .await
-            .expect("accepted with no other stream to wake it")
-            .unwrap();
+        // Taken on the poll that reads it. The deadline is checked first: a
+        // timeout that polls the accept when it fires would wake it itself
+        // and hide the missing wakeup (without the fix the accept returned
+        // only when such a timer fired; for a browser's session, nothing did)
+        let accepted = tokio::select! {
+            biased;
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                panic!("not accepted: nothing woke the accept for the stream")
+            }
+            accepted = h3.accept_any() => accepted.unwrap(),
+        };
         let Some(h3::server::Accepted::WebTransportUni { session, .. }) = accepted else {
             panic!("a WebTransport stream");
         };
