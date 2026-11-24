@@ -1049,14 +1049,14 @@ mod tests {
             loop {
                 match stream.recv_data().await {
                     Ok(Some(_)) => {}
-                    Ok(None) => return true,
-                    Err(_) => return false,
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(e.to_string()),
                 }
             }
         })
         .await
         .expect("the session's end of the stream");
-        assert!(ended, "closed with FIN");
+        assert_eq!(ended, Ok(()), "closed with FIN");
         let _ = release.send(());
         let (end, room) = tokio::time::timeout(Duration::from_secs(5), serving)
             .await
