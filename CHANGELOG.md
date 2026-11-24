@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.22.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.4...v0.22.0) (2026-11-24)
+
+
+### Features
+
+* **webtransport:** draft 17's session rules at the listener: SETTINGS_WT_ENABLED, no request before the client's SETTINGS, one session without flow control, and a browser's Origin verified at /moq ([e695536](https://github.com/PQCrypta/pqcrypta-proxy/commit/e695536da5ab231eeab15add16aaa804a5986a58))
+* **webtransport:** every :protocol token reaches the listener, and the h3 fork speaks WebTransport draft 17's settings ([416c5ff](https://github.com/PQCrypta/pqcrypta-proxy/commit/416c5ffad0352689925e439c6f978a9409e23b57))
+* **webtransport:** per-session flow control and the CONNECT stream's capsules (draft-ietf-webtrans-http3-17 sections 5 and 6) ([ce174bc](https://github.com/PQCrypta/pqcrypta-proxy/commit/ce174bc9297c479f5e682305d7ba105e93df4924))
+
+
+### Bug Fixes
+
+* **webtransport:** clippy: the HTTP/3 backend body boxed (its stream state outgrew hyper's), short first doc paragraphs, assert_eq on the capsules sent ([2dde3d1](https://github.com/PQCrypta/pqcrypta-proxy/commit/2dde3d16f04fa3f95b1b2683bfb33a7fca3d4a4b))
+* **webtransport:** the round compiles: the accept loop computes its own initial limits, H3Send calls tokio's AsyncWrite rather than quinn's poll_write, a violation's error is cloned out of its borrow, the h3 fork's SETTINGS tests fill the larger array ([c633a03](https://github.com/PQCrypta/pqcrypta-proxy/commit/c633a03e79325969156ab60d8e8d1c252d2a6c34))
+
 ## [0.21.4](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.3...v0.21.4) (2026-11-24)
 
 
