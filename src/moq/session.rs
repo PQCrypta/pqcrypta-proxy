@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
+use futures_util::StreamExt as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
@@ -1432,21 +1433,37 @@ impl<T: Transport> Session<T> {
         }
         let ads = self.relay.publishers_for(&track.name.namespace);
         if !ads.is_empty() {
-            let attempts: Vec<_> = ads
+            // Through every publisher of the namespace at once, going on at
+            // the first that answers: a publisher that went without closing
+            // (a restarted one, still advertised until its idle timeout) held
+            // every request for the track until it was given up on
+            let mut attempts: futures_util::stream::FuturesUnordered<_> = ads
                 .iter()
                 .map(|ad| {
                     ad.publisher
                         .subscribe_upstream(Arc::clone(track), new_group)
                 })
                 .collect();
-            let results = futures_util::future::join_all(attempts).await;
-            if results.iter().any(Result::is_ok) || track.has_publisher() {
+            let mut refused = None;
+            while let Some(r) = attempts.next().await {
+                match r {
+                    Ok(()) => {
+                        // The others finish on their own: one dropped part
+                        // way would leave its SUBSCRIBE unanswered upstream
+                        if !attempts.is_empty() {
+                            tokio::spawn(async move { while attempts.next().await.is_some() {} });
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        refused.get_or_insert(e);
+                    }
+                }
+            }
+            if track.has_publisher() {
                 return Ok(());
             }
-            let (code, reason) = results
-                .into_iter()
-                .find_map(Result::err)
-                .unwrap_or((0x10, String::new()));
+            let (code, reason) = refused.unwrap_or((0x10, String::new()));
             let code = match code {
                 0x1 => RequestCode::Unauthorized,
                 0x2 => RequestCode::Timeout,
@@ -3202,7 +3219,12 @@ async fn fill_from_upstream(
         .into_iter()
         .find_map(|p| p.fetch(track.name.clone(), a, b, budget));
     if answer.is_none() {
-        for ad in relay.publishers_for(&track.name.namespace) {
+        // The newest advertisement first: a publisher that restarted
+        // advertises again from a new session while its old one, gone
+        // without a close, is listed until its idle timeout
+        let mut ads = relay.publishers_for(&track.name.namespace);
+        ads.sort_by_key(|ad| std::cmp::Reverse(ad.id));
+        for ad in ads {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
                 break;

@@ -1089,6 +1089,79 @@ async fn a_fetch_past_the_cache_is_filled_by_the_namespace_s_publisher() {
     serving.abort();
 }
 
+/// PUBLISH_NAMESPACE `prefix`, with its token: the answer's message type,
+/// and the request's streams, which the advertisement lasts as long as
+async fn advertise(
+    publisher: &mut Client,
+    prefix: &Namespace,
+) -> (u64, (quinn::SendStream, BufReader<quinn::RecvStream>)) {
+    let id = publisher.id();
+    let (send, recv, kind, _) = publisher
+        .request(Message::PublishNamespace(PrefixRequest {
+            request_id: id,
+            prefix: prefix.clone(),
+            params: Params {
+                auth_tokens: vec![token_for(prefix)],
+                ..Params::default()
+            },
+        }))
+        .await;
+    (kind, (send, recv))
+}
+
+/// A publisher that restarted advertises again from a new session while its
+/// old one, gone without a close, is listed until its idle timeout: a FETCH
+/// goes on at the publisher that answers, the newest first, rather than
+/// waiting on the silent one (the music origin's restart, 2026-11-24: every
+/// first FETCH of a song waited 15 s, then came back empty).
+#[tokio::test]
+async fn a_silent_publisher_of_the_namespace_does_not_hold_a_fetch() {
+    let (server, _moq, _accept, cert) = relay().await;
+    let v = Version::Draft23;
+    let t = track();
+    // The old session: advertised, then answers nothing and never closes
+    let mut silent = Client::connect(&server, &cert, v, Setup::default()).await;
+    let (kind, _silent_request) = advertise(&mut silent, &t.namespace).await;
+    assert_eq!(kind, message::REQUEST_OK);
+    // The new one, which answers
+    let mut publisher = Client::connect(&server, &cert, v, Setup::default()).await;
+    let (kind, _request) = advertise(&mut publisher, &t.namespace).await;
+    assert_eq!(kind, message::REQUEST_OK);
+    const PAYLOADS: [&[u8]; 4] = [b"a0", b"a1", b"b0", b"b1"];
+    let objects: Vec<Object> = PAYLOADS
+        .iter()
+        .enumerate()
+        .map(|(i, p)| object(i as u64 / 2, i as u64 % 2, p))
+        .collect();
+    let serving = tokio::spawn(serve_finished_track(publisher.conn.clone(), v, objects));
+
+    let started = tokio::time::Instant::now();
+    let all = fetch_all(
+        &server,
+        &cert,
+        v,
+        &t,
+        Location::new(0, 0),
+        Location::new(1, 1),
+    )
+    .await;
+    assert_eq!(
+        all,
+        PAYLOADS
+            .iter()
+            .map(|p| Ok(Bytes::from_static(p)))
+            .collect::<Vec<_>>(),
+        "every object, from the publisher that answers"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the FETCH waited {:?} on the silent publisher",
+        started.elapsed()
+    );
+    serving.abort();
+    drop(silent);
+}
+
 #[tokio::test]
 async fn an_edge_relay_serves_the_origin_s_tracks() {
     let (origin, _o, _oa, origin_cert) = relay().await;
