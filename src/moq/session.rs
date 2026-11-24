@@ -2450,7 +2450,7 @@ impl<T: Transport> Session<T> {
 
     /// FETCH upstream through this session; entries arrive on the returned
     /// channel, which closes at the end of the response.
-    fn fetch_upstream(
+    pub(super) fn fetch_upstream(
         self: Arc<Self>,
         track: TrackName,
         start: Location,
@@ -2647,6 +2647,17 @@ impl<T: Transport> NamespacePublisher for SessionUpstream<T> {
                 )),
             }
         })
+    }
+
+    fn fetch_through(
+        &self,
+        track: TrackName,
+        start: Location,
+        end: Location,
+        timeout: Duration,
+    ) -> BoxFuture<'static, Option<mpsc::Receiver<FetchEntry>>> {
+        let session = self.session.upgrade();
+        Box::pin(async move { session?.fetch_upstream(track, start, end, timeout) })
     }
 
     fn session_id(&self) -> u64 {
@@ -3181,14 +3192,32 @@ async fn fill_from_upstream(
         covered.timed_out = budget.is_zero() && !gaps.is_empty();
         return covered;
     }
-    let Some(publisher) = track.publishers().into_iter().next() else {
-        return covered;
-    };
-    let (a, b) = (gaps[0].0, gaps[gaps.len() - 1].1);
-    let Some(mut rx) = publisher.fetch(track.name.clone(), a, b, budget) else {
-        return covered;
-    };
     let deadline = tokio::time::Instant::now() + budget;
+    let (a, b) = (gaps[0].0, gaps[gaps.len() - 1].1);
+    // The track's publishers first, then those of its namespace: a track the
+    // relay is no longer subscribed to (a finished one's subscription ends
+    // with it) is fetched through the session that advertised it
+    let mut answer = track
+        .publishers()
+        .into_iter()
+        .find_map(|p| p.fetch(track.name.clone(), a, b, budget));
+    if answer.is_none() {
+        for ad in relay.publishers_for(&track.name.namespace) {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let asked = ad.publisher.fetch_through(track.name.clone(), a, b, left);
+            if let Ok(Some(rx)) = tokio::time::timeout_at(deadline, asked).await {
+                answer = Some(rx);
+                break;
+            }
+        }
+    }
+    let Some(mut rx) = answer else {
+        covered.timed_out = tokio::time::Instant::now() >= deadline;
+        return covered;
+    };
     let mut prior: Option<Location> = None;
     let mut complete = false;
     loop {
@@ -3261,6 +3290,19 @@ fn before(l: Location) -> Location {
     }
 }
 
+/// The last Location before `l` as a FETCH stream names it: the previous
+/// group's last object where the relay knows it, so an End of Range carries
+/// an Object ID a receiver holds as a number; 2^64 - 1, the whole group,
+/// only where it does not.
+fn last_before(l: Location, track: &Track) -> Location {
+    if l.object == 0 {
+        let g = l.group.saturating_sub(1);
+        Location::new(g, track.group_end(g).unwrap_or(u64::MAX))
+    } else {
+        Location::new(l.group, l.object - 1)
+    }
+}
+
 /// Where unknown territory starts after `l`: the next object, or the next
 /// group when `l` ends its group.
 fn after_object(l: Location, track: &Track) -> Location {
@@ -3315,11 +3357,9 @@ fn plan_fetch(
                     continue;
                 }
                 if o.location > cursor {
-                    if let Some(kind) = unknown_kind(cursor, before(o.location)) {
-                        out.push(FetchEntry::EndOfRange {
-                            kind,
-                            end: before(o.location),
-                        });
+                    let end = last_before(o.location, track);
+                    if let Some(kind) = unknown_kind(cursor, end) {
+                        out.push(FetchEntry::EndOfRange { kind, end });
                     }
                 }
                 match o.status {
