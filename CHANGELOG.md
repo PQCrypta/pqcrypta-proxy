@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.1...v0.22.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **moq:** a FETCH past the cache is filled through the namespace's publisher ([2ef26fd](https://github.com/PQCrypta/pqcrypta-proxy/commit/2ef26fd3dfb8615bbc7b489f71a234a9a008f02c))
+
 ## [0.22.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.0...v0.22.1) (2026-11-24)
 
 
