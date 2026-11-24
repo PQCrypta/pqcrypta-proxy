@@ -958,8 +958,11 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await;
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            let room = session.flow().reserve(100, &mut cx);
+            // A Context is not Send: it goes before the await below
+            let room = {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                session.flow().reserve(100, &mut cx)
+            };
             let _ = tokio::time::timeout(Duration::from_secs(5), released).await;
             drop(h3);
             (end, room)
