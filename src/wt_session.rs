@@ -904,7 +904,12 @@ mod tests {
         h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         tokio::task::JoinHandle<(SessionEnd, Poll<usize>)>,
         tokio::sync::oneshot::Sender<()>,
-        quinn::Endpoint,
+        // The client's handles: its connection closes when the last request
+        // sender goes
+        (
+            h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+            quinn::Endpoint,
+        ),
     ) {
         use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
         use std::net::{Ipv4Addr, SocketAddr};
@@ -999,7 +1004,7 @@ mod tests {
         let mut stream = send.send_request(connect).await.unwrap();
         let response = stream.recv_response().await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
-        (stream, serving, release, client)
+        (stream, serving, release, (send, client))
     }
 
     fn close_capsule(code: u32, message: &[u8]) -> Bytes {
