@@ -226,6 +226,7 @@ session is sent GOAWAY and given `goaway_timeout_ms` to move.
 | `max_filter_ranges` | u64 | `64` | MAX_FILTER_RANGES sent in SETUP |
 | `max_auth_token_cache` | u64 | `4096` | MAX_AUTH_TOKEN_CACHE_SIZE sent in SETUP, in bytes |
 | `max_control_message` | u64 | `65535` | MAX_CONTROL_MESSAGE_SIZE sent in SETUP (draft 23); at least 65535 |
+| `allowed_origins` | list | `[]` | Further origins whose pages may open a WebTransport session at `path`. A page on the origin the request names always may, `"*"` admits any, and a client with no Origin (not a browser) is not asked; others get 403 (draft-ietf-webtrans-http3-17 section 3.2) |
 
 ```toml
 [moq]

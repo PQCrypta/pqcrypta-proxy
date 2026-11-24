@@ -162,6 +162,9 @@ path = "/moq"
 # upstream = "moqt://origin.example.com/moq"
 cache_mb = 256
 max_object_kb = 4096
+# Pages on other origins that may open a session at `path`; a page on the
+# origin the request names always may, and "*" admits any.
+# allowed_origins = ["https://player.example.com"]
 
 # =============================
 # TLS Configuration

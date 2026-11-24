@@ -195,12 +195,32 @@ pub fn running() -> Option<Arc<Moq>> {
     SHARED.get().cloned()
 }
 
+/// See [`Moq::origin_allowed`].
+fn origin_allowed(origin: &str, authority: Option<&str>, allowed: &[String]) -> bool {
+    if allowed.iter().any(|a| a == "*") {
+        return true;
+    }
+    let origin = origin.trim();
+    if allowed.iter().any(|a| a.eq_ignore_ascii_case(origin)) {
+        return true;
+    }
+    authority.is_some_and(|authority| {
+        let authority = authority.strip_suffix(":443").unwrap_or(authority);
+        origin
+            .strip_prefix("https://")
+            .is_some_and(|host| host.eq_ignore_ascii_case(authority))
+    })
+}
+
 /// The relay and what its sessions are configured with.
 pub struct Moq {
     pub relay: Arc<Relay>,
     pub settings: Arc<Settings>,
     /// The WebTransport path MoQ answers on
     pub path: String,
+    /// Origins besides the request's own whose pages may open a session
+    /// there (`[moq] allowed_origins`)
+    pub allowed_origins: Vec<String>,
 }
 
 impl Moq {
@@ -257,7 +277,18 @@ impl Moq {
             relay,
             settings,
             path: config.path.clone(),
+            allowed_origins: config.allowed_origins.clone(),
         }))
+    }
+
+    /// Whether a page on `origin` (a browser's Origin header) may open a
+    /// WebTransport session at a request naming `authority`
+    /// (draft-ietf-webtrans-http3-17 section 3.2): a page on the origin the
+    /// request names (`https://` and the authority, its port left out where
+    /// it is 443), one `[moq] allowed_origins` lists, or any where it lists
+    /// `"*"`. An opaque origin (`null`) only with `"*"`.
+    pub fn origin_allowed(&self, origin: &str, authority: Option<&str>) -> bool {
+        origin_allowed(origin, authority, &self.allowed_origins)
     }
 
     /// Serve a QUIC connection from `peer` whose ALPN is `alpn`, a MOQT
@@ -562,6 +593,39 @@ pub fn negotiate_webtransport(field: Option<&str>) -> Option<(Version, String)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A browser's Origin: its own origin passes, port 443 left out or not;
+    /// another passes only when listed, any with "*"; `null` only with "*"
+    #[test]
+    fn a_browser_origin_is_verified() {
+        let none: Vec<String> = Vec::new();
+        let host = Some("pqcrypta.com");
+        assert!(origin_allowed("https://pqcrypta.com", host, &none));
+        assert!(origin_allowed(
+            "https://PQCrypta.com",
+            Some("pqcrypta.com:443"),
+            &none
+        ));
+        assert!(origin_allowed(
+            "https://pqcrypta.com:4433",
+            Some("pqcrypta.com:4433"),
+            &none
+        ));
+        assert!(!origin_allowed(
+            "https://pqcrypta.com",
+            Some("pqcrypta.com:4433"),
+            &none
+        ));
+        assert!(!origin_allowed("http://pqcrypta.com", host, &none));
+        assert!(!origin_allowed("https://evil.example", host, &none));
+        assert!(!origin_allowed("null", host, &none));
+        assert!(!origin_allowed("https://pqcrypta.com", None, &none));
+        let listed = vec!["https://player.example".to_string()];
+        assert!(origin_allowed("https://player.example", host, &listed));
+        assert!(!origin_allowed("https://evil.example", host, &listed));
+        let any = vec!["*".to_string()];
+        assert!(origin_allowed("null", host, &any));
+    }
 
     /// ClusterFuzzLite's crash of 2026-11-23 (moq_control): a SUBSCRIBE_TRACKS
     /// whose FILL_PARAMETERS held a repeated Range Filter and empty ones,

@@ -409,6 +409,13 @@ pub struct MoqConfig {
     /// MAX_CONTROL_MESSAGE_SIZE sent in SETUP (draft 23), in bytes; at least
     /// 65535. Default: 65535.
     pub max_control_message: u64,
+    /// Further origins whose pages may open a WebTransport session at `path`
+    /// (draft-ietf-webtrans-http3-17 section 3.2: a server verifies a
+    /// browser's Origin). A page on the origin the request itself names
+    /// (`https://` and its authority) always may, `"*"` admits every origin,
+    /// and a client that sends no Origin (not a browser) is not asked; any
+    /// other is refused with 403. Default: [].
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for MoqConfig {
@@ -430,6 +437,7 @@ impl Default for MoqConfig {
             max_filter_ranges: 64,
             max_auth_token_cache: 4096,
             max_control_message: 65_535,
+            allowed_origins: Vec::new(),
         }
     }
 }

@@ -507,6 +507,12 @@ pub(crate) fn install_crypto(
 /// `is_conformance_host`, ran `find_route` (an O(routes) scan -- one route in a
 /// test config, sixty on the live edge, nine of them carrying regexes) and
 /// cloned every policy field. Extracted so the caller can resolve it once.
+/// Whether this server's SETTINGS declare initial WebTransport flow control
+/// limits (draft-ietf-webtrans-http3-17 section 5.1). They do not yet, so
+/// flow control is off on every connection and a draft-17 client has one
+/// session per connection.
+const WT_INITIAL_LIMITS_DECLARED: bool = false;
+
 /// How long a MoQ session over WebTransport has to finish once its session
 /// has ended (its tasks see the end at once; this bounds a stuck one)
 const MOQ_SESSION_WIND_DOWN: Duration = Duration::from_secs(5);
@@ -1379,6 +1385,9 @@ impl QuicListener {
             .enable_extended_connect(true)
             .enable_datagram(true)
             .max_webtransport_sessions(config.server.webtransport_max_sessions_per_origin as u64)
+            // draft-ietf-webtrans-http3-17 section 3.1, beside the earlier
+            // drafts' two settings, which clients of those drafts read
+            .wt_enabled(true)
             .build(H3Connection::new(connection.clone()))
             .await;
 
@@ -1730,11 +1739,30 @@ impl QuicListener {
         // listeners give a request's header (`server.max_idle_timeout_secs`).
         let mut resolving = futures_util::stream::FuturesUnordered::new();
         let header_wait = Duration::from_secs(config.server.max_idle_timeout_secs.max(1));
+        // WebTransport requests that came before the client's SETTINGS,
+        // waiting for them (draft-ietf-webtrans-http3-17 section 3.1: a
+        // server processes none before), the connection served meanwhile
+        let mut awaiting_settings = futures_util::stream::FuturesUnordered::new();
 
         loop {
             let step = tokio::select! {
                 Some(resolved) = resolving.next(), if !resolving.is_empty() => {
                     Step::Resolved(resolved)
+                }
+                Some(held) = awaiting_settings.next(), if !awaiting_settings.is_empty() => {
+                    match held {
+                        Some((request, stream)) => {
+                            Step::Resolved(Ok(Ok(h3::server::Resolved::Request(request, stream))))
+                        }
+                        None => {
+                            // Dropping the stream resets it
+                            debug!(
+                                "WebTransport request from {} with no SETTINGS within {:?}",
+                                remote_addr, header_wait
+                            );
+                            continue;
+                        }
+                    }
                 }
                 accepted = h3.accept_any() => Step::Accepted(accepted),
                 () = crate::memory_pressure::idle_at_relief(&mut relief, &activity),
@@ -1846,6 +1874,22 @@ impl QuicListener {
                             remote_addr
                         );
                         spawn_request(stream, request);
+                        continue;
+                    }
+
+                    if h3.peer_settings().is_none()
+                        && request
+                            .extensions()
+                            .get::<Protocol>()
+                            .is_some_and(Protocol::is_webtransport)
+                    {
+                        let arrived = h3.peer_settings_arrived();
+                        awaiting_settings.push(async move {
+                            tokio::time::timeout(header_wait, arrived)
+                                .await
+                                .ok()
+                                .map(|()| (request, stream))
+                        });
                         continue;
                     }
 
@@ -2006,11 +2050,60 @@ impl QuicListener {
                             path, remote_addr, host
                         );
 
+                        // A draft-17 client (its `webtransport-h3` token, or
+                        // its SETTINGS_WT_ENABLED) may have one session per
+                        // connection without flow control, which needs both
+                        // ends to declare initial limits (draft-ietf-webtrans-
+                        // http3-17 section 5.1): a further CONNECT is reset
+                        // with H3_REQUEST_REJECTED
+                        let peer_settings = h3.peer_settings();
+                        let draft17 = protocol_ext == Some(&Protocol::WEB_TRANSPORT_H3)
+                            || peer_settings.is_some_and(|s| s.wt_enabled());
+                        let flow_control = WT_INITIAL_LIMITS_DECLARED
+                            && peer_settings.is_some_and(|s| s.wt_flow_control());
+                        if draft17
+                            && !flow_control
+                            && wt_sessions.values().any(|feed| !feed.has_ended())
+                        {
+                            debug!(
+                                "WebTransport CONNECT from {}: a second session without flow control, reset H3_REQUEST_REJECTED",
+                                remote_addr
+                            );
+                            let mut stream = stream;
+                            stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                            stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+                            continue;
+                        }
+
                         // Media over QUIC over WebTransport: the version is
                         // the one WT-Available-Protocols and WT-Protocol
                         // agree (draft-ietf-moq-transport section 6.2.1,
                         // draft-ietf-webtrans-http3 section 3.3)
                         if let Some(moq) = crate::moq::running().filter(|m| path == m.path) {
+                            // A browser's Origin is verified (draft-ietf-
+                            // webtrans-http3-17 section 3.2); a client that
+                            // sends none is not a browser
+                            let origin = request
+                                .headers()
+                                .get(http::header::ORIGIN)
+                                .map(|o| o.to_str().unwrap_or("null").to_string());
+                            if let Some(origin) = origin.filter(|o| {
+                                !moq.origin_allowed(o, uri.authority().map(|a| a.as_str()))
+                            }) {
+                                debug!(
+                                    "MoQ WebTransport session from {} refused: Origin {} not allowed",
+                                    remote_addr, origin
+                                );
+                                log_outcome(http::StatusCode::FORBIDDEN);
+                                let mut stream = stream;
+                                let refused = http::Response::builder()
+                                    .status(http::StatusCode::FORBIDDEN)
+                                    .body(())?;
+                                if stream.send_response(refused).await.is_ok() {
+                                    let _ = stream.finish().await;
+                                }
+                                continue;
+                            }
                             let offered = request
                                 .headers()
                                 .get("wt-available-protocols")
