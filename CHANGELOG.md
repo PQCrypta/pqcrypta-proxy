@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.4](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.3...v0.21.4) (2026-11-24)
+
+
+### Bug Fixes
+
+* **webtransport:** a WebTransport stream that arrives alone is accepted at once ([d89dcfa](https://github.com/PQCrypta/pqcrypta-proxy/commit/d89dcfafbf6bb6c6892c68f2629ae9a99d3b6bcb))
+
 ## [0.21.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.2...v0.21.3) (2026-11-24)
 
 
