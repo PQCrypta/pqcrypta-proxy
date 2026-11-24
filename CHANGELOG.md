@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.21.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.2...v0.21.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **moq:** a session's end is not a CLOSED_CONTROL_STREAM error ([2c1669f](https://github.com/PQCrypta/pqcrypta-proxy/commit/2c1669f89d45a87a1b36b73007c532e138d280f1))
+* **webtransport:** a stream whose first data comes after its header reaches its session ([555847e](https://github.com/PQCrypta/pqcrypta-proxy/commit/555847e92ff61b6c03744a781057f18cedc09130))
+* **webtransport:** clippy: the HTTP/3 backend body boxed, its stream state having outgrown hyper's ([c264941](https://github.com/PQCrypta/pqcrypta-proxy/commit/c2649410ddaa000152fed49520dd7c7a7ecf7374))
+
 ## [0.21.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.1...v0.21.2) (2026-11-23)
 
 
