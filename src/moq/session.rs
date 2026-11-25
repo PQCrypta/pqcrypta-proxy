@@ -470,13 +470,21 @@ impl<T: Transport> Session<T> {
 
     /// Close the session with a session error (section 6.6).
     fn fail(&self, e: &SessionError) {
+        // Named as sent: a draft-22 session gets PROTOCOL_VIOLATION where 23
+        // has a code of its own
+        let sent = format!(
+            "{} ({:#x}): {}",
+            e.code.name_in(self.version),
+            e.code.code(self.version),
+            e.reason
+        );
         info!(
             "MoQ session {} from {}: closing with {}",
             self.id,
             self.t.peer(),
-            e
+            sent
         );
-        self.note_end(format!("the relay closed it with {e}"));
+        self.note_end(format!("the relay closed it with {sent}"));
         self.relay
             .stats
             .session_errors

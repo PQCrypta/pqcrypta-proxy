@@ -255,6 +255,31 @@ not observable. The relay's tests are in `src/moq/` (codec, message, data,
 relay and session unit tests, and `e2e.rs`, which runs publishers and
 subscribers against the relay over real QUIC connections in both drafts).
 
+### Against other implementations
+
+`e2e.rs`'s `live_an_outside_relay_as_upstream` (ignored unless asked for)
+puts another implementation's relay behind this one as its upstream. A
+subscriber here, in each draft this relay speaks, subscribes to a track that
+something else publishes into that relay, and FETCHes a group only that relay
+holds:
+
+```bash
+MOQ_INTEROP_UPSTREAM=moqt://127.0.0.1:14433 MOQ_INTEROP_CA=ca.pem \
+MOQ_INTEROP_TRACK=moqtail/demo \
+cargo test --lib live_an_outside_relay_as_upstream -- --ignored --nocapture
+```
+
+`MOQ_INTEROP_CA` holds the roots the upstream's certificate chains to. Run
+on 2026-11-25 against moqtail 0.19.0's relay (draft 22) with moqtail's client
+publishing: subscribers on draft 22 and on draft 23 got SUBSCRIBE_OK with the
+upstream's Largest Object, live groups in order, and FETCHes of earlier
+groups filled from it. moqtail's client against this relay, over native QUIC
+and WebTransport: SUBSCRIBE_NAMESPACE, SUBSCRIBE, FETCH and SUBSCRIBE_TRACKS
+all worked. A SUBSCRIBE carrying FILL_PARAMETERS was closed with
+PROTOCOL_VIOLATION: moqtail 0.19.0 puts a parameter count inside the
+parameter's length, which draft 22 does not have (draft 23 has the count and
+no length).
+
 ## Known limits
 
 - **WebTransport over HTTP/2:** not offered; MOQT runs over QUIC only.
