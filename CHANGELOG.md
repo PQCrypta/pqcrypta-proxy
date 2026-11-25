@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.4...v0.23.0) (2026-11-25)
+
+
+### Features
+
+* **quic:** the QUIC listener serves webtransport_port; one WebTransport implementation ([fbfebde](https://github.com/PQCrypta/pqcrypta-proxy/commit/fbfebdeb10848142a56a5e71d937522327c9a411))
+
 ## [0.22.4](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.3...v0.22.4) (2026-11-25)
 
 
