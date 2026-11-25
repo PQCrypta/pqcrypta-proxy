@@ -1289,7 +1289,7 @@ async fn write_framed_json<W: AsyncWrite + Unpin + Send>(
     Ok(())
 }
 
-/// Read exactly `buf.len()` bytes from a wtransport RecvStream.
+/// Read exactly `buf.len()` bytes from a WebTransport stream.
 async fn read_exact<R: AsyncRead + Unpin + Send>(
     recv: &mut R,
     buf: &mut [u8],

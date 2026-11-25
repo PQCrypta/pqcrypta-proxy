@@ -319,10 +319,10 @@ jobs:
       - name: Run noq-proto's and noq's tests
         run: cargo test --manifest-path vendor/noq/Cargo.toml -p noq-proto -p noq --lib
 
-  # The vendored wtransport's tests: the WebTransport server the proxy runs
-  # (the speedtest), its rejection of requests that are not a WebTransport
-  # CONNECT among what it decides. Its manifest repeats the proxy's rustls
-  # patch, as the h3 and noq forks' do.
+  # The vendored wtransport's tests: the WebTransport client of the examples
+  # (speedtest-probe, wt-sessions); the proxy's own WebTransport is the QUIC
+  # listener's. Its manifest repeats the proxy's rustls patch, as the h3 and
+  # noq forks' do.
   wtransport-fork:
     name: wtransport fork tests
     runs-on: ubuntu-latest

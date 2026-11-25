@@ -47,7 +47,7 @@ build until this reference says so too.
 |--------|------|---------|-------------|
 | `bind_address` | string | `"0.0.0.0"` | IP address to bind QUIC/UDP listener |
 | `udp_port` | u16 | `443` | Primary UDP port for QUIC/HTTP3/WebTransport |
-| `additional_ports` | array[u16] | `[4433, 4434]` | Additional ports for WebTransport |
+| `additional_ports` | array[u16] | `[4433, 4434]` | Further ports served over TCP and QUIC, and advertised in Alt-Svc |
 | `max_connections` | u32 | `10000` | Maximum concurrent client connections across every listener (TCP, QUIC, WebTransport); a connection past it is refused. `0` = no limit |
 | `max_streams_per_connection` | u32 | `1000` | Maximum concurrent streams per connection |
 | `keepalive_interval_secs` | u64 | `15` | How often the QUIC listener sends a keep-alive PING, in seconds, so a NAT keeps the path of a connection with a session or tunnel open; an idle connection is still closed after `max_idle_timeout_secs` |
@@ -198,7 +198,8 @@ There are three entrances, all chosen by protocol negotiation, never by port:
 - **WebTransport on the HTTP/3 port:** an extended CONNECT to `path` whose
   `WT-Available-Protocols` lists a MOQT version. The answer's `WT-Protocol`
   names the version chosen; a request that offers none is refused with 400.
-- **WebTransport on the WebTransport server's port**, in the same way.
+- **WebTransport on `webtransport_port`** (4433), in the same way: the same
+  QUIC listener serves that port.
 
 Subscribing is open, held to the per-address rate limits. Publishing (PUBLISH,
 PUBLISH_NAMESPACE) needs an authorization token for the namespace. Tokens are

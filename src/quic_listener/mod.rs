@@ -3,8 +3,10 @@
 //! Accepts QUIC connections, negotiates HTTP/3, and handles WebTransport sessions.
 //! Routes streams and datagrams to configured backends.
 //!
-//! This listener handles QUIC/HTTP3 connections (h3/quinn stack) and runs alongside
-//! `WebTransportServer` (wtransport stack), which handles the dedicated WebTransport port.
+//! One listener a port: `udp_port`, each of `additional_ports`, and
+//! `webtransport_port`, whose connections get windows for bulk transfers
+//! (the speed test's). WebTransport (draft-ietf-webtrans-http3-17 and the
+//! drafts before it) is served on every one.
 
 use http::header::{self, HeaderName, HeaderValue};
 use std::net::SocketAddr;
@@ -516,9 +518,15 @@ const WT_INITIAL_MAX_DATA: u64 = 16 << 20;
 /// (draft-ietf-webtrans-http3-17 section 5.6): as many streams per session as
 /// the connection allows, and [`WT_INITIAL_MAX_DATA`].
 fn wt_initial_limits(config: &ProxyConfig) -> crate::wt_flow::Limits {
+    // A session's streams by server.webtransport_max_streams_per_session, in
+    // each direction, within what QUIC allows the connection (which holds the
+    // CONNECT stream too): set to the connection's own limits, the session's
+    // could never be passed and meant nothing
+    let per_session = u64::from(config.server.webtransport_max_streams_per_session);
     crate::wt_flow::Limits {
-        streams_uni: u64::from(config.server.max_uni_streams_per_connection),
-        streams_bidi: u64::from(config.server.max_streams_per_connection),
+        streams_uni: per_session.min(u64::from(config.server.max_uni_streams_per_connection)),
+        streams_bidi: per_session
+            .min(u64::from(config.server.max_streams_per_connection).saturating_sub(1)),
         data: WT_INITIAL_MAX_DATA,
     }
 }
@@ -868,9 +876,11 @@ impl QuicListener {
 
         // Create transport configuration
         let mut transport_config = TransportConfig::default();
-        // server.quic_congestion_control: BBRv3 by default (see its docs).
+        // server.quic_congestion_control: BBRv3 by default (see its docs); the
+        // speed test reports it as the sender its results were measured with
         transport_config
             .congestion_controller_factory(config.server.quic_congestion_control.factory());
+        crate::speedtest::set_congestion_control(config.server.quic_congestion_control.name());
         // Path MTU discovery to the byte, up to a 1500-byte link (see its docs).
         transport_config.mtu_discovery_config(Some(crate::config::quic_mtu_discovery()));
         transport_config
@@ -894,6 +904,25 @@ impl QuicListener {
         // peer chose to open.
         transport_config.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8 MB connection
         transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2 MB per stream
+
+        // The WebTransport port's connections carry the speed test's bulk
+        // transfers with its latency datagrams beside them: windows for
+        // 200 Mbps and more at 50 ms (64 MB a connection, 32 MB a stream, a
+        // 64 MB send window) and 4 MB datagram buffers, without which 64 KB of
+        // datagrams filled under a download and the connection was aborted
+        // with EXCESSIVE_LOAD. The dedicated WebTransport server had them;
+        // this listener serves the port now.
+        if config.server.udp_port == config.server.webtransport_port {
+            transport_config.receive_window(VarInt::from_u32(64 * 1024 * 1024));
+            transport_config.stream_receive_window(VarInt::from_u32(32 * 1024 * 1024));
+            transport_config.send_window(64 * 1024 * 1024);
+            transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+            transport_config.datagram_send_buffer_size(4 * 1024 * 1024);
+            info!(
+                "QUIC on the WebTransport port {}: windows 64 MB a connection and 32 MB a stream, datagram buffers 4 MB",
+                config.server.udp_port
+            );
+        }
         transport_config.max_idle_timeout(Some(
             Duration::from_secs(config.server.max_idle_timeout_secs)
                 .try_into()
@@ -3706,6 +3735,46 @@ mod listener_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(admitted.is_some(), "a session once the first has ended");
+    }
+
+    /// Sessions held open do not stop the listener: a session once held a
+    /// lock on its origin's counter for as long as it lived, and each further
+    /// session from the same origin parked a runtime worker waiting for it, so
+    /// `worker_threads` + 1 sessions stopped the whole proxy (OriginSlot,
+    /// 2026-09-25). The listener runs alone on a runtime of two workers, its
+    /// clients on another, so a stall shows as a failure, not a hang.
+    #[test]
+    fn sessions_held_open_do_not_stop_the_listener() {
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (addr, der, stop) = server_rt.block_on(listener());
+        let server = server_rt.handle().clone();
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        client_rt.block_on(async move {
+            let wait = Duration::from_secs(10);
+            let mut held = Vec::new();
+            for n in 0..3 {
+                let (conn, endpoint) = connect(addr, &der).await;
+                let mut send = h3_client(conn).await;
+                let mut session = send.send_request(wt_connect()).await.unwrap();
+                let answer = tokio::time::timeout(wait, session.recv_response())
+                    .await
+                    .unwrap_or_else(|_| panic!("session {n} was never answered"))
+                    .unwrap();
+                assert_eq!(answer.status(), http::StatusCode::OK, "session {n}");
+                held.push((session, send, endpoint));
+            }
+            tokio::time::timeout(Duration::from_secs(5), server.spawn(async {}))
+                .await
+                .expect("the listener's runtime stopped running tasks")
+                .unwrap();
+            drop(held);
+        });
+        drop(stop);
+        server_rt.shutdown_background();
     }
 
     /// A WebTransport CONNECT to the relay's entrance, draft 17's token
