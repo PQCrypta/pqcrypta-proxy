@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.23.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.23.0...v0.23.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **deploy:** the post-deploy gate opens the proxy's own WebTransport sessions on every node the site lists ([44b1262](https://github.com/PQCrypta/pqcrypta-proxy/commit/44b12628722ec4f3553b23ea1ffdea3b32434b04))
+* **quic:** the speed test and the telemetry wall are served with no route on every port, as on 4433 before 0.23.0 ([7bac12f](https://github.com/PQCrypta/pqcrypta-proxy/commit/7bac12f62bd23c3f80dbd0409e0a019a785aa24a))
+
 ## [0.23.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.4...v0.23.0) (2026-11-25)
 
 
