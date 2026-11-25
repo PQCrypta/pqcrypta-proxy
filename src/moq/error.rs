@@ -95,6 +95,17 @@ impl SessionCode {
         }
     }
 
+    /// The name of the code sent in `version`: where a draft has no code of
+    /// its own for the condition (draft 22, for most of 23's 0x200-0x401),
+    /// PROTOCOL_VIOLATION, which is what goes on the wire.
+    pub const fn name_in(self, version: Version) -> &'static str {
+        if self.code(version) == 0x3 {
+            "PROTOCOL_VIOLATION"
+        } else {
+            self.name()
+        }
+    }
+
     /// The draft's name for the code, for logs and the admin API.
     pub const fn name(self) -> &'static str {
         match self {
@@ -257,6 +268,23 @@ mod tests {
         );
         assert_eq!(SessionCode::InvalidRequestId.code(Version::Draft22), 0x4);
         assert_eq!(SessionCode::MalformedKeyValue.code(Version::Draft22), 0x6);
+    }
+
+    /// A close is named as sent: draft 22 has no INVALID_PARAMETER (an
+    /// interop session logged one where 0x3 went on the wire)
+    #[test]
+    fn a_code_is_named_as_sent() {
+        let p = SessionCode::InvalidParameter;
+        assert_eq!(p.name_in(Version::Draft23), "INVALID_PARAMETER");
+        assert_eq!(p.name_in(Version::Draft22), "PROTOCOL_VIOLATION");
+        assert_eq!(
+            SessionCode::MalformedPath.name_in(Version::Draft22),
+            "MALFORMED_PATH"
+        );
+        assert_eq!(
+            SessionCode::ProtocolViolation.name_in(Version::Draft23),
+            "PROTOCOL_VIOLATION"
+        );
     }
 
     #[test]
