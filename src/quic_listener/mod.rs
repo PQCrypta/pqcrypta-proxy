@@ -2113,6 +2113,40 @@ impl QuicListener {
                             continue;
                         }
 
+                        // The same admission as every entrance's
+                        // (webtransport_server::admit): a browser's Origin
+                        // against server.webtransport_allowed_origins where
+                        // the route is not the MoQ relay's (which verifies it
+                        // by [moq]'s rules, below), and the per-client and
+                        // per-origin session caps, held while the session lasts
+                        let moq_route = crate::moq::running().is_some_and(|m| path == m.path);
+                        let admission = match crate::webtransport_server::admit(
+                            &config,
+                            request
+                                .headers()
+                                .get(http::header::ORIGIN)
+                                .map(|o| o.to_str().unwrap_or("null")),
+                            remote_addr.ip(),
+                            !moq_route,
+                        ) {
+                            Ok(a) => a,
+                            Err(why) => {
+                                warn!(
+                                    "WebTransport session from {} for {} refused: {}",
+                                    remote_addr, path, why
+                                );
+                                log_outcome(http::StatusCode::FORBIDDEN);
+                                let mut stream = stream;
+                                let refused = http::Response::builder()
+                                    .status(http::StatusCode::FORBIDDEN)
+                                    .body(())?;
+                                if stream.send_response(refused).await.is_ok() {
+                                    let _ = stream.finish().await;
+                                }
+                                continue;
+                            }
+                        };
+
                         // Media over QUIC over WebTransport: the version is
                         // the one WT-Available-Protocols and WT-Protocol
                         // agree (draft-ietf-moq-transport section 6.2.1,
@@ -2202,6 +2236,7 @@ impl QuicListener {
                             let flight = activity.begin();
                             tokio::spawn(async move {
                                 let _flight = flight;
+                                let _admission = admission;
                                 // The MoQ session sees its end and finishes,
                                 // noting how; were it dropped instead, its
                                 // cleanup would still run (moq::session's
@@ -2329,6 +2364,7 @@ impl QuicListener {
                         let flight = activity.begin();
                         tokio::spawn(async move {
                             let _flight = flight;
+                            let _admission = admission;
                             // The CONNECT stream IS the session (Chrome tears
                             // the session down when it is finished or reset):
                             // held for the session's life, its capsules read
@@ -3525,6 +3561,13 @@ mod listener_tests {
     /// the certificate's DER, for the client to pin, and the sender that
     /// stops it
     async fn listener() -> (SocketAddr, Vec<u8>, mpsc::Sender<()>) {
+        listener_with(|_| {}).await
+    }
+
+    /// [`listener`], its config changed by `tune` first
+    async fn listener_with(
+        tune: impl FnOnce(&mut ProxyConfig),
+    ) -> (SocketAddr, Vec<u8>, mpsc::Sender<()>) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let dir = std::env::temp_dir().join(format!(
@@ -3542,6 +3585,7 @@ mod listener_tests {
         config.tls.cert_path = dir.join("localhost.crt");
         config.tls.key_path = dir.join("localhost.key");
         config.moq.enabled = true;
+        tune(&mut config);
         let tls = Arc::new(
             TlsProvider::new(
                 &config.tls,
@@ -3590,6 +3634,78 @@ mod listener_tests {
         )));
         let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
         (conn, endpoint)
+    }
+
+    /// An HTTP/3 client on `conn`, its connection driven
+    async fn h3_client(
+        conn: quinn::Connection,
+    ) -> h3::client::SendRequest<h3_quinn::OpenStreams, Bytes> {
+        let (mut driver, send) = h3::client::builder()
+            .enable_extended_connect(true)
+            .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        send
+    }
+
+    /// Every entrance admits a WebTransport session by the same rules
+    /// (webtransport_server::admit): on this one, a session over the
+    /// per-origin cap is refused 403, and one is admitted again once a
+    /// session has ended. The origin is the relay's own, which [moq]
+    /// admits and no other test sends: the caps are node-wide, tests run in
+    /// one process, and the relay is the process's one, set up by the first
+    #[tokio::test]
+    async fn a_session_over_the_origin_cap_is_refused() {
+        const ORIGIN: &str = "https://localhost";
+        let (addr, der, _stop) =
+            listener_with(|c| c.server.webtransport_max_sessions_per_origin = 1).await;
+        let from = || {
+            let mut r = wt_connect();
+            r.headers_mut()
+                .insert(http::header::ORIGIN, http::HeaderValue::from_static(ORIGIN));
+            r
+        };
+        let wait = Duration::from_secs(5);
+        let (first_conn, _first_endpoint) = connect(addr, &der).await;
+        let mut first_send = h3_client(first_conn.clone()).await;
+        let mut first = first_send.send_request(from()).await.unwrap();
+        let answer = tokio::time::timeout(wait, first.recv_response())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.status(), http::StatusCode::OK);
+
+        // Another connection, the same origin: over the cap
+        let (second_conn, _second_endpoint) = connect(addr, &der).await;
+        let mut second_send = h3_client(second_conn).await;
+        let mut second = second_send.send_request(from()).await.unwrap();
+        let answer = tokio::time::timeout(wait, second.recv_response())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.status(), http::StatusCode::FORBIDDEN);
+
+        // The first ends: its slot is given back
+        drop(first);
+        first_conn.close(0u32.into(), b"");
+        let mut admitted = None;
+        for _ in 0..60 {
+            let mut s = second_send.send_request(from()).await.unwrap();
+            let status = tokio::time::timeout(wait, s.recv_response())
+                .await
+                .unwrap()
+                .unwrap()
+                .status();
+            if status == http::StatusCode::OK {
+                admitted = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(admitted.is_some(), "a session once the first has ended");
     }
 
     /// A WebTransport CONNECT to the relay's entrance, draft 17's token

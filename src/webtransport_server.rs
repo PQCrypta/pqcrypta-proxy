@@ -32,8 +32,6 @@ pub struct WebTransportServer {
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     metrics: Option<Arc<MetricsRegistry>>,
-    /// Per-origin active session counter (origin string → count)
-    origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
     /// Shared security state for WAF inspection of proxied payloads.
     ///
     /// WebTransport stream and datagram payloads are forwarded to the same
@@ -233,7 +231,6 @@ impl WebTransportServer {
             config,
             backend_pool,
             metrics: None,
-            origin_session_counts: Arc::new(DashMap::new()),
             security: None,
             shutdown: None,
             config_updates: None,
@@ -284,7 +281,6 @@ impl WebTransportServer {
         let mut config = self.config.clone();
         let mut backend_pool = self.backend_pool.clone();
         let metrics = self.metrics.clone();
-        let origin_counts = Arc::clone(&self.origin_session_counts);
         let security = self.security.clone();
 
         info!("🌐 WebTransport server listening on {}", self.addr);
@@ -324,7 +320,6 @@ impl WebTransportServer {
             let config_clone = config.clone();
             let backend_clone = backend_pool.clone();
             let session_metrics = metrics.clone();
-            let counts_clone = Arc::clone(&origin_counts);
             let security_clone = security.clone();
             let remote_addr = incoming_session.remote_address();
             // A place under the connection limits, held until the session ends
@@ -350,7 +345,6 @@ impl WebTransportServer {
                     incoming_session,
                     config_clone,
                     backend_clone,
-                    counts_clone,
                     security_clone,
                 )
                 .await
@@ -369,7 +363,6 @@ async fn handle_incoming_session(
     incoming_session: wtransport::endpoint::IncomingSession,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
-    origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
     security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("📨 Processing incoming WebTransport session...");
@@ -535,69 +528,26 @@ async fn handle_incoming_session(
     // The backend this session's requests go to: its own route's.
     let session_target: Option<WtTarget> = route.map(WtTarget::of);
 
-    // SR-02: Origin validation.
-    //
-    // The WebTransport spec requires servers to validate the `Origin` header
-    // to prevent cross-origin abuse from arbitrary web pages.  We reject any
-    // session whose origin is not listed in `server.webtransport_allowed_origins`.
-    //
-    // Behaviour matrix:
-    //   allowed_origins is empty  → non-browser (no Origin header) passes;
-    //                               browser sessions (have Origin) are rejected
-    //                               until the operator configures the list.
-    //   allowed_origins non-empty → Origin must match one of the listed values;
-    //                               sessions without an Origin header are also
-    //                               accepted (non-browser / native clients).
-    let allowed_origins = &config.server.webtransport_allowed_origins;
-    let origin_key = session_request
-        .origin()
-        .map(|o| o.to_string())
-        .unwrap_or_else(|| "no-origin".to_string());
-
-    if let Some(origin) = session_request.origin() {
-        // Browser-sourced session: check against the allowlist.
-        let is_allowed = if allowed_origins.is_empty() {
-            // No origins configured — reject all browser cross-origin sessions.
-            false
-        } else {
-            allowed_origins.iter().any(|o| o == origin)
-        };
-
-        if !is_allowed {
+    // SR-02, WT-RL-01, WT-RL-02: the same admission as every entrance's
+    // (`admit`): a browser's Origin against server.webtransport_allowed_origins
+    // where the route is not the MoQ relay's (which verifies it by [moq]'s
+    // rules, below), and the per-client and per-origin session caps
+    let moq_route = crate::moq::running().is_some_and(|m| path == m.path);
+    let _admission = match admit(
+        &config,
+        session_request.origin(),
+        remote_addr.ip(),
+        !moq_route,
+    ) {
+        Ok(a) => a,
+        Err(why) => {
             warn!(
-                "SR-02: WebTransport session from {} rejected — Origin '{}' not in allowed list",
-                remote_addr, origin
+                "WebTransport session from {} for {} refused: {}",
+                remote_addr, path, why
             );
             session_request.forbidden().await;
             return Ok(());
         }
-        debug!("   Origin: {} ✅", origin);
-    } else {
-        // No Origin header — non-browser / native client; always accepted.
-        debug!("   Origin: (none — non-browser client)");
-    }
-
-    // WT-RL-02: per-client-address session limit.
-    let client_ip = crate::speedtest::canonical_ip(remote_addr.ip());
-    let max_client = config.server.webtransport_max_sessions_per_client;
-    let Some(_client_slot) = ClientSlot::reserve(&CLIENT_SESSIONS, client_ip, max_client) else {
-        warn!(
-            "WT-RL-02: WebTransport session limit ({}) reached for {} — rejecting",
-            max_client, remote_addr
-        );
-        session_request.forbidden().await;
-        return Ok(());
-    };
-
-    // WT-RL-01: Per-origin session limit.
-    let max_sessions = config.server.webtransport_max_sessions_per_origin;
-    let Some(_slot) = OriginSlot::reserve(&origin_session_counts, &origin_key, max_sessions) else {
-        warn!(
-            "WT-RL-01: WebTransport session limit ({}) reached for origin '{}' — rejecting {}",
-            max_sessions, origin_key, remote_addr
-        );
-        session_request.forbidden().await;
-        return Ok(());
     };
 
     // The session's server span, stitched into the caller's trace from the
@@ -630,6 +580,19 @@ async fn handle_incoming_session(
         // WT-Available-Protocols offers and WT-Protocol names
         // (draft-ietf-moq-transport section 6.2.1)
         if let Some(moq) = crate::moq::running().filter(|m| path == m.path) {
+            // A browser's Origin is verified by [moq]'s rules, as at every
+            // entrance (draft-ietf-webtrans-http3-17 section 3.2)
+            if let Some(origin) = session_request
+                .origin()
+                .filter(|o| !moq.origin_allowed(o, Some(session_request.authority())))
+            {
+                debug!(
+                    "MoQ WebTransport session from {} refused: Origin {} not allowed",
+                    remote_addr, origin
+                );
+                session_request.forbidden().await;
+                return Ok(());
+            }
             let offered = session_request
                 .headers()
                 .get("wt-available-protocols")
@@ -680,6 +643,7 @@ async fn handle_incoming_session(
 /// worker was parked, nothing could poll the session holding the lock, and the
 /// proxy stopped outright -- every listener, the admin port, SIGTERM -- until
 /// the hang watchdog restarted it, twice on 2026-09-25.
+#[derive(Debug)]
 struct OriginSlot(Arc<AtomicU32>);
 
 impl OriginSlot {
@@ -713,12 +677,88 @@ impl Drop for OriginSlot {
 /// Sessions open per client address (`server.webtransport_max_sessions_per_client`).
 static CLIENT_SESSIONS: LazyLock<DashMap<IpAddr, u32>> = LazyLock::new(DashMap::new);
 
+/// Sessions open per origin (`server.webtransport_max_sessions_per_origin`),
+/// node-wide: a session counts here whichever entrance it came to
+static ORIGIN_SESSIONS: LazyLock<DashMap<String, Arc<AtomicU32>>> = LazyLock::new(DashMap::new);
+
+/// A WebTransport session's admission, held while it lasts: its claims on
+/// the per-client and per-origin session caps
+#[derive(Debug)]
+pub(crate) struct Admission {
+    _client: ClientSlot,
+    _origin: OriginSlot,
+}
+
+/// Why a WebTransport session was not admitted
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// A browser's Origin not in `server.webtransport_allowed_origins`
+    Origin,
+    /// Its address already holds `webtransport_max_sessions_per_client`
+    ClientCap(u32),
+    /// Its origin already holds `webtransport_max_sessions_per_origin`
+    OriginCap(u32),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Origin => f.write_str("its Origin is not in server.webtransport_allowed_origins"),
+            Self::ClientCap(n) => write!(f, "its address holds {n} sessions already"),
+            Self::OriginCap(n) => write!(f, "its origin holds {n} sessions already"),
+        }
+    }
+}
+
+/// Admit a WebTransport session from `remote` whose browser sent `origin`,
+/// by the same rules at every entrance: where the route's Origin is
+/// verified by `server.webtransport_allowed_origins` (`check_origin`; the
+/// MoQ relay verifies a browser's by `[moq]`'s own rules), a browser's must
+/// be listed there (none listed admits none; a client that sends no Origin
+/// is not a browser, draft-ietf-webtrans-http3-17 section 3.2); then a slot
+/// under the per-client and the per-origin caps, given back when the
+/// admission is dropped.
+pub(crate) fn admit(
+    config: &ProxyConfig,
+    origin: Option<&str>,
+    remote: IpAddr,
+    check_origin: bool,
+) -> Result<Admission, Refusal> {
+    if check_origin {
+        if let Some(o) = origin {
+            if !config
+                .server
+                .webtransport_allowed_origins
+                .iter()
+                .any(|a| a == o)
+            {
+                return Err(Refusal::Origin);
+            }
+        }
+    }
+    let max_client = config.server.webtransport_max_sessions_per_client;
+    let client = ClientSlot::reserve(
+        &CLIENT_SESSIONS,
+        crate::speedtest::canonical_ip(remote),
+        max_client,
+    )
+    .ok_or(Refusal::ClientCap(max_client))?;
+    let max_origin = config.server.webtransport_max_sessions_per_origin;
+    let origin = OriginSlot::reserve(&ORIGIN_SESSIONS, origin.unwrap_or("no-origin"), max_origin)
+        .ok_or(Refusal::OriginCap(max_origin))?;
+    Ok(Admission {
+        _client: client,
+        _origin: origin,
+    })
+}
+
 /// One client address's claim on a concurrent-session slot, given back on drop.
 ///
 /// The count is read and raised under the map shard's lock and nothing awaits
 /// while it is held (see [`OriginSlot`] for what holding it across an await
 /// did). An address's entry goes when its last session ends, so the map holds
 /// only addresses with sessions open.
+#[derive(Debug)]
 struct ClientSlot {
     counts: &'static DashMap<IpAddr, u32>,
     ip: IpAddr,
@@ -1622,7 +1662,10 @@ mod tests {
 
     use super::*;
 
+    /// Each test's own origin: the per-origin session counts are node-wide,
+    /// and tests run in one process
     const ORIGIN: &str = "https://origin.test";
+    const CAPPED_ORIGIN: &str = "https://capped.origin.test";
 
     /// A runtime whose workers can all be parked at once, so a stall shows.
     fn server_runtime() -> tokio::runtime::Runtime {
@@ -1639,6 +1682,7 @@ mod tests {
     async fn server(
         dir: &std::path::Path,
         per_origin: u32,
+        origin: &str,
     ) -> (
         WebTransportServer,
         rustls::pki_types::CertificateDer<'static>,
@@ -1661,7 +1705,7 @@ mod tests {
             .unwrap()
             .port();
         let mut config = ProxyConfig::default();
-        config.server.webtransport_allowed_origins = vec![ORIGIN.to_string()];
+        config.server.webtransport_allowed_origins = vec![origin.to_string()];
         config.server.webtransport_max_sessions_per_origin = per_origin;
         let config = Arc::new(config);
         let crt = dir.join("localhost.crt");
@@ -1701,13 +1745,14 @@ mod tests {
     async fn open(
         endpoint: &wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
         port: u16,
+        origin: &str,
     ) -> Result<wtransport::Connection, wtransport::error::ConnectingError> {
         endpoint
             .connect(
                 wtransport::endpoint::ConnectOptions::builder(format!(
                     "https://localhost:{port}/webtransport"
                 ))
-                .add_header("origin", ORIGIN)
+                .add_header("origin", origin)
                 .build(),
             )
             .await
@@ -1733,7 +1778,7 @@ mod tests {
     fn sessions_from_one_origin_cannot_stop_the_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let server_rt = server_runtime();
-        let (server, root) = server_rt.block_on(server(dir.path(), 100));
+        let (server, root) = server_rt.block_on(server(dir.path(), 100, ORIGIN));
         let port = server.local_addr().port();
         let handle = server_rt.handle().clone();
         server_rt.spawn(server.run());
@@ -1744,10 +1789,11 @@ mod tests {
             let endpoint = client(root);
             let mut held = Vec::new();
             for n in 0..3 {
-                let session = tokio::time::timeout(Duration::from_secs(10), open(&endpoint, port))
-                    .await
-                    .unwrap_or_else(|_| panic!("session {n} was never answered"))
-                    .unwrap_or_else(|e| panic!("session {n} failed: {e}"));
+                let session =
+                    tokio::time::timeout(Duration::from_secs(10), open(&endpoint, port, ORIGIN))
+                        .await
+                        .unwrap_or_else(|_| panic!("session {n} was never answered"))
+                        .unwrap_or_else(|e| panic!("session {n} failed: {e}"));
                 held.push(session);
             }
             // Anything at all must still run on the server's runtime.
@@ -1786,30 +1832,75 @@ mod tests {
         );
     }
 
+    /// One admission for every entrance: a browser's Origin is checked
+    /// against server.webtransport_allowed_origins where the route asks it
+    /// (none listed admits none), a client with no Origin is not a browser,
+    /// and the MoQ relay's route leaves the Origin to [moq]'s own rules
+    #[test]
+    fn a_session_is_admitted_by_its_origin_and_the_caps() {
+        let mut config = ProxyConfig::default();
+        let ip: IpAddr = "192.0.2.71".parse().unwrap();
+        // None listed: no browser is admitted where the list is asked
+        assert_eq!(
+            super::admit(&config, Some("https://a.test"), ip, true).unwrap_err(),
+            super::Refusal::Origin
+        );
+        config.server.webtransport_allowed_origins = vec!["https://a.test".into()];
+        assert!(super::admit(&config, Some("https://a.test"), ip, true).is_ok());
+        assert_eq!(
+            super::admit(&config, Some("https://b.test"), ip, true).unwrap_err(),
+            super::Refusal::Origin
+        );
+        // Not asked (the MoQ relay's route), and no Origin at all
+        assert!(super::admit(&config, Some("https://b.test"), ip, false).is_ok());
+        assert!(super::admit(&config, None, ip, true).is_ok());
+        // The per-origin cap, held while the admission lives
+        config.server.webtransport_max_sessions_per_origin = 1;
+        let held = super::admit(&config, Some("https://a.test"), ip, true).unwrap();
+        assert_eq!(
+            super::admit(
+                &config,
+                Some("https://a.test"),
+                "192.0.2.72".parse().unwrap(),
+                true
+            )
+            .unwrap_err(),
+            super::Refusal::OriginCap(1)
+        );
+        drop(held);
+        assert!(super::admit(&config, Some("https://a.test"), ip, true).is_ok());
+    }
+
     #[test]
     fn the_per_origin_cap_is_enforced_and_released() {
         let dir = tempfile::tempdir().unwrap();
         let server_rt = server_runtime();
-        let (server, root) = server_rt.block_on(server(dir.path(), 1));
+        let (server, root) = server_rt.block_on(server(dir.path(), 1, CAPPED_ORIGIN));
         let port = server.local_addr().port();
         server_rt.spawn(server.run());
 
         let client_rt = tokio::runtime::Runtime::new().unwrap();
         client_rt.block_on(async move {
             let endpoint = client(root);
-            let first = open(&endpoint, port)
+            let first = open(&endpoint, port, CAPPED_ORIGIN)
                 .await
                 .expect("the first session is within the cap");
-            let second = tokio::time::timeout(Duration::from_secs(10), open(&endpoint, port))
-                .await
-                .expect("the refusal never came");
+            let second = tokio::time::timeout(
+                Duration::from_secs(10),
+                open(&endpoint, port, CAPPED_ORIGIN),
+            )
+            .await
+            .expect("the refusal never came");
             assert!(second.is_err(), "a second session exceeded a cap of one");
 
             first.close(0u32.into(), b"done");
             let mut reopened = None;
             for _ in 0..50 {
-                if let Ok(Ok(s)) =
-                    tokio::time::timeout(Duration::from_secs(2), open(&endpoint, port)).await
+                if let Ok(Ok(s)) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    open(&endpoint, port, CAPPED_ORIGIN),
+                )
+                .await
                 {
                     reopened = Some(s);
                     break;
