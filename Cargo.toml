@@ -79,9 +79,6 @@ h3-quinn = { package = "h3-noq", path = "vendor/h3-noq" }
 # Matches the version quinn-udp already pulls, so no extra crate copy is added.
 socket2 = { version = "0.6", features = ["all"] }
 
-# WebTransport (proper protocol support)
-wtransport = { path = "vendor/wtransport", features = ["quinn"] }
-
 # HTTP client/server for backend proxying
 hyper = { version = "1.5", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full", "tokio"] }
@@ -276,6 +273,9 @@ signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The WebTransport client of examples/speedtest-probe.rs and
+# examples/wt-sessions.rs (the proxy's own WebTransport is the QUIC listener's)
+wtransport = { path = "vendor/wtransport", features = ["quinn"] }
 # HTTP/2 interim responses read by a client (tests/early_hints_h2.rs)
 h2 = "0.4"
 assert_matches = "1.5"

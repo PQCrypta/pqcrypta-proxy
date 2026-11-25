@@ -1479,7 +1479,13 @@ pub struct ServerConfig {
     #[serde(default = "default_wt_max_sessions_per_client")]
     pub webtransport_max_sessions_per_client: u32,
 
-    /// Maximum concurrent streams per WebTransport session (default 1000).
+    /// Streams a WebTransport session may have open in each direction
+    /// (default 256), the initial limits its draft-17 SETTINGS declare
+    /// (draft-ietf-webtrans-http3-17 section 5.6.2), within what QUIC allows
+    /// the connection (`max_streams_per_connection`, which also holds the
+    /// session's CONNECT stream). Below the connection's own limit, a session's
+    /// is one a client can reach and the server holds it to; the speed test
+    /// opens 12 a session.
     #[serde(default = "default_wt_max_streams")]
     pub webtransport_max_streams_per_session: u32,
 
@@ -1487,13 +1493,11 @@ pub struct ServerConfig {
     #[serde(default = "default_wt_max_datagrams")]
     pub webtransport_max_datagrams_per_sec: u32,
 
-    /// UDP port reserved for the dedicated WebTransport server (default 4433).
-    ///
-    /// P3-fix: previously hardcoded as the literal `4433` in main.rs.  This
-    /// port is skipped in the generic QUIC listener loop and handed to the
-    /// wtransport-based WebTransportServer instead.  Must be listed in
-    /// `additional_ports` (or be the primary `udp_port`) for the Alt-Svc
-    /// advertisement to include it.
+    /// A UDP port the QUIC listener serves besides `udp_port` and
+    /// `additional_ports` (default 4433): HTTP/3 and WebTransport, as on every
+    /// QUIC port, for clients that ask for WebTransport here. It needs no TCP
+    /// listener. Listed in `additional_ports` (or as `udp_port`), it is also
+    /// advertised in Alt-Svc and served over TCP.
     #[serde(default = "default_webtransport_port")]
     pub webtransport_port: u16,
 
@@ -1567,24 +1571,6 @@ pub struct ServerConfig {
     /// ```
     #[serde(default)]
     pub http11_only_hosts: Vec<String>,
-
-    /// Explicit TLS certificate for the WebTransport server (port 4433).
-    ///
-    /// When set, overrides the auto-detection logic that looks for
-    /// `api.{primary_domain}.crt` in the certs directory.  Use this when
-    /// the WebTransport hostname doesn't follow the `api.` prefix convention
-    /// (e.g. `api2.pqcrypta.com` served from a `tcp2.pqcrypta.com` config).
-    ///
-    /// Example:
-    /// ```toml
-    /// webtransport_cert_path = "/etc/pqcrypta/certs/api2.pqcrypta.com.crt"
-    /// webtransport_key_path  = "/etc/pqcrypta/certs/api2.pqcrypta.com.key"
-    /// ```
-    #[serde(default)]
-    pub webtransport_cert_path: Option<std::path::PathBuf>,
-
-    #[serde(default)]
-    pub webtransport_key_path: Option<std::path::PathBuf>,
 
     /// Lowercase request paths before route matching and before forwarding to backends.
     ///
@@ -1687,7 +1673,7 @@ impl Default for ServerConfig {
             quic_congestion_control: QuicCongestionControl::default(),
             webtransport_max_sessions_per_origin: default_wt_max_sessions(),
             webtransport_max_sessions_per_client: default_wt_max_sessions_per_client(),
-            webtransport_max_streams_per_session: 1000,
+            webtransport_max_streams_per_session: default_wt_max_streams(),
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
             tcp_only_hosts: Vec::new(),
@@ -1699,8 +1685,6 @@ impl Default for ServerConfig {
             alt_svc_clear_cidrs: default_alt_svc_clear_cidrs(),
             alt_svc_clear_user_agents: default_alt_svc_clear_user_agents(),
             http11_only_hosts: Vec::new(),
-            webtransport_cert_path: None,
-            webtransport_key_path: None,
             normalize_paths: true,
             resolve_dot_segments: true,
             merge_slashes: true,
@@ -1892,7 +1876,7 @@ fn default_wt_max_sessions_per_client() -> u32 {
 }
 
 fn default_wt_max_streams() -> u32 {
-    1000
+    256
 }
 
 fn default_webtransport_port() -> u16 {
@@ -4408,8 +4392,6 @@ pub const RESTART_BOUND_SETTINGS: &[&str] = &[
     "server.proxy_protocol_trusted",
     "server.proxy_protocol_timeout_ms",
     "server.webtransport_port",
-    "server.webtransport_cert_path",
-    "server.webtransport_key_path",
     "tls.handshake_timeout_secs",
     "pqc.enabled",
     "fingerprint.enabled",
@@ -5841,9 +5823,9 @@ impl ProxyConfig {
     /// Every socket the listeners of this configuration bind.
     ///
     /// As the proxy starts them: TCP for HTTPS and UDP for HTTP/3 on `udp_port` and each of
-    /// `additional_ports` (no HTTP/3 on `webtransport_port`, which is the
-    /// WebTransport server's), the plain-HTTP redirect, one UDP port per
-    /// conformance test, the DNS over HTTPS gateway and the admin API.
+    /// `additional_ports`, UDP for HTTP/3 on `webtransport_port`, the plain-HTTP
+    /// redirect, one UDP port per conformance test, the DNS over HTTPS gateway
+    /// and the admin API.
     ///
     /// `pqcrypta-proxy --socket-unit` writes the systemd socket unit from this
     /// list, so the sockets the service manager holds (crate::inherited) are
@@ -5867,15 +5849,10 @@ impl ProxyConfig {
             .chain(self.server.additional_ports.iter().copied());
         for port in https {
             push(Kind::Tcp, at(port), format!("https {port}"));
-            if port != self.server.webtransport_port {
-                push(Kind::Udp, at(port), format!("http3 {port}"));
-            }
+            push(Kind::Udp, at(port), format!("http3 {port}"));
         }
-        push(
-            Kind::Udp,
-            at(self.server.webtransport_port),
-            "webtransport".into(),
-        );
+        let wt = self.server.webtransport_port;
+        push(Kind::Udp, at(wt), format!("http3 {wt}"));
         if self.http_redirect.enabled {
             push(
                 Kind::Tcp,

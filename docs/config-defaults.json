@@ -529,12 +529,10 @@
     "udp_gro": false,
     "udp_port": 443,
     "webtransport_allowed_origins": [],
-    "webtransport_cert_path": null,
-    "webtransport_key_path": null,
     "webtransport_max_datagrams_per_sec": 500,
     "webtransport_max_sessions_per_client": 64,
     "webtransport_max_sessions_per_origin": 4096,
-    "webtransport_max_streams_per_session": 1000,
+    "webtransport_max_streams_per_session": 256,
     "webtransport_port": 4433,
     "worker_threads": 0
   },

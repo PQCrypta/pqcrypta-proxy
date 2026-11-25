@@ -48,7 +48,6 @@ use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
 use pqcrypta_proxy::startup_verify;
 use pqcrypta_proxy::tls::TlsProvider;
-use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
 };
@@ -1613,9 +1612,10 @@ async fn run() -> anyhow::Result<()> {
         });
     }
 
-    // Start QUIC/HTTP3 servers (UDP) on all ports EXCEPT the WebTransport port
-    // The WebTransport port is handled by dedicated WebTransportServer
-    let webtransport_port = config.server.webtransport_port;
+    // QUIC/HTTP3 servers (UDP) on every port, the WebTransport port too: one
+    // listener serves WebTransport on each (draft-ietf-webtrans-http3-17, the
+    // MoQ relay's entrance at `[moq] path`, the WebTransport routes), its
+    // certificates chosen by SNI like every other port's
     let mut quic_shutdown_senders: Vec<mpsc::Sender<()>> = Vec::new();
 
     // P1-fix: Create ONE shared SecurityState before the QUIC listener loop.
@@ -1632,16 +1632,13 @@ async fn run() -> anyhow::Result<()> {
     // `Arc`s of its own.
     let shared_quic_security = std::sync::Arc::new(security_state.clone());
 
-    for port in all_ports.clone() {
-        // Skip webtransport_port - it's handled by dedicated WebTransportServer
-        if port == webtransport_port {
-            info!(
-                "📡 Port {} will be handled by dedicated WebTransport server",
-                webtransport_port
-            );
-            continue;
-        }
-
+    // The HTTPS ports, and the WebTransport port where it is not one of them
+    // (UDP only: socket_unit's `http3` sockets)
+    let mut quic_ports = all_ports.clone();
+    if !quic_ports.contains(&config.server.webtransport_port) {
+        quic_ports.push(config.server.webtransport_port);
+    }
+    for port in quic_ports {
         // Create config with the specific port for this listener
         let mut quic_config = (*config).clone();
         quic_config.server.udp_port = port;
@@ -1752,89 +1749,6 @@ async fn run() -> anyhow::Result<()> {
             ),
             Err(e) => error!("DNS over HTTPS gateway not started: {}", e),
         }
-    }
-
-    // Start dedicated WebTransport server on port 4433
-    // This uses wtransport crate for proper WebTransport protocol support
-    {
-        let wt_config = config.clone();
-        let wt_backend_pool = Arc::new(BackendPool::new(&config));
-        let wt_security = security_state.clone();
-        let wt_config_updates = tcp_config_rx.clone();
-        // The WebTransport server uses a single cert (no SNI).  Resolution order:
-        //   1. Explicit webtransport_cert_path / webtransport_key_path from config.
-        //   2. Auto-detect: look for api.<primary-domain>.crt in the certs directory.
-        //   3. Fall back to the primary cert.
-        let (wt_cert, wt_key) = if let (Some(wt_c), Some(wt_k)) = (
-            config.server.webtransport_cert_path.as_ref(),
-            config.server.webtransport_key_path.as_ref(),
-        ) {
-            info!(
-                "WebTransport server: using explicit cert {}",
-                wt_c.display()
-            );
-            (
-                wt_c.to_string_lossy().to_string(),
-                wt_k.to_string_lossy().to_string(),
-            )
-        } else {
-            let wt_certs_dir = std::path::Path::new(&cert_path)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
-            let primary_domain = std::path::Path::new(&cert_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            let api_domain = format!("api.{}", primary_domain);
-            let api_cert = wt_certs_dir.join(format!("{}.crt", api_domain));
-            let api_key = wt_certs_dir.join(format!("{}.key", api_domain));
-            if api_cert.exists() && api_key.exists() {
-                info!("WebTransport server: using cert for {}", api_domain);
-                (
-                    api_cert.to_string_lossy().to_string(),
-                    api_key.to_string_lossy().to_string(),
-                )
-            } else {
-                (cert_path.clone(), key_path.clone())
-            }
-        };
-        let wt_metrics = metrics_registry.clone();
-
-        let wt_port = webtransport_port;
-        let (wt_shutdown_tx, wt_shutdown_rx) = tokio::sync::watch::channel(());
-        http_shutdown_senders.push(wt_shutdown_tx);
-        tokio::spawn(async move {
-            // SR-04: Use the configured bind_address instead of a hardcoded "0.0.0.0"
-            // so the WebTransport server honours the operator's bind_address setting
-            // (e.g. a private NIC) rather than always binding on all interfaces.
-            // P3-fix: use the configurable webtransport_port from ServerConfig instead
-            // of the previously hardcoded 4433.
-            let wt_addr: std::net::SocketAddr =
-                format!("{}:{}", wt_config.server.effective_bind_address(), wt_port)
-                    .parse()
-                    .expect("valid WebTransport bind address from config");
-
-            info!("🚀 Starting dedicated WebTransport server on {}", wt_addr);
-
-            match WebTransportServer::new(wt_addr, &wt_cert, &wt_key, wt_config, wt_backend_pool)
-                .await
-            {
-                Ok(server) => {
-                    let server = server
-                        .with_metrics(wt_metrics)
-                        .with_security(wt_security)
-                        .with_shutdown(wt_shutdown_rx)
-                        .with_config_updates(wt_config_updates);
-                    info!("✅ WebTransport server ready on {}", server.local_addr());
-                    if let Err(e) = server.run().await {
-                        error!("WebTransport server error: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to start WebTransport server: {}", e);
-                }
-            }
-        });
     }
 
     // Build Alt-Svc header value for logging

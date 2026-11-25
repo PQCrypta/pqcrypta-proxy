@@ -44,7 +44,7 @@ A client reaches the relay by protocol negotiation, never by port:
 |----------|---------------------------|
 | Native QUIC on the QUIC listener's port | The client offers `moqt-23` and/or `moqt-22` in ALPN |
 | WebTransport on the HTTP/3 port | Extended CONNECT to `[moq] path` (`/moq`), with `WT-Available-Protocols: "moqt-23", "moqt-22"`; the answer's `WT-Protocol` names the one chosen |
-| WebTransport on the WebTransport server's port | The same |
+| WebTransport on `webtransport_port` (4433) | The same: the same QUIC listener serves it |
 
 - **QUIC listener:** a client that offers only versions the relay does not
   speak gets `no_application_protocol` in the handshake. A native session

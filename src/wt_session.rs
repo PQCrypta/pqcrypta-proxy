@@ -1,11 +1,9 @@
-//! One WebTransport session, whichever listener accepted it.
+//! One WebTransport session, as the QUIC listener accepts it.
 //!
-//! The WebTransport server (`webtransport_server.rs`, its own port) accepts
-//! sessions through the wtransport crate; the HTTP/3 listener accepts them on
-//! the HTTP/3 port itself, beside ordinary requests on the same connection
-//! (draft-ietf-webtrans-http3). What a session does -- forward its streams and
-//! datagrams to the route's backend, run a speed test, feed the telemetry
-//! wall -- is written once, against [`WtSession`], and runs on either.
+//! On every port, beside ordinary requests on the same connection
+//! (draft-ietf-webtrans-http3). What a session does -- forward its streams and datagrams to the
+//! route's backend, run a speed test, feed the telemetry wall -- is written
+//! against [`WtSession`] (webtransport_server.rs).
 //!
 //! On the HTTP/3 port the connection's accept loop owns the streams: it hands
 //! each WebTransport stream and datagram to its session ([`H3SessionFeed`]),
@@ -173,86 +171,6 @@ pub fn close_session_capsule(code: u32, reason: &str) -> Bytes {
     out.extend_from_slice(&code.to_be_bytes());
     out.extend_from_slice(&reason.as_bytes()[..end]);
     Bytes::from(out)
-}
-
-// ── The WebTransport server's sessions (wtransport) ─────────────────────────
-
-impl WtSession for wtransport::Connection {
-    type Send = wtransport::stream::SendStream;
-    type Recv = wtransport::stream::RecvStream;
-
-    async fn accept_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
-        wtransport::Connection::accept_bi(self)
-            .await
-            .map_err(|e| WtClosed(e.to_string()))
-    }
-
-    async fn accept_uni(&self) -> Result<Self::Recv, WtClosed> {
-        wtransport::Connection::accept_uni(self)
-            .await
-            .map_err(|e| WtClosed(e.to_string()))
-    }
-
-    async fn open_uni(&self) -> Result<Self::Send, WtClosed> {
-        let opening = wtransport::Connection::open_uni(self)
-            .await
-            .map_err(|e| WtClosed(e.to_string()))?;
-        opening.await.map_err(|e| WtClosed(e.to_string()))
-    }
-
-    async fn open_bi(&self) -> Result<(Self::Send, Self::Recv), WtClosed> {
-        let opening = wtransport::Connection::open_bi(self)
-            .await
-            .map_err(|e| WtClosed(e.to_string()))?;
-        opening.await.map_err(|e| WtClosed(e.to_string()))
-    }
-
-    fn reset(&self, send: &mut Self::Send, code: u32) {
-        let id = send.quic_stream().id();
-        let session = self.session_id().into_u64();
-        reset_wt_stream(
-            send.quic_stream_mut(),
-            code,
-            wt_header_len(id, quinn::Side::Server, session),
-        );
-    }
-
-    fn stop(recv: &mut Self::Recv, code: u32) {
-        let _ = recv
-            .quic_stream_mut()
-            .stop(quinn::VarInt::from_u64(wt_application_code(code)).expect("below 2^62"));
-    }
-
-    fn set_priority(send: &Self::Send, priority: i32) {
-        send.set_priority(priority);
-    }
-
-    fn close(&self, code: u32, reason: &str) {
-        self.close_session(code, reason);
-    }
-
-    async fn receive_datagram(&self) -> Result<Bytes, WtClosed> {
-        wtransport::Connection::receive_datagram(self)
-            .await
-            .map(|d| d.payload())
-            .map_err(|e| WtClosed(e.to_string()))
-    }
-
-    fn send_datagram(&self, payload: &[u8]) -> Result<(), WtClosed> {
-        wtransport::Connection::send_datagram(self, payload).map_err(|e| WtClosed(e.to_string()))
-    }
-
-    fn rtt(&self) -> Duration {
-        wtransport::Connection::rtt(self)
-    }
-
-    fn quic_connection(&self) -> &quinn::Connection {
-        wtransport::Connection::quic_connection(self)
-    }
-
-    async fn ended(&self) {
-        let _ = wtransport::Connection::closed(self).await;
-    }
 }
 
 // ── Sessions on the HTTP/3 port (h3) ─────────────────────────────────────────

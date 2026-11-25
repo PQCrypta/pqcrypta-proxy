@@ -254,7 +254,6 @@ pub use rate_limiter::{
 pub use security::{security_middleware, SecurityState};
 pub use tls::TlsProvider;
 pub use tls_acceptor::{FingerprintedConnection, FingerprintingTlsAcceptor};
-pub use webtransport_server::WebTransportServer;
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
