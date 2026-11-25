@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.4](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.3...v0.22.4) (2026-11-25)
+
+
+### Bug Fixes
+
+* **webtransport:** one admission for every entrance: Origin, per-client and per-origin caps ([a10dd2d](https://github.com/PQCrypta/pqcrypta-proxy/commit/a10dd2ddced503698797a3c087953d3ff8e336ab))
+
 ## [0.22.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.22.2...v0.22.3) (2026-11-24)
 
 
