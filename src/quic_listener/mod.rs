@@ -2289,17 +2289,22 @@ impl QuicListener {
                             continue;
                         }
 
-                        // Reject WebTransport sessions for hosts/paths with no matching WT route.
-                        // Without this check the proxy accepts every CONNECT unconditionally,
-                        // leaving the session open until a 5-second idle timeout fires — which
-                        // stalls scanners and health checks on non-WebTransport hosts.
-                        // Note: find_route(is_webtransport=true) still returns non-WT routes
-                        // (route_matches only prevents WT-only routes matching non-WT requests,
-                        // not the reverse), so we must additionally check route.webtransport.
+                        // A session at a path the proxy does not serve itself
+                        // (the speed test, the telemetry wall) needs a
+                        // WebTransport route for its host and path, or it is
+                        // refused with 404: accepted, it would stay open
+                        // until the idle timeout, stalling scanners and
+                        // health checks on hosts without WebTransport.
+                        // find_route(.., true) also returns routes that are
+                        // not WebTransport's (route_matches keeps only
+                        // WebTransport routes from other requests, not the
+                        // reverse), hence the filter.
                         let wt_route = config
                             .find_route(host.as_deref(), &path, true)
                             .filter(|r| r.webtransport);
-                        if wt_route.is_none() {
+                        if wt_route.is_none()
+                            && !crate::webtransport_server::served_by_the_proxy(&path)
+                        {
                             debug!(
                                 "WebTransport CONNECT rejected (no WT route) for {} from {}",
                                 path, remote_addr
@@ -3775,6 +3780,42 @@ mod listener_tests {
         });
         drop(stop);
         server_rt.shutdown_background();
+    }
+
+    /// The speed test and the telemetry wall are the proxy's own, served with
+    /// no route configured for them, on every port (the dedicated WebTransport
+    /// server served them so on 4433, and 0.23.0 answered them 404 there); a
+    /// path neither the proxy nor a route serves is refused with 404
+    #[tokio::test]
+    async fn the_proxy_s_own_paths_need_no_route() {
+        let (addr, der, _stop) = listener().await;
+        let wait = Duration::from_secs(5);
+        for (path, expected) in [
+            (
+                crate::webtransport_server::SPEEDTEST_PATH,
+                http::StatusCode::OK,
+            ),
+            (
+                crate::webtransport_server::TELEMETRY_PATH,
+                http::StatusCode::OK,
+            ),
+            ("/nowhere", http::StatusCode::NOT_FOUND),
+        ] {
+            let (conn, _endpoint) = connect(addr, &der).await;
+            let mut send = h3_client(conn).await;
+            let mut r = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri(format!("https://localhost{path}"))
+                .body(())
+                .unwrap();
+            r.extensions_mut().insert(Protocol::WEB_TRANSPORT_H3);
+            let mut session = send.send_request(r).await.unwrap();
+            let answer = tokio::time::timeout(wait, session.recv_response())
+                .await
+                .unwrap_or_else(|_| panic!("{path} was never answered"))
+                .unwrap();
+            assert_eq!(answer.status(), expected, "{path}");
+        }
     }
 
     /// A WebTransport CONNECT to the relay's entrance, draft 17's token

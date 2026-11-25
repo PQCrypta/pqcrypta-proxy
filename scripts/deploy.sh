@@ -8,7 +8,10 @@
 #           build host whose glibc is no newer than the oldest node's); this
 #           script builds nothing
 #   NODE    `local`, or an ssh destination (a host alias, user@host)
-#   --gate  run pentests/regression/postdeploy_gate.sh once every node is done
+#   --gate  run pentests/regression/postdeploy_gate.sh once every node is done;
+#           its WebTransport step runs the speedtest-probe and wt-sessions
+#           examples built from the same commit, from BINARY's directory
+#           (`cargo build --release --examples`), or PROBE_DIR
 #
 # Environment: PQCRYPTA_CONFIG (default /etc/pqcrypta/proxy-config.toml) and
 # PQCRYPTA_USER (default pqcrypta), the service's configuration and account on
@@ -90,5 +93,6 @@ for node in "$@"; do
 done
 
 if [ "$GATE" -eq 1 ]; then
-    "$(dirname "$0")/../pentests/regression/postdeploy_gate.sh"
+    PROBE_DIR=${PROBE_DIR:-$(cd "$(dirname "$BIN")" && pwd)} \
+        "$(dirname "$0")/../pentests/regression/postdeploy_gate.sh"
 fi

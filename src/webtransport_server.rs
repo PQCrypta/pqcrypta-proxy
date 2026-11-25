@@ -329,7 +329,19 @@ async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     })
 }
 
-/// Serve an established WebTransport session, on either listener: the speed
+/// The speed test's path, which the proxy serves itself
+pub(crate) const SPEEDTEST_PATH: &str = "/speedtest";
+
+/// The telemetry wall's path, which the proxy serves itself
+pub(crate) const TELEMETRY_PATH: &str = "/telemetry";
+
+/// Whether the proxy serves a session at `path` itself (the speed test, the
+/// telemetry wall), on every host and port, with no route configured for it
+pub(crate) fn served_by_the_proxy(path: &str) -> bool {
+    path == SPEEDTEST_PATH || path == TELEMETRY_PATH
+}
+
+/// Serve an established WebTransport session, on any port: the speed
 /// test and the telemetry wall at their paths, and otherwise each stream and
 /// datagram forwarded to the session route's backend.
 #[expect(clippy::too_many_arguments)]
@@ -348,13 +360,11 @@ pub async fn serve_session<S: WtSession>(
         remote_addr, path
     );
 
-    // Native speed test handler — serves /speedtest without backend proxying
-    if path == "/speedtest" {
+    // The speed test and the telemetry wall, served here with no backend
+    if path == SPEEDTEST_PATH {
         return crate::speedtest::handle_speedtest_session(connection, remote_addr).await;
     }
-
-    // Native telemetry wall handler — serves /telemetry without backend proxying
-    if path == "/telemetry" {
+    if path == TELEMETRY_PATH {
         return crate::telemetry::handle_telemetry_session(connection, remote_addr).await;
     }
 
