@@ -1344,3 +1344,147 @@ async fn a_stream_reset_at_its_header_still_delivers_the_header() {
     conn.close(0u32.into(), b"");
     sender.abort();
 }
+
+/// An outside implementation's relay as this relay's upstream, live: a
+/// subscriber here, in each draft this relay speaks, subscribes to a track
+/// another implementation publishes into that relay, and fetches a group it
+/// holds only there. Against moqtail 0.19.0 (draft 22) with its client
+/// publishing (`client -c publish -n moqtail -T demo`):
+///
+/// ```text
+/// MOQ_INTEROP_UPSTREAM=moqt://127.0.0.1:14433 MOQ_INTEROP_CA=ca.pem \
+/// MOQ_INTEROP_TRACK=moqtail/demo cargo test --lib live_an_outside_relay_as_upstream -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs an outside relay with a track published into it"]
+async fn live_an_outside_relay_as_upstream() {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let upstream = std::env::var("MOQ_INTEROP_UPSTREAM").expect("MOQ_INTEROP_UPSTREAM");
+    let ca = std::env::var("MOQ_INTEROP_CA").expect("MOQ_INTEROP_CA");
+    let wanted = std::env::var("MOQ_INTEROP_TRACK").unwrap_or_else(|_| "moqtail/demo".into());
+    let (namespace, name) = wanted.rsplit_once('/').expect("namespace/track");
+    let t = TrackName {
+        namespace: Namespace(
+            namespace
+                .split('/')
+                .map(|f| Bytes::copy_from_slice(f.as_bytes()))
+                .collect(),
+        ),
+        name: Bytes::copy_from_slice(name.as_bytes()),
+    };
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(&ca).expect("the CA file") {
+        roots.add(cert.expect("a certificate")).expect("a root");
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = Version::alpns();
+    let client = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+    ));
+    let edge_moq = Moq::new(&MoqConfig {
+        enabled: true,
+        ..MoqConfig::default()
+    })
+    .expect("the edge");
+    let link = super::upstream::UpstreamLink::with_client(
+        super::upstream::UpstreamUri::parse(&upstream).expect("an upstream URI"),
+        &edge_moq.relay,
+        Arc::clone(&edge_moq.settings),
+        client,
+    )
+    .unwrap();
+    edge_moq
+        .relay
+        .set_upstream(Arc::new(super::upstream::UpstreamPublisher(link)));
+    let (edge, _e, _ea, edge_cert) = serve(edge_moq);
+
+    for v in Version::ALL {
+        let mut subscriber = Client::connect(&edge, &edge_cert, v, Setup::default()).await;
+        let id = subscriber.id();
+        let (_ss, _sr, kind, ok) = subscriber
+            .request(Message::Subscribe(TrackRequest {
+                request_id: id,
+                track: t.clone(),
+                params: Params::default(),
+            }))
+            .await;
+        assert_eq!(
+            kind,
+            message::SUBSCRIBE_OK,
+            "{v:?}: subscribed through the upstream"
+        );
+        let Message::SubscribeOk { params, .. } = ok else {
+            unreachable!()
+        };
+        let largest = params
+            .largest_object
+            .expect("the upstream's Largest Object");
+        println!("{v:?}: SUBSCRIBE_OK, Largest Object {largest:?}");
+
+        // Live objects, group by group, each in order
+        let mut groups = Vec::new();
+        while groups.len() < 2 {
+            let (_alias, group, got) = receive_subgroup(&subscriber.conn).await;
+            assert!(!got.is_empty(), "{v:?}: group {group} carried objects");
+            assert!(
+                got.windows(2).all(|w| w[0].0 < w[1].0),
+                "{v:?}: group {group} in order"
+            );
+            println!("{v:?}: group {group}, {} objects", got.len());
+            groups.push(group);
+        }
+
+        // A group from before the subscription: the edge never had it, so the
+        // FETCH is filled from the upstream
+        let past = largest.group.saturating_sub(1);
+        let mut fetcher = Client::connect(&edge, &edge_cert, v, Setup::default()).await;
+        let id = fetcher.id();
+        let (_fs, _fr, kind, _) = fetcher
+            .request(Message::Fetch(TrackRequest {
+                request_id: id,
+                track: t.clone(),
+                params: Params {
+                    location_filter: Some(LocationFilter::AbsoluteRange {
+                        start: Location::new(past, 0),
+                        end: Location::new(past, 2),
+                    }),
+                    ..Params::default()
+                },
+            }))
+            .await;
+        // Draft 22 answers a FETCH with FETCH_OK; 23 with REQUEST_OK
+        let answered = if v.fetch_ok_is_request_ok() {
+            message::REQUEST_OK
+        } else {
+            message::FETCH_OK_22
+        };
+        assert_eq!(kind, answered, "{v:?}: FETCH of group {past}");
+        let recv = tokio::time::timeout(WAIT, fetcher.conn.accept_uni())
+            .await
+            .expect("a fetch stream")
+            .unwrap();
+        let mut r = BufReader::new(recv);
+        assert_eq!(read_vi64(&mut r).await.unwrap(), Some(STREAM_FETCH_HEADER));
+        assert_eq!(read_vi64(&mut r).await.unwrap(), Some(id));
+        let mut state = FetchState::default();
+        let mut fetched = Vec::new();
+        while let Some(e) = state
+            .read(&mut r, GroupOrder::Ascending, v, 1 << 20)
+            .await
+            .unwrap()
+        {
+            match e {
+                FetchEntry::Object(o) => fetched.push(o.location),
+                other => println!("{v:?}: fetch entry {other:?}"),
+            }
+        }
+        println!("{v:?}: FETCH of group {past}: {fetched:?}");
+        assert!(!fetched.is_empty(), "{v:?}: group {past} from the upstream");
+    }
+}
