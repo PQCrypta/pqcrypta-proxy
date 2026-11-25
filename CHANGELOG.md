@@ -45,18 +45,14 @@
 
 ## [0.22.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.4...v0.22.0) (2026-11-24)
 
+WebTransport over HTTP/3 as draft-ietf-webtrans-http3-17 has it, on the QUIC listener: its settings, its session rules, and per-session flow control with the CONNECT stream's capsules.
+
 
 ### Features
 
 * **webtransport:** draft 17's session rules at the listener: SETTINGS_WT_ENABLED, no request before the client's SETTINGS, one session without flow control, and a browser's Origin verified at /moq ([e695536](https://github.com/PQCrypta/pqcrypta-proxy/commit/e695536da5ab231eeab15add16aaa804a5986a58))
 * **webtransport:** every :protocol token reaches the listener, and the h3 fork speaks WebTransport draft 17's settings ([416c5ff](https://github.com/PQCrypta/pqcrypta-proxy/commit/416c5ffad0352689925e439c6f978a9409e23b57))
 * **webtransport:** per-session flow control and the CONNECT stream's capsules (draft-ietf-webtrans-http3-17 sections 5 and 6) ([ce174bc](https://github.com/PQCrypta/pqcrypta-proxy/commit/ce174bc9297c479f5e682305d7ba105e93df4924))
-
-
-### Bug Fixes
-
-* **webtransport:** clippy: the HTTP/3 backend body boxed (its stream state outgrew hyper's), short first doc paragraphs, assert_eq on the capsules sent ([2dde3d1](https://github.com/PQCrypta/pqcrypta-proxy/commit/2dde3d16f04fa3f95b1b2683bfb33a7fca3d4a4b))
-* **webtransport:** the round compiles: the accept loop computes its own initial limits, H3Send calls tokio's AsyncWrite rather than quinn's poll_write, a violation's error is cloned out of its borrow, the h3 fork's SETTINGS tests fill the larger array ([c633a03](https://github.com/PQCrypta/pqcrypta-proxy/commit/c633a03e79325969156ab60d8e8d1c252d2a6c34))
 
 ## [0.21.4](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.3...v0.21.4) (2026-11-24)
 
@@ -72,7 +68,6 @@
 
 * **moq:** a session's end is not a CLOSED_CONTROL_STREAM error ([2c1669f](https://github.com/PQCrypta/pqcrypta-proxy/commit/2c1669f89d45a87a1b36b73007c532e138d280f1))
 * **webtransport:** a stream whose first data comes after its header reaches its session ([555847e](https://github.com/PQCrypta/pqcrypta-proxy/commit/555847e92ff61b6c03744a781057f18cedc09130))
-* **webtransport:** clippy: the HTTP/3 backend body boxed, its stream state having outgrown hyper's ([c264941](https://github.com/PQCrypta/pqcrypta-proxy/commit/c2649410ddaa000152fed49520dd7c7a7ecf7374))
 
 ## [0.21.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.21.1...v0.21.2) (2026-11-23)
 
@@ -101,7 +96,6 @@
 
 * **admin:** --admin reads only [admin], --moq-token only [moq] ([e942f7c](https://github.com/PQCrypta/pqcrypta-proxy/commit/e942f7c5aa0864d20dc7ba7e4f77c14c1e7cf2ba))
 * **canary:** a cohort gives the canary its share of the clients exactly ([7e21b8c](https://github.com/PQCrypta/pqcrypta-proxy/commit/7e21b8c4ebeb264efdf0fbbc1f83ee4d1f0b697b))
-* **canary:** the cohort book's placement is a three-way enum, not a nested Option (clippy::option_option) ([47406e5](https://github.com/PQCrypta/pqcrypta-proxy/commit/47406e5a3f15c45b7e2958e3fab7518a840956e0))
 * **canary:** the cohort key maps to its placement ([2e7ee0e](https://github.com/PQCrypta/pqcrypta-proxy/commit/2e7ee0ea2cd57a663d57df6b3bdea0e38c0bc299))
 * **ech:** a reload the proxy refuses is logged with the reason, not ended silently by set -e ([532aa91](https://github.com/PQCrypta/pqcrypta-proxy/commit/532aa9115b8b2f3c476f71795d384884b0e54b8f))
 * **pentests:** the integrity preflight counts a tester the fail2ban allowlist names by host name ([cb3fbbf](https://github.com/PQCrypta/pqcrypta-proxy/commit/cb3fbbf1e611b0a0d0c2ca13ca77c2b8da4c5f84))
