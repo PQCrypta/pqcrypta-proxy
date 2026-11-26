@@ -2498,12 +2498,26 @@ impl<T: Transport> Session<T> {
                 },
             );
         let me = Arc::clone(&self);
+        // A FETCH the upstream refuses (REQUEST_ERROR), leaves unanswered or
+        // cannot be sent vouches for none of the range: said so on the
+        // channel before it closes, as a closed channel alone is a complete
+        // answer, every object it did not carry one that does not exist
+        let unanswered = move |me: &Session<T>| {
+            let sink = me
+                .fetches_out
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id);
+            if let Some(sink) = sink {
+                let _ = sink.tx.try_send(FetchEntry::EndOfRange {
+                    kind: RangeKind::Unknown,
+                    end,
+                });
+            }
+        };
         tokio::spawn(async move {
             let Ok((mut send, recv)) = me.t.open_bi().await else {
-                me.fetches_out
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&request_id);
+                unanswered(&me);
                 return;
             };
             let mut recv = BufReader::new(recv);
@@ -2511,12 +2525,23 @@ impl<T: Transport> Session<T> {
                 request_id,
                 track,
                 params: Params {
-                    location_filter: Some(LocationFilter::AbsoluteRange { start, end }),
+                    // To the end of a group as the draft says it (Absolute
+                    // Start, Group End), not as Object 2^64 - 1, which a peer
+                    // whose integers stop at 2^62 cannot read
+                    location_filter: Some(if end.object == u64::MAX {
+                        LocationFilter::AbsoluteGroupEnd {
+                            start,
+                            end_group: end.group,
+                        }
+                    } else {
+                        LocationFilter::AbsoluteRange { start, end }
+                    }),
                     fill_timeout: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
                     ..Params::default()
                 },
             });
             if send.write_all(&m.encode(me.version)).await.is_err() {
+                unanswered(&me);
                 return;
             }
             let ctx = Context {
@@ -2537,12 +2562,7 @@ impl<T: Transport> Session<T> {
                         me.fail(&e);
                     }
                 }
-                _ => {
-                    me.fetches_out
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&request_id);
-                }
+                _ => unanswered(&me),
             }
         });
         Some(rx)
@@ -3250,6 +3270,8 @@ async fn fill_from_upstream(
     };
     let mut prior: Option<Location> = None;
     let mut complete = false;
+    // The ranges the upstream marked as unknown to it: no answer for them
+    let mut holes: Vec<(Location, Location)> = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(FetchEntry::Object(o))) => {
@@ -3257,8 +3279,15 @@ async fn fill_from_upstream(
                 relay.ingest(track, o, None, false, false);
             }
             Ok(Some(FetchEntry::EndOfRange { kind, end: e })) => {
-                if kind == RangeKind::Gone {
-                    track.note_gone(prior.map_or(a, Location::next_object), e);
+                let from = prior.map_or(a, Location::next_object);
+                match kind {
+                    RangeKind::Gone => track.note_gone(from, e),
+                    RangeKind::Unknown => holes.push((from, e)),
+                    RangeKind::TimedOut => {
+                        holes.push((from, e));
+                        covered.timed_out = true;
+                    }
+                    RangeKind::NonExistent => {}
                 }
                 prior = Some(e);
             }
@@ -3282,12 +3311,43 @@ async fn fill_from_upstream(
             }
         }
     }
-    if complete {
-        covered.spans.push((a, b));
-    } else if let Some(p) = prior {
-        covered.spans.push((a, p));
+    // Vouched for: the whole range of a complete answer (an unmarked gap is
+    // objects that do not exist, section 3.2.2), or as far as an unfinished
+    // one reached, but not what it marked unknown
+    if let Some(reach) = if complete { Some(b) } else { prior } {
+        covered.spans.extend(vouched(a, reach, &holes, track));
     }
     covered
+}
+
+/// `a..=reach` less the `holes` within it, in order.
+fn vouched(
+    a: Location,
+    reach: Location,
+    holes: &[(Location, Location)],
+    track: &Track,
+) -> Vec<(Location, Location)> {
+    let mut spans = Vec::new();
+    let mut cursor = a;
+    for &(from, to) in holes {
+        if from > cursor {
+            spans.push((cursor, before(from).min(reach)));
+        }
+        // A hole to Object 2^64 - 1 takes the rest of its group
+        let next = if to.object == u64::MAX {
+            Location::new(to.group.saturating_add(1), 0)
+        } else {
+            after_object(to, track)
+        };
+        cursor = cursor.max(next);
+        if cursor > reach {
+            return spans;
+        }
+    }
+    if cursor <= reach {
+        spans.push((cursor, reach));
+    }
+    spans
 }
 
 /// The spans of `start..=end` the cache holds nothing for.
