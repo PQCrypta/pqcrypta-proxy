@@ -292,8 +292,9 @@ impl TestListener {
             "q-ack-frequency" => {
                 transport.ack_frequency_config(Some(quinn::AckFrequencyConfig::default()));
             }
-            // Offer more than one path. Almost nothing on the public internet
-            // will accept, which is the point of measuring it.
+            // Offer multipath: initial_max_path_id in the handshake (RFC 10069
+            // §2.1). Only the client opens a path (§3), and few clients do,
+            // which is the point of measuring it.
             "q-multipath" => {
                 transport.max_concurrent_multipath_paths(4);
             }
@@ -3628,6 +3629,89 @@ async fn watch_for_liveness(
     observation
 }
 
+/// The multipath drafts' provisional transport parameter codepoints, read from
+/// each of draft-ietf-quic-multipath-00 to -21: (codepoint, parameter, drafts).
+///
+/// RFC 10069 registers `initial_max_path_id` as 0x3e (§6), which drafts 19 to
+/// 21 already used, and a server that follows it negotiates nothing else. Draft
+/// 13 gives 0x0f739bbc1b666d0c in its text and 0x0f739bbc1b666d0d in its IANA
+/// table, so it is under both.
+const MULTIPATH_DRAFT_CODEPOINTS: &[(u64, &str, &str)] = &[
+    (
+        0xbabf,
+        "enable_multipath",
+        "draft-ietf-quic-multipath-00 to -03",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d04,
+        "enable_multipath",
+        "draft-ietf-quic-multipath-04",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d05,
+        "enable_multipath",
+        "draft-ietf-quic-multipath-05",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d06,
+        "enable_multipath",
+        "draft-ietf-quic-multipath-06",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d07,
+        "initial_max_paths",
+        "draft-ietf-quic-multipath-07 and -08",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d09,
+        "initial_max_path_id",
+        "draft-ietf-quic-multipath-09 and -10",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d11,
+        "initial_max_path_id",
+        "draft-ietf-quic-multipath-11",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d0c,
+        "initial_max_path_id",
+        "draft-ietf-quic-multipath-12 and -13",
+    ),
+    (
+        0x0f73_9bbc_1b66_6d0d,
+        "initial_max_path_id",
+        "draft-ietf-quic-multipath-13 to -18",
+    ),
+];
+
+/// What a client did with the multipath offer (RFC 10069): `negotiated` is both
+/// sides' `initial_max_path_id`; `frames` the PATH_CHALLENGE, PATH_ACK and
+/// MAX_PATH_ID frames it sent; `unknown` the transport parameter identifiers it
+/// sent that the server does not implement, where a draft's codepoint shows.
+fn multipath_verdict(
+    negotiated: bool,
+    frames: [u64; 3],
+    unknown: impl IntoIterator<Item = u64>,
+) -> String {
+    let [challenges, acks, max_path_ids] = frames;
+    if negotiated {
+        return format!(
+            "negotiated multipath (RFC 10069): {challenges} PATH_CHALLENGE, {acks} PATH_ACK and {max_path_ids} MAX_PATH_ID frames received"
+        );
+    }
+    let draft = unknown.into_iter().find_map(|id| {
+        MULTIPATH_DRAFT_CODEPOINTS
+            .iter()
+            .find(|(codepoint, _, _)| *codepoint == id)
+    });
+    match draft {
+        Some((codepoint, name, drafts)) => format!(
+            "offered multipath only under {drafts}'s provisional codepoint ({name}, {codepoint:#x}), which a server following RFC 10069 does not negotiate; it stayed on one path, which is conformant"
+        ),
+        None => "did not take up multipath and stayed on one path, which is conformant".to_string(),
+    }
+}
+
 /// What the transport itself can say about a QUIC-layer test.
 ///
 /// `None` means this test is judged the ordinary way, on the liveness probe.
@@ -4188,16 +4272,19 @@ fn quic_observation(
             ))
         }
 
-        // Almost nothing on the public internet speaks multipath, which is
-        // precisely why it is worth measuring rather than assuming.
-        "q-multipath" => Some(Observation::Signalled(if rx.max_path_id > 0 {
-            format!(
-                "negotiated multipath ({} MAX_PATH_ID frames)",
-                rx.max_path_id
-            )
-        } else {
-            "declined the multipath offer and stayed on one path, which is conformant".to_string()
-        })),
+        // Few clients speak multipath, which is precisely why it is worth
+        // measuring rather than assuming. Negotiation is the transport
+        // parameters (both sides' initial_max_path_id); MAX_PATH_ID frames only
+        // raise the limit later, so a client that negotiated and never raised
+        // it did not decline.
+        "q-multipath" => Some(Observation::Signalled(multipath_verdict(
+            connection.is_multipath_enabled(),
+            [rx.path_challenge, rx.path_acks, rx.max_path_id],
+            connection
+                .peer_unknown_transport_parameters()
+                .iter()
+                .map(|u| u.id),
+        ))),
 
         _ => None,
     }
@@ -5449,6 +5536,43 @@ mod tests {
 
     fn test(id: &str) -> &'static Test {
         catalog::find(id).expect("catalogue entry")
+    }
+
+    /// A client that negotiated multipath is not reported as declining for
+    /// never raising the limit, and one on a draft's codepoint is named.
+    #[test]
+    fn multipath_verdict_reads_the_negotiation_not_the_limit_frames() {
+        let negotiated = multipath_verdict(true, [2, 5, 0], []);
+        assert!(
+            negotiated.starts_with("negotiated multipath (RFC 10069)"),
+            "{negotiated}"
+        );
+        assert!(negotiated.contains("0 MAX_PATH_ID"), "{negotiated}");
+
+        let draft = multipath_verdict(false, [0, 0, 0], [0x1234, 0x0f73_9bbc_1b66_6d0d]);
+        assert!(
+            draft.contains("draft-ietf-quic-multipath-13 to -18")
+                && draft.contains("0xf739bbc1b666d0d"),
+            "{draft}"
+        );
+
+        // A reserved (GREASE) identifier is no multipath offer
+        let none = multipath_verdict(false, [0, 0, 0], [27]);
+        assert!(none.starts_with("did not take up multipath"), "{none}");
+    }
+
+    /// Each provisional codepoint is listed once, is a varint, and is neither
+    /// RFC 10069's 0x3e nor a reserved identifier.
+    #[test]
+    fn multipath_draft_codepoints_are_distinct_and_not_the_rfcs() {
+        let mut seen = std::collections::HashSet::new();
+        for &(codepoint, _, drafts) in MULTIPATH_DRAFT_CODEPOINTS {
+            assert!(seen.insert(codepoint), "{codepoint:#x} twice");
+            assert_ne!(codepoint, 0x3e);
+            assert!(codepoint < 1 << 62, "{codepoint:#x}");
+            assert_ne!((codepoint - 27) % 31, 0, "{codepoint:#x} is reserved");
+            assert!(drafts.starts_with("draft-ietf-quic-multipath-"));
+        }
     }
 
     /// A Retry nobody answered is reported once, and only by the watcher of

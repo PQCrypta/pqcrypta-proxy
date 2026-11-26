@@ -42,6 +42,9 @@ mod range_set;
 #[cfg(all(test, feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
 mod tests;
 pub mod transport_parameters;
+pub use crate::transport_parameters::{
+    UNKNOWN_TRANSPORT_PARAMETERS_KEPT, UnknownTransportParameter, UnknownTransportParameters,
+};
 mod varint;
 
 use identity_hash::IdentityHashable;
@@ -58,9 +61,8 @@ pub use crate::connection::{
     ConnectionStats, Datagrams, EcnFeedback, Event, FinishError, FrameStats,
     MultipathNotNegotiated, NetworkChangeHint, PathAbandonReason, PathError, PathEvent, PathId,
     PathStats, PathStatus, ReadError, ReadableError, RecvStream, ResetStreamAtError, RttEstimator,
-    SendDatagramError,
-    SendStream, SetPathStatusError, ShouldTransmit, StreamAffinity, StreamEvent, Streams,
-    UdpStats, WriteError,
+    SendDatagramError, SendStream, SetPathStatusError, ShouldTransmit, StreamAffinity, StreamEvent,
+    Streams, UdpStats, WriteError,
 };
 #[cfg(test)]
 use test_strategy::Arbitrary;

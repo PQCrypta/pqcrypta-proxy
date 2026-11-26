@@ -1028,9 +1028,9 @@ mod test {
     #[test]
     fn truncate_ordered() {
         let mut x = Assembler::new();
-        x.insert(0, Bytes::from_static(b"123"), 3);
-        x.insert(3, Bytes::from_static(b"456"), 3);
-        x.insert(8, Bytes::from_static(b"9"), 1);
+        x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
+        x.insert(3, Bytes::from_static(b"456"), 3).unwrap();
+        x.insert(8, Bytes::from_static(b"9"), 1).unwrap();
         assert_matches!(next(&mut x, 2), Some(ref y) if &y[..] == b"12");
         assert_eq!(x.unread_before(5), 3);
         x.truncate(5);
@@ -1045,15 +1045,15 @@ mod test {
     fn truncate_unordered() {
         let mut x = Assembler::new();
         x.ensure_ordering(false).unwrap();
-        x.insert(3, Bytes::from_static(b"45"), 2);
-        x.insert(5, Bytes::from_static(b"6"), 1);
-        x.insert(8, Bytes::from_static(b"9"), 1);
+        x.insert(3, Bytes::from_static(b"45"), 2).unwrap();
+        x.insert(5, Bytes::from_static(b"6"), 1).unwrap();
+        x.insert(8, Bytes::from_static(b"9"), 1).unwrap();
         assert_eq!(next_unordered(&mut x).offset, 3);
         // Bytes 0..3 and 5 are unread
         assert_eq!(x.unread_before(6), 4);
         x.truncate(6);
         assert_eq!(x.unread_before(6), 4);
-        x.insert(0, Bytes::from_static(b"123"), 3);
+        x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         assert_eq!(x.unread_before(6), 4);
         assert_eq!(next_unordered(&mut x).bytes, &b"123"[..]);
         assert_eq!(x.unread_before(6), 1);

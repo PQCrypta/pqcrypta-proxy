@@ -7,7 +7,9 @@ use std::{
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
-use proto::{ClosedStream, ConnectionError, FinishError, ResetStreamAtError, StreamAffinity, StreamId};
+use proto::{
+    ClosedStream, ConnectionError, FinishError, ResetStreamAtError, StreamAffinity, StreamId,
+};
 use thiserror::Error;
 use tokio::sync::futures::OwnedNotified;
 

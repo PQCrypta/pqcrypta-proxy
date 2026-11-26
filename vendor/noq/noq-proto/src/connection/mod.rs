@@ -3041,6 +3041,13 @@ impl Connection {
             && self.peer_params.initial_max_path_id.is_some()
     }
 
+    /// The transport parameters the peer sent that this implementation does not know: ignored
+    /// (RFC 9000 §7.4.2), and kept so a diagnostic consumer can name them, such as multipath
+    /// offered under a draft's provisional codepoint rather than RFC 10069's.
+    pub fn peer_unknown_transport_parameters(&self) -> crate::UnknownTransportParameters {
+        self.peer_params.unknown
+    }
+
     fn on_ack_received(
         &mut self,
         now: Instant,

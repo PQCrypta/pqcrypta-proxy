@@ -65,6 +65,15 @@ when the proxy builds noq as a dependency.
 - An Initial whose Retry token differs from the connection's is logged at
   debug, not warn: the packet is the peer's (or a spoofer's) to send, one line
   each.
+- The transport parameter reader keeps the parameters it does not know
+  (`TransportParameters::unknown`, `UnknownTransportParameters`: identifier,
+  length and the value when it is one varint, the first 16 inline so the struct
+  stays `Copy`, the rest counted) where upstream skips them, read with
+  `Connection::peer_unknown_transport_parameters`. The protocol still ignores
+  them (RFC 9000 section 7.4.2); the conformance suite's multipath test names a
+  client that offers multipath only under a draft's provisional codepoint, which
+  a server following RFC 10069 does not negotiate. The platform's scanner fork
+  carries the same change.
 
 ## Updating it
 
