@@ -123,8 +123,20 @@ struct Client {
 impl Client {
     async fn connect(server: &quinn::Endpoint, cert: &[u8], v: Version, setup: Setup) -> Self {
         let ep = client_endpoint(cert, vec![v.alpn().as_bytes().to_vec()]);
+        Self::connect_over(&ep, server.local_addr().unwrap(), "localhost", v, setup).await
+    }
+
+    /// A session to `addr` (as `name`) through `ep`, whose client
+    /// configuration offers `v`.
+    async fn connect_over(
+        ep: &quinn::Endpoint,
+        addr: SocketAddr,
+        name: &str,
+        v: Version,
+        setup: Setup,
+    ) -> Self {
         let conn = ep
-            .connect(server.local_addr().unwrap(), "localhost")
+            .connect(addr, name)
             .unwrap()
             .await
             .expect("the handshake");
@@ -979,7 +991,13 @@ async fn fetch_all(
             },
         }))
         .await;
-    assert_eq!(kind, message::REQUEST_OK);
+    // Draft 22 answers a FETCH with FETCH_OK; 23 with REQUEST_OK
+    let answered = if v.fetch_ok_is_request_ok() {
+        message::REQUEST_OK
+    } else {
+        message::FETCH_OK_22
+    };
+    assert_eq!(kind, answered, "{v}");
     let recv = tokio::time::timeout(WAIT, fetcher.conn.accept_uni())
         .await
         .unwrap()
@@ -1160,6 +1178,101 @@ async fn a_silent_publisher_of_the_namespace_does_not_hold_a_fetch() {
     );
     serving.abort();
     drop(silent);
+}
+
+/// A publisher that serves a SUBSCRIBE from group 2 and refuses every FETCH
+/// (REQUEST_ERROR), as moq-dev's relay refuses one over more than a group at
+/// draft 23.
+async fn refuse_fetches(conn: quinn::Connection, v: Version) {
+    while let Ok(Ok((mut send, recv))) = tokio::time::timeout(WAIT, conn.accept_bi()).await {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut recv = BufReader::new(recv);
+            let Some((kind, body)) = read_frame(&mut recv, v, 1 << 20).await.ok().flatten() else {
+                return;
+            };
+            match Message::decode(kind, &body, v, &Context::default()).unwrap() {
+                Message::Subscribe(_) => {
+                    let ok = Message::SubscribeOk {
+                        track_alias: 5,
+                        params: Params {
+                            largest_object: Some(Location::new(1, 0)),
+                            ..Params::default()
+                        },
+                        properties: Bytes::new(),
+                    };
+                    send.write_all(&ok.encode(v)).await.unwrap();
+                    send_subgroup(&conn, 5, 2, &[object(2, 0, b"c")]).await;
+                    // The subscription lasts while its request stream does
+                    tokio::time::sleep(WAIT * 2).await;
+                    drop(send);
+                }
+                Message::Fetch(_) => {
+                    let refused = Message::RequestError(message::RequestError {
+                        code: super::error::RequestCode::NotSupported as u64,
+                        retry_interval: 0,
+                        reason: "one group at a time".into(),
+                        details: Vec::new(),
+                    });
+                    send.write_all(&refused.encode(v)).await.unwrap();
+                    let _ = send.finish();
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+/// A FETCH the upstream refuses leaves its range unknown, never vouched for:
+/// a refused fill once closed its channel as a complete answer would, and
+/// the relay told a subscriber the objects did not exist (found against
+/// moq-dev's relay at draft 23, 2026-11-26).
+#[tokio::test]
+async fn a_refused_upstream_fetch_leaves_the_range_unknown() {
+    let (server, _moq, _accept, cert) = relay().await;
+    for v in Version::ALL {
+        let t = TrackName {
+            namespace: ns(&[b"music", b"refused"]),
+            name: Bytes::from(v.alpn()),
+        };
+        let mut publisher = Client::connect(&server, &cert, v, Setup::default()).await;
+        let (kind, _request) = advertise(&mut publisher, &t.namespace).await;
+        assert_eq!(kind, message::REQUEST_OK, "{v}");
+        let serving = tokio::spawn(refuse_fetches(publisher.conn.clone(), v));
+        // Group 2 reaches the relay through a subscription
+        let mut subscriber = Client::connect(&server, &cert, v, Setup::default()).await;
+        let id = subscriber.id();
+        let (_ss, _sr, kind, _) = subscriber
+            .request(Message::Subscribe(TrackRequest {
+                request_id: id,
+                track: t.clone(),
+                params: Params::default(),
+            }))
+            .await;
+        assert_eq!(kind, message::SUBSCRIBE_OK, "{v}");
+        let (_alias, group, got) = receive_subgroup(&subscriber.conn).await;
+        assert_eq!((group, got.len()), (2, 1), "{v}: group 2, live");
+        // Groups 0 and 1 the relay never had, and the publisher refuses them
+        let all = fetch_all(
+            &server,
+            &cert,
+            v,
+            &t,
+            Location::new(0, 0),
+            Location::new(2, 0),
+        )
+        .await;
+        assert!(
+            matches!(all.first(), Some(Err(e)) if e.contains("Unknown")),
+            "{v}: groups 0 and 1 unknown, not objects that do not exist: {all:?}"
+        );
+        assert_eq!(
+            all.last(),
+            Some(&Ok(Bytes::from_static(b"c"))),
+            "{v}: then group 2: {all:?}"
+        );
+        serving.abort();
+    }
 }
 
 #[tokio::test]
@@ -1345,6 +1458,72 @@ async fn a_stream_reset_at_its_header_still_delivers_the_header() {
     sender.abort();
 }
 
+/// FETCH `from..=to` of `t` on a session: the Locations of the objects that
+/// come and the other entries, or None where the FETCH is refused.
+async fn fetch_locations(
+    session: &mut Client,
+    track: &TrackName,
+    from: Location,
+    to: Location,
+) -> Option<(Vec<Location>, Vec<String>)> {
+    let v = session.v;
+    let id = session.id();
+    let (_fs, _fr, kind, _) = session
+        .request(Message::Fetch(TrackRequest {
+            request_id: id,
+            track: track.clone(),
+            params: Params {
+                // To the end of a group as the draft says it
+                location_filter: Some(if to.object == u64::MAX {
+                    LocationFilter::AbsoluteGroupEnd {
+                        start: from,
+                        end_group: to.group,
+                    }
+                } else {
+                    LocationFilter::AbsoluteRange {
+                        start: from,
+                        end: to,
+                    }
+                }),
+                ..Params::default()
+            },
+        }))
+        .await;
+    if kind == message::REQUEST_ERROR {
+        return None;
+    }
+    // Draft 22 answers a FETCH with FETCH_OK; 23 with REQUEST_OK
+    let answered = if v.fetch_ok_is_request_ok() {
+        message::REQUEST_OK
+    } else {
+        message::FETCH_OK_22
+    };
+    assert_eq!(kind, answered, "{v:?}: FETCH of {from:?} to {to:?}");
+    let recv = tokio::time::timeout(WAIT, session.conn.accept_uni())
+        .await
+        .expect("a fetch stream")
+        .unwrap();
+    let mut stream = BufReader::new(recv);
+    assert_eq!(
+        read_vi64(&mut stream).await.unwrap(),
+        Some(STREAM_FETCH_HEADER)
+    );
+    assert_eq!(read_vi64(&mut stream).await.unwrap(), Some(id));
+    let mut state = FetchState::default();
+    let (mut objects, mut others) = (Vec::new(), Vec::new());
+    while let Some(e) = state
+        .read(&mut stream, GroupOrder::Ascending, v, 1 << 20)
+        .await
+        .unwrap()
+    {
+        match e {
+            FetchEntry::Object(o) => objects.push(o.location),
+            other => others.push(format!("{other:?}")),
+        }
+    }
+    Some((objects, others))
+}
+
 /// An outside implementation's relay as this relay's upstream, live: a
 /// subscriber here, in each draft this relay speaks, subscribes to a track
 /// another implementation publishes into that relay, and fetches a group it
@@ -1355,6 +1534,10 @@ async fn a_stream_reset_at_its_header_still_delivers_the_header() {
 /// MOQ_INTEROP_UPSTREAM=moqt://127.0.0.1:14433 MOQ_INTEROP_CA=ca.pem \
 /// MOQ_INTEROP_TRACK=moqtail/demo cargo test --lib live_an_outside_relay_as_upstream -- --ignored --nocapture
 /// ```
+///
+/// A track that is published whole and ended (`MOQ_INTEROP_FINITE=1`, as
+/// moq-dev's `interop-tail publish … cached` writes) brings no live group to a
+/// subscriber: each is fetched instead, from group 0 to the Largest Object.
 #[tokio::test]
 #[ignore = "needs an outside relay with a track published into it"]
 async fn live_an_outside_relay_as_upstream() {
@@ -1363,6 +1546,7 @@ async fn live_an_outside_relay_as_upstream() {
     let ca = std::env::var("MOQ_INTEROP_CA").expect("MOQ_INTEROP_CA");
     let wanted = std::env::var("MOQ_INTEROP_TRACK").unwrap_or_else(|_| "moqtail/demo".into());
     let (namespace, name) = wanted.rsplit_once('/').expect("namespace/track");
+    let finite = std::env::var("MOQ_INTEROP_FINITE").is_ok_and(|v| v == "1");
     let t = TrackName {
         namespace: Namespace(
             namespace
@@ -1377,16 +1561,26 @@ async fn live_an_outside_relay_as_upstream() {
     for cert in CertificateDer::pem_file_iter(&ca).expect("the CA file") {
         roots.add(cert.expect("a certificate")).expect("a root");
     }
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    crypto.alpn_protocols = Version::alpns();
-    let client = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
-    ));
+    let roots = Arc::new(roots);
+    let client_for = |alpns: Vec<Vec<u8>>| {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(Arc::clone(&roots))
+            .with_no_client_auth();
+        crypto.alpn_protocols = alpns;
+        quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        ))
+    };
+    let client = client_for(Version::alpns());
+    let up = super::upstream::UpstreamUri::parse(&upstream).expect("an upstream URI");
+    let up_addr = tokio::net::lookup_host((up.host.as_str(), up.port))
+        .await
+        .expect("the upstream's address")
+        .next()
+        .expect("an address");
     let edge_moq = Moq::new(&MoqConfig {
         enabled: true,
         ..MoqConfig::default()
@@ -1427,9 +1621,9 @@ async fn live_an_outside_relay_as_upstream() {
             .expect("the upstream's Largest Object");
         println!("{v:?}: SUBSCRIBE_OK, Largest Object {largest:?}");
 
-        // Live objects, group by group, each in order
+        // Live objects, group by group, each in order (a finished track has none)
         let mut groups = Vec::new();
-        while groups.len() < 2 {
+        while !finite && groups.len() < 2 {
             let (_alias, group, got) = receive_subgroup(&subscriber.conn).await;
             assert!(!got.is_empty(), "{v:?}: group {group} carried objects");
             assert!(
@@ -1441,50 +1635,64 @@ async fn live_an_outside_relay_as_upstream() {
         }
 
         // A group from before the subscription: the edge never had it, so the
-        // FETCH is filled from the upstream
+        // FETCH is filled from the upstream. A finished track: every group of it
         let past = largest.group.saturating_sub(1);
-        let mut fetcher = Client::connect(&edge, &edge_cert, v, Setup::default()).await;
-        let id = fetcher.id();
-        let (_fs, _fr, kind, _) = fetcher
-            .request(Message::Fetch(TrackRequest {
-                request_id: id,
-                track: t.clone(),
-                params: Params {
-                    location_filter: Some(LocationFilter::AbsoluteRange {
-                        start: Location::new(past, 0),
-                        end: Location::new(past, 2),
-                    }),
-                    ..Params::default()
-                },
-            }))
-            .await;
-        // Draft 22 answers a FETCH with FETCH_OK; 23 with REQUEST_OK
-        let answered = if v.fetch_ok_is_request_ok() {
-            message::REQUEST_OK
+        let (from, to) = if finite {
+            (Location::new(0, 0), largest)
         } else {
-            message::FETCH_OK_22
+            (Location::new(past, 0), Location::new(past, 2))
         };
-        assert_eq!(kind, answered, "{v:?}: FETCH of group {past}");
-        let recv = tokio::time::timeout(WAIT, fetcher.conn.accept_uni())
+        let mut fetcher = Client::connect(&edge, &edge_cert, v, Setup::default()).await;
+        let (fetched, marks) = fetch_locations(&mut fetcher, &t, from, to)
             .await
-            .expect("a fetch stream")
-            .unwrap();
-        let mut r = BufReader::new(recv);
-        assert_eq!(read_vi64(&mut r).await.unwrap(), Some(STREAM_FETCH_HEADER));
-        assert_eq!(read_vi64(&mut r).await.unwrap(), Some(id));
-        let mut state = FetchState::default();
-        let mut fetched = Vec::new();
-        while let Some(e) = state
-            .read(&mut r, GroupOrder::Ascending, v, 1 << 20)
-            .await
-            .unwrap()
-        {
-            match e {
-                FetchEntry::Object(o) => fetched.push(o.location),
-                other => println!("{v:?}: fetch entry {other:?}"),
+            .expect("this relay answers the FETCH");
+        println!("{v:?}: FETCH of {from:?} to {to:?} through this relay: {fetched:?} {marks:?}");
+        assert!(!fetched.is_empty(), "{v:?}: objects from the upstream");
+        if finite {
+            // The same asked of the upstream itself: this relay passes on all
+            // it gives, and marks Unknown what it will not give
+            let ep =
+                quinn::Endpoint::client(SocketAddr::from(([0u8; 4], 0))).expect("a client port");
+            ep.set_default_client_config(client_for(vec![v.alpn().as_bytes().to_vec()]));
+            let mut direct =
+                Client::connect_over(&ep, up_addr, &up.host, v, Setup::default()).await;
+            match fetch_locations(&mut direct, &t, from, to).await {
+                Some((theirs, _)) => {
+                    assert_eq!(
+                        fetched, theirs,
+                        "{v:?}: this relay returns what the upstream holds"
+                    );
+                }
+                None => {
+                    println!("{v:?}: the upstream refuses a FETCH of {from:?} to {to:?}");
+                    assert!(
+                        marks.iter().any(|m| m.contains("Unknown")),
+                        "{v:?}: what the upstream refused is marked Unknown: {marks:?}"
+                    );
+                }
+            }
+            // One group at a time: what the upstream serves comes through
+            // whole, what it refuses is refused or marked Unknown
+            for g in 0..=largest.group {
+                let (a, b) = (Location::new(g, 0), Location::new(g, u64::MAX));
+                let ours = fetch_locations(&mut fetcher, &t, a, b).await;
+                let theirs = fetch_locations(&mut direct, &t, a, b).await;
+                println!(
+                    "{v:?}: group {g}: through this relay {ours:?}, from the upstream {theirs:?}"
+                );
+                match (&ours, &theirs) {
+                    (Some((o, _)), Some((th, _))) => {
+                        assert_eq!(o, th, "{v:?}: group {g} as the upstream has it");
+                    }
+                    (None, None) => {}
+                    (Some((o, marks)), None) => assert!(
+                        o.iter().all(|l| l.group != g)
+                            || marks.iter().any(|m| m.contains("Unknown")),
+                        "{v:?}: group {g}, refused upstream, marked Unknown: {ours:?}"
+                    ),
+                    (None, Some(_)) => panic!("{v:?}: group {g} refused here, served upstream"),
+                }
             }
         }
-        println!("{v:?}: FETCH of group {past}: {fetched:?}");
-        assert!(!fetched.is_empty(), "{v:?}: group {past} from the upstream");
     }
 }

@@ -269,7 +269,12 @@ MOQ_INTEROP_TRACK=moqtail/demo \
 cargo test --lib live_an_outside_relay_as_upstream -- --ignored --nocapture
 ```
 
-`MOQ_INTEROP_CA` holds the roots the upstream's certificate chains to. Run
+`MOQ_INTEROP_CA` holds the roots the upstream's certificate chains to. With
+`MOQ_INTEROP_FINITE=1`, for a track published whole and ended, it fetches the
+track from group 0 to its Largest Object, and each group on its own, through
+this relay and from the upstream itself: what the upstream serves must come
+through unchanged, and what it refuses must be marked Unknown, never left out
+as if it did not exist. Run
 on 2026-11-25 against moqtail 0.19.0's relay (draft 22) with moqtail's client
 publishing: subscribers on draft 22 and on draft 23 got SUBSCRIBE_OK with the
 upstream's Largest Object, live groups in order, and FETCHes of earlier
@@ -279,6 +284,15 @@ all worked. A SUBSCRIBE carrying FILL_PARAMETERS was closed with
 PROTOCOL_VIOLATION: moqtail 0.19.0 puts a parameter count inside the
 parameter's length, which draft 22 does not have (draft 23 has the count and
 no length).
+
+Run on 2026-11-26 against moq-dev's relay (moq-relay 0.17.2, moq-net 0.3.10,
+draft 23 opted in) with its `interop-tail` publishing a finished track: the
+relay refuses a FETCH over more than one group and holds only the newest
+group, so this relay marks the rest Unknown and serves the group both hold
+as the upstream does. This run found that a refused upstream FETCH had been
+read as a complete answer, the range reported as objects that do not exist;
+and a fill to the end of a group now asks with Absolute Start, Group End
+rather than an End Object of 2^64 - 1, which moq-dev's relay refuses.
 
 ## Known limits
 
