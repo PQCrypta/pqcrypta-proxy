@@ -1022,6 +1022,11 @@ pub struct Evidence {
     /// Whether the handshake accepted early data, and whether any arrived.
     pub early_data_accepted: bool,
     pub zero_rtt_datagrams_in: u64,
+    /// The PATH_CHALLENGE frames the client sent: on the multipath port, the
+    /// paths it validated (RFC 10069 §3: a client opens a path, and validates
+    /// it first). Absent from evidence stored before it was recorded.
+    #[serde(default)]
+    pub path_challenges_in: u64,
     /// The timeline, in milliseconds from the connection's start.
     pub t_anomaly_ms: u64,
     pub t_exchange_completed_ms: Option<u64>,
@@ -1091,6 +1096,11 @@ impl Evidence {
     /// connection, since a server's `into_0rtt` always succeeds.
     pub fn met_early_data(&self) -> bool {
         self.zero_rtt_datagrams_in > 0
+    }
+
+    /// Whether the client validated a path of its own on this connection.
+    pub fn opened_a_path(&self) -> bool {
+        self.path_challenges_in > 0
     }
 }
 
@@ -1327,6 +1337,22 @@ impl Session {
                     tracing::info!(
                         "conformance: {} keeping the connection whose early data arrived, \
                          rather than a later one that sent none",
+                        test.id
+                    );
+                    return;
+                }
+            }
+        }
+        // On the multipath port, the connection on which the client opened a
+        // path is the measurement: the scanner and browsers connect several
+        // times per session, and a later connection that only negotiated
+        // multipath must not replace the one that used it.
+        if test.id == "q-multipath" && !ev.opened_a_path() {
+            if let Some(existing) = self.evidence.get(test.id) {
+                if existing.opened_a_path() {
+                    tracing::info!(
+                        "conformance: {} keeping the connection that opened a path, \
+                         rather than a later one that did not",
                         test.id
                     );
                     return;
@@ -1745,6 +1771,7 @@ mod tests {
                 read_proof: Some(true),
                 early_data_accepted: true,
                 zero_rtt_datagrams_in: 1,
+                path_challenges_in: 0,
                 t_anomaly_ms: 0,
                 t_exchange_completed_ms: Some(1),
                 t_observation_end_ms: end_ms,
@@ -1765,6 +1792,7 @@ mod tests {
             read_proof: None,
             early_data_accepted: false,
             zero_rtt_datagrams_in: 0,
+            path_challenges_in: 0,
             t_anomaly_ms: t_anomaly,
             t_exchange_completed_ms: exch,
             t_observation_end_ms: 8_000,
@@ -2049,6 +2077,37 @@ mod tests {
             detail.contains("required to be able to process"),
             "{detail}"
         );
+    }
+
+    /// A client that opened a second path on one connection and only
+    /// negotiated multipath on a later one is judged on the first.
+    #[test]
+    fn a_later_connection_without_a_path_does_not_replace_the_one_with() {
+        let t = catalog::find("q-multipath").expect("the test exists");
+        let mut s = Session::new("s".into());
+        let mut opened = ev(
+            Observation::Signalled("negotiated multipath (RFC 10069): 1 PATH_CHALLENGE".into()),
+            1,
+            Some(1),
+            Some(900),
+        );
+        opened.path_challenges_in = 1;
+        s.record_evidence(t, opened);
+        let later = ev(
+            Observation::Signalled("negotiated multipath (RFC 10069): 0 PATH_CHALLENGE".into()),
+            1,
+            Some(1),
+            Some(900),
+        );
+        s.record_evidence(t, later);
+        assert_eq!(s.evidence[t.id].path_challenges_in, 1);
+
+        // Evidence stored before the field existed reads as no path opened
+        let old = serde_json::to_value(&s.evidence[t.id]).unwrap();
+        let mut old = old.as_object().unwrap().clone();
+        old.remove("path_challenges_in");
+        let back: Evidence = serde_json::from_value(old.into()).unwrap();
+        assert_eq!(back.path_challenges_in, 0);
     }
 
     /// A client's own retry after its early data was refused resumes without

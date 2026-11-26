@@ -742,6 +742,7 @@ async fn watch_retry_answered(
                 read_proof: None,
                 early_data_accepted: false,
                 zero_rtt_datagrams_in: 0,
+                path_challenges_in: 0,
                 // No connection followed, so the clock starts at the Retry.
                 t_anomaly_ms: 0,
                 t_exchange_completed_ms: None,
@@ -818,6 +819,7 @@ async fn watch_version_negotiation(
                     read_proof: None,
                     early_data_accepted: false,
                     zero_rtt_datagrams_in: 0,
+                    path_challenges_in: 0,
                     // No connection followed, so the stimulus and the
                     // observation are the same instant.
                     t_anomaly_ms: 0,
@@ -999,6 +1001,7 @@ async fn run_one(
                         read_proof: None,
                         early_data_accepted: false,
                         zero_rtt_datagrams_in: 0,
+                        path_challenges_in: 0,
                         // Refused before a handshake existed, so the anomaly
                         // was never reached.
                         t_anomaly_ms: refused_at,
@@ -1152,6 +1155,7 @@ async fn run_one(
                             // refusal happens in the handshake, and the reaction
                             // opportunity is "early data arrived and was refused".
                             zero_rtt_datagrams_in: since.zero_rtt_in(),
+                            path_challenges_in: 0,
                             t_anomaly_ms: elapsed,
                             t_exchange_completed_ms: None,
                             t_observation_end_ms: elapsed,
@@ -1476,6 +1480,9 @@ async fn run_one(
         .unwrap_or(false);
     let observation =
         quic_observation(&connection, test, &since, &qpack, held_tickets).unwrap_or(observation);
+    // The paths the client validated on this connection: the multipath
+    // port's measurement (Evidence::opened_a_path)
+    let path_challenges_in = connection.stats().frame_rx.path_challenge;
 
     // A completed handshake on the post-quantum chain port deserves its own
     // sentence rather than the generic discretionary one.
@@ -1657,6 +1664,7 @@ async fn run_one(
                 read_proof,
                 early_data_accepted,
                 zero_rtt_datagrams_in: since.zero_rtt_in(),
+                path_challenges_in,
                 t_anomaly_ms,
                 t_exchange_completed_ms: exchange_completed,
                 t_observation_end_ms: elapsed,
