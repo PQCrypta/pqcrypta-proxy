@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.1...v0.24.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* **conformance:** q-multipath judges RFC 10069's negotiation, and names a client on a draft codepoint ([04c985a](https://github.com/PQCrypta/pqcrypta-proxy/commit/04c985ae713df9ea9bb10ae0568febfb3844c3c5))
+
 ## [0.24.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.0...v0.24.1) (2026-11-26)
 
 
