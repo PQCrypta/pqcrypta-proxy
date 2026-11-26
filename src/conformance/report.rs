@@ -334,6 +334,7 @@ mod tests {
                         read_proof: Some(true),
                         early_data_accepted: true,
                         zero_rtt_datagrams_in: 1,
+                        path_challenges_in: 0,
                         t_anomaly_ms: 0,
                         t_exchange_completed_ms: Some(1),
                         t_observation_end_ms: 5,
