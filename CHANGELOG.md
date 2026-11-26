@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.2...v0.24.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* **conformance:** q-multipath keeps the connection on which the client opened a path ([b92a443](https://github.com/PQCrypta/pqcrypta-proxy/commit/b92a44316bb71295f0ec3242815edce5b9f2064f))
+
 ## [0.24.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.1...v0.24.2) (2026-11-26)
 
 
