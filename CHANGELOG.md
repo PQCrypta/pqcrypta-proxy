@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.0...v0.24.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **moq:** an upstream that refuses a FETCH leaves its range Unknown; a fill to the end of a group asks for it as the draft does ([a214707](https://github.com/PQCrypta/pqcrypta-proxy/commit/a21470791495029caadddc4fcae9e1abfa820027))
+
 ## [0.24.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.23.1...v0.24.0) (2026-11-25)
 
 ### Bug Fixes
