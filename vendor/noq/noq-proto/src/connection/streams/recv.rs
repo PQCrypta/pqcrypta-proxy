@@ -89,13 +89,16 @@ impl Recv {
             if let RecvState::ResetRecvd { reliable_size, .. } = self.state {
                 // Only data before the reliable size is delivered after a reset
                 data.truncate(
-                    usize::try_from(reliable_size.saturating_sub(frame.offset)).unwrap_or(usize::MAX),
+                    usize::try_from(reliable_size.saturating_sub(frame.offset))
+                        .unwrap_or(usize::MAX),
                 );
             }
             if !data.is_empty() {
                 self.assembler
                     .insert(frame.offset, data, payload_len)
-                    .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in stream buffer"))?;
+                    .map_err(|_| {
+                        TransportError::INTERNAL_ERROR("too many gaps in stream buffer")
+                    })?;
             }
         }
 
@@ -288,7 +291,6 @@ impl Recv {
             _ => None,
         }
     }
-
 
     /// Compute the amount of flow control credit consumed, or return an error if more was consumed
     /// than issued

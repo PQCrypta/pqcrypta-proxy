@@ -68,8 +68,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # quinn fork), aliased as `quinn`/`quinn_proto` so the small amount of direct
 # quinn API the proxy uses compiles unchanged; genuine API divergences
 # (noq's per-path multipath API) are patched at the call sites. This brings
-# real, full draft-ietf-quic-multipath support (concurrent data-carrying
-# paths, PATH_ACK/ABANDON/STATUS, per-path loss recovery), superseding the
+# real, full multipath QUIC, RFC 10069 (concurrent data-carrying paths,
+# PATH_ACK/PATH_ABANDON/PATH_STATUS_*, per-path loss recovery), superseding the
 # earlier narrow single-path probe fork.
 quinn = { package = "noq", path = "vendor/noq/noq", default-features = false, features = ["runtime-tokio", "rustls", "aws-lc-rs", "bloom", "platform-verifier"] }
 quinn-proto = { package = "noq-proto", path = "vendor/noq/noq-proto" }

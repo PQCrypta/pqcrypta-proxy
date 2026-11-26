@@ -559,12 +559,12 @@ pub const CATALOG: &[Test] = &[
     },
     Test {
         id: "q-multipath",
-        title: "A second path offered mid-connection",
-        spec: "draft-ietf-quic-multipath",
+        title: "Multipath offered in the handshake",
+        spec: "RFC 10069 §2.1, §3",
         class: Class::Discretionary,
         requirement: Requirement::May,
         tier: Tier::Quic,
-        expectation: "Use the additional path, or decline it cleanly. Do not abort the connection.",
+        expectation: "Negotiate it and open paths (only a client opens one), or ignore the parameter. Do not abort the connection. A client that offers it under a draft's provisional codepoint is not offering it to a server that follows the RFC.",
         implemented: true,
         port_offset: Some(12),
     },
@@ -1431,8 +1431,8 @@ pub fn documents(test: &Test) -> Vec<String> {
 
     if found.is_empty() {
         // A draft, or anything else cited by name. Take it up to the first
-        // separator so "draft-ietf-quic-multipath §5" still groups with its
-        // siblings.
+        // separator so "draft-ietf-tls-hybrid-design §3.2" still groups with
+        // its siblings.
         let name = test
             .spec
             .split([',', ' '])
@@ -1713,8 +1713,14 @@ mod tests {
         let reorder = find("q-packet-reordering").expect("catalogue entry");
         assert_eq!(documents(reorder), vec!["RFC 9000"]);
         // Drafts are named too, or the filter would hide the extensions.
+        let ack_frequency = find("q-ack-frequency").expect("catalogue entry");
+        assert_eq!(
+            documents(ack_frequency),
+            vec!["draft-ietf-quic-ack-frequency"]
+        );
+        // An extension published as an RFC is filed under it.
         let multipath = find("q-multipath").expect("catalogue entry");
-        assert_eq!(documents(multipath), vec!["draft-ietf-quic-multipath"]);
+        assert_eq!(documents(multipath), vec!["RFC 10069"]);
     }
 
     /// Requirement level and class are independent axes.

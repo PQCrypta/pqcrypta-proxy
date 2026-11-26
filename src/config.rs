@@ -1435,7 +1435,7 @@ pub struct ServerConfig {
     pub enable_quic_retry: bool,
 
     /// Maximum concurrent data-carrying paths per connection
-    /// (draft-ietf-quic-multipath), served by the noq QUIC stack.
+    /// (multipath QUIC, RFC 10069), served by the noq QUIC stack.
     ///
     /// The full extension is implemented — per-path packet-number spaces,
     /// PATH_ACK/ABANDON/STATUS lifecycle frames, per-path loss recovery and a

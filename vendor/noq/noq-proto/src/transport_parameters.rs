@@ -135,6 +135,11 @@ macro_rules! make_struct {
 
             /// The endpoint is willing to receive RESET_STREAM_AT frames
             pub(crate) reset_stream_at: bool,
+
+            /// The parameters the peer sent that this implementation does not know. They are
+            /// ignored (RFC 9000 §7.4.2) and kept only for diagnostics: empty for outgoing
+            /// `TransportParameters`.
+            pub(crate) unknown: UnknownTransportParameters,
         }
 
         // We deliberately don't implement the `Default` trait, since that would be public, and
@@ -163,6 +168,7 @@ macro_rules! make_struct {
                     initial_max_path_id: None,
                     max_remote_nat_traversal_addresses: None,
                     reset_stream_at: false,
+                    unknown: UnknownTransportParameters::default(),
                 }
             }
         }
@@ -170,6 +176,61 @@ macro_rules! make_struct {
 }
 
 apply_params!(make_struct);
+
+/// How many of a peer's unknown transport parameters are kept for diagnostics
+pub const UNKNOWN_TRANSPORT_PARAMETERS_KEPT: usize = 16;
+
+/// A transport parameter the peer sent that this implementation does not know
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct UnknownTransportParameter {
+    /// Its identifier
+    pub id: u64,
+    /// The length of its value, in bytes
+    pub len: u64,
+    /// Its value, when that is exactly one variable-length integer
+    pub varint: Option<u64>,
+}
+
+/// The transport parameters a peer sent that this implementation does not know, in the order
+/// sent, up to [`UNKNOWN_TRANSPORT_PARAMETERS_KEPT`].
+///
+/// The protocol ignores them (RFC 9000 §7.4.2). A diagnostic consumer reads them to name an
+/// extension the peer advertised under another codepoint, such as a draft's provisional one, or
+/// a reserved (GREASE) identifier. Held inline so `TransportParameters` stays `Copy`.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct UnknownTransportParameters {
+    kept: [UnknownTransportParameter; UNKNOWN_TRANSPORT_PARAMETERS_KEPT],
+    len: usize,
+    /// How many more the peer sent than were kept
+    pub dropped: u64,
+}
+
+impl UnknownTransportParameters {
+    fn push(&mut self, parameter: UnknownTransportParameter) {
+        match self.kept.get_mut(self.len) {
+            Some(slot) => {
+                *slot = parameter;
+                self.len += 1;
+            }
+            None => self.dropped += 1,
+        }
+    }
+
+    /// The parameters kept, in the order the peer sent them
+    pub fn iter(&self) -> impl Iterator<Item = &UnknownTransportParameter> {
+        self.kept[..self.len].iter()
+    }
+
+    /// How many were kept
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the peer sent none
+    pub fn is_empty(&self) -> bool {
+        self.len == 0 && self.dropped == 0
+    }
+}
 
 impl TransportParameters {
     pub(crate) fn new(
@@ -516,11 +577,18 @@ impl TransportParameters {
                 return Err(Error::Malformed);
             }
             let len = len as usize;
-            let Ok(id) = TransportParameterId::try_from(id) else {
-                // unknown transport parameters are ignored
-                r.advance(len);
+            let Ok(known) = TransportParameterId::try_from(id) else {
+                // Unknown transport parameters are ignored, and kept for diagnostics
+                let mut value = r.copy_to_bytes(len);
+                let varint = value.get_var().ok().filter(|_| !value.has_remaining());
+                params.unknown.push(UnknownTransportParameter {
+                    id,
+                    len: len as u64,
+                    varint,
+                });
                 continue;
             };
+            let id = known;
 
             match id {
                 TransportParameterId::OriginalDestinationConnectionId => {
@@ -984,8 +1052,48 @@ mod test {
 
         reserved_parameter.write(&mut buf);
         assert!(!buf.is_empty());
-        let read_params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+        let mut read_params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+        // Kept for diagnostics, and otherwise ignored
+        let kept: Vec<_> = read_params.unknown.iter().copied().collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, reserved_parameter.id.0);
+        assert_eq!(kept[0].len, reserved_parameter.payload_len as u64);
+        read_params.unknown = UnknownTransportParameters::default();
         assert_eq!(read_params, TransportParameters::default());
+    }
+
+    /// An unknown parameter is kept with its value when that is one varint, as a draft's
+    /// provisional multipath codepoint is (initial_max_path_id under 0x0f739bbc1b666d0d), and
+    /// without one otherwise; past the limit they are counted, not kept.
+    #[test]
+    fn unknown_transport_parameters_kept_for_diagnostics() {
+        let mut buf = Vec::new();
+        buf.write_var(0x0f73_9bbc_1b66_6d0d);
+        buf.write_var(1);
+        buf.write_var(3);
+        buf.write_var(0x1234);
+        buf.write_var(2);
+        buf.extend_from_slice(&[0xff, 0xff]);
+        for id in 0..UNKNOWN_TRANSPORT_PARAMETERS_KEPT as u64 {
+            buf.write_var(0x4000 + id);
+            buf.write_var(0);
+        }
+        let params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+        let kept: Vec<_> = params.unknown.iter().copied().collect();
+        assert_eq!(kept.len(), UNKNOWN_TRANSPORT_PARAMETERS_KEPT);
+        assert_eq!(
+            kept[0],
+            UnknownTransportParameter {
+                id: 0x0f73_9bbc_1b66_6d0d,
+                len: 1,
+                varint: Some(3),
+            }
+        );
+        // Two bytes that are not one varint (0xffff starts an eight-byte one)
+        assert_eq!(kept[1].varint, None);
+        assert_eq!(params.unknown.dropped, 2);
+        // The protocol ignores them all
+        assert_eq!(params.initial_max_path_id, None);
     }
 
     #[test]

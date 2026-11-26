@@ -958,7 +958,7 @@ impl QuicListener {
             info!("QUIC ACK Frequency extension enabled");
         }
 
-        // Full draft-ietf-quic-multipath support (via the noq QUIC stack):
+        // Full multipath QUIC support (RFC 10069, via the noq QUIC stack):
         // allow this many concurrent, data-carrying paths per connection when
         // the peer negotiates multipath. Unlike the earlier narrow single-
         // path validation probe, noq implements the complete extension -

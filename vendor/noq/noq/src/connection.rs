@@ -1126,6 +1126,15 @@ impl Connection {
         conn.inner.is_multipath_negotiated()
     }
 
+    /// The transport parameters the peer sent that noq does not know: ignored (RFC 9000
+    /// §7.4.2), and kept for diagnostics
+    pub fn peer_unknown_transport_parameters(&self) -> proto::UnknownTransportParameters {
+        let conn = self
+            .0
+            .lock_without_waking("peer_unknown_transport_parameters");
+        conn.inner.peer_unknown_transport_parameters()
+    }
+
     /// Registers one address at which this endpoint might be reachable
     ///
     /// When the NAT traversal extension is negotiated, servers send these addresses to clients in
