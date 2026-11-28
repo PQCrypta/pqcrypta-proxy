@@ -483,11 +483,14 @@ impl MoqConfig {
 
 impl ProxyConfig {
     /// The application protocols the QUIC listener serves, by ALPN: HTTP/3,
-    /// DNS over QUIC where it is on, and every MOQT version where MoQ is on.
-    /// A name the listener does not serve is refused with
-    /// no_application_protocol (RFC 9001 section 8.1).
+    /// WebTransport over QUIC where it is on, DNS over QUIC where it is on,
+    /// and every MOQT version where MoQ is on. A name the listener does not
+    /// serve is refused with no_application_protocol (RFC 9001 section 8.1).
     pub fn quic_applications(&self) -> Vec<Vec<u8>> {
         let mut names = vec![b"h3".to_vec()];
+        if self.server.webtransport_over_quic {
+            names.push(crate::wt_quic::ALPN.to_vec());
+        }
         if self.doq.enabled {
             names.push(crate::doq::ALPN.to_vec());
         }
@@ -1501,6 +1504,18 @@ pub struct ServerConfig {
     #[serde(default = "default_webtransport_port")]
     pub webtransport_port: u16,
 
+    /// WebTransport over QUIC (draft-vvv-webtransport-quic-02): a session
+    /// that is a whole QUIC connection, by ALPN `wq-vvv-01`, on every QUIC
+    /// port beside HTTP/3 (default on). The client names the session's path
+    /// and origin in a client indication on its first unidirectional stream;
+    /// the session is admitted by the rules a WebTransport session over
+    /// HTTP/3 meets (`webtransport_allowed_origins`, the session caps, the
+    /// route's gates) and served the same way: the speed test, the telemetry
+    /// wall, or a WebTransport route's backend. Off, the ALPN is not offered
+    /// and such a handshake fails with no_application_protocol.
+    #[serde(default = "default_true")]
+    pub webtransport_over_quic: bool,
+
     /// Hosts that must never advertise HTTP/3 upgrade.
     ///
     /// When a request arrives from one of these hostnames, the proxy sends
@@ -1676,6 +1691,7 @@ impl Default for ServerConfig {
             webtransport_max_streams_per_session: default_wt_max_streams(),
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
+            webtransport_over_quic: true,
             tcp_only_hosts: Vec::new(),
             server_header: default_server_header(),
             request_id_header: String::new(),
@@ -4392,6 +4408,7 @@ pub const RESTART_BOUND_SETTINGS: &[&str] = &[
     "server.proxy_protocol_trusted",
     "server.proxy_protocol_timeout_ms",
     "server.webtransport_port",
+    "server.webtransport_over_quic",
     "tls.handshake_timeout_secs",
     "pqc.enabled",
     "fingerprint.enabled",

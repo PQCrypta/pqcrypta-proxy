@@ -15,6 +15,7 @@ build until this reference says so too.
 - [MASQUE / CONNECT-UDP](#masque--connect-udp-rfc-9298)
 - [DNS over HTTPS](#dns-over-https)
 - [DNS over QUIC](#dns-over-quic)
+- [WebTransport over QUIC](#webtransport-over-quic)
 - [Media over QUIC](#media-over-quic)
 - [HTTP/3 Advanced Features](#http3-advanced-features)
 - [TLS Configuration](#tls-configuration)
@@ -174,6 +175,50 @@ protocol in `/metrics`, apart from HTTP/3.
 | `enabled` | bool | `false` | Serve DNS over QUIC on the QUIC listener |
 | `upstream` | string | `"127.0.0.1:53"` | The name server, `ip:port`, asked over TCP |
 | `timeout_ms` | u64 | `3000` | Time allowed for the name server's answer; past it the client gets SERVFAIL with Extended DNS Error 22 |
+
+---
+
+## WebTransport over QUIC
+
+```toml
+[server]
+webtransport_over_quic = true
+```
+
+WebTransport over QUIC (draft-vvv-webtransport-quic-02) on the QUIC listener,
+on every port: a client that offers `wq-vvv-01` in ALPN gets a connection that
+is one WebTransport session, with no HTTP/3 on it. Chosen by ALPN like DNS
+over QUIC and MOQT, so it needs no port of its own.
+
+Once the handshake completes, the client sends a client indication on its
+first unidirectional stream (stream 2) and ends it: fields of a 16-bit key, a
+16-bit length and the value, 65,535 bytes at most, `Origin` (0x0000) and
+`Path` (0x0001) among them. Nothing else on the connection is read before it
+has arrived, within `max_idle_timeout_secs`. A key the draft does not define
+is ignored, and a key sent twice ends the connection. The session's host is
+the TLS server name.
+
+The session is then admitted as a WebTransport session over HTTP/3 is, in the
+same order: `pqc.downgrade_action`, the rate limiters and the security layer,
+the WebTransport route's own rate limit and gates, `webtransport_allowed_origins`
+and the per-client and per-origin session caps, and a WebTransport route or a
+path the proxy serves itself (`/speedtest`, `/telemetry`). Its streams and
+datagrams are the connection's own, with no stream header or session prefix,
+served as every session is. A stream reset or STOP_SENDING carries the
+application's code as the QUIC error code.
+
+The draft defines no error codes and no response. A session that is refused
+is closed with CONNECTION_CLOSE, its application error code the HTTP status
+the HTTP/3 entrance answers the same refusal with (400 for a malformed client
+indication, 403, 404, 421, 429), and its reason phrase says why. A session
+whose handler finishes is closed with code 0. Sessions are counted under
+`webtransport` in `/metrics`, and logged with `wq-vvv-01` as the protocol.
+
+**Enabled by default.** Changes take effect on restart.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `webtransport_over_quic` | bool | `true` | Offer `wq-vvv-01` in the QUIC listener's ALPN list and serve WebTransport over QUIC sessions |
 
 ---
 

@@ -40,6 +40,7 @@ use crate::tls::TlsProvider;
 mod cors;
 mod request;
 mod websocket;
+mod webtransport_quic;
 
 use websocket::ws_h3_tunnel;
 
@@ -771,7 +772,9 @@ async fn connect_refusal(
     }
 }
 
-/// The access-log line of an extended CONNECT answered here.
+/// The access-log line of an extended CONNECT answered here, or of a
+/// WebTransport over QUIC session (`protocol`, the request line's token:
+/// `HTTP/3`, or the session's ALPN).
 fn log_connect(
     request: &http::Request<()>,
     host: Option<&str>,
@@ -779,6 +782,7 @@ fn log_connect(
     remote_addr: SocketAddr,
     fingerprint: &crate::fingerprint::FingerprintResult,
     status: u16,
+    protocol: &'static str,
 ) {
     let field = |name: HeaderName| request.headers().get(name).and_then(|v| v.to_str().ok());
     crate::access_logger::log_access(&crate::access_logger::AccessLogEntry {
@@ -788,7 +792,7 @@ fn log_connect(
         remote_addr,
         method: request.method().as_str(),
         path,
-        protocol: "HTTP/3",
+        protocol,
         status,
         body_size: 0,
         referer: field(header::REFERER),
@@ -1393,6 +1397,43 @@ impl QuicListener {
             let _open = metrics
                 .connections
                 .connection_opened(ConnectionProtocol::Doq);
+            // Held to the fingerprint policy as every connection is, from the
+            // ClientHello, which is readable now: DNS over QUIC answers 0-RTT
+            // queries before the handshake completes (RFC 9250 section 4.5).
+            // Counted as a completed or failed handshake once it ends. The
+            // key-exchange policy answers requests and sessions 421, which
+            // DNS has no way to say; it is not applied here.
+            let pqc = {
+                let data = current_handshake_data(&connection, hello_data);
+                let (handshake_facts, client_hello) =
+                    read_handshake_facts(data.as_deref(), remote_addr);
+                if fingerprint_or_close(
+                    &connection,
+                    client_hello.as_deref(),
+                    remote_addr,
+                    &fingerprint_extractor,
+                    &security,
+                    &fingerprint_config,
+                )
+                .is_none()
+                {
+                    return Ok(());
+                }
+                handshake_facts.is_post_quantum()
+            };
+            let established: Established = {
+                let connection = connection.clone();
+                let metrics = metrics.clone();
+                Box::pin(async move {
+                    let accepted = established.await;
+                    if connection.close_reason().is_none() {
+                        metrics.tls.handshake_completed(true, pqc);
+                    } else {
+                        metrics.handshake_failed();
+                    }
+                    accepted
+                })
+            };
             if let Some(service) = doq {
                 crate::doq::serve(
                     connection,
@@ -1415,11 +1456,98 @@ impl QuicListener {
                 let _open = metrics
                     .connections
                     .connection_opened(ConnectionProtocol::Moqt);
-                if handshake_completed(established, &connection).await {
-                    moq.serve_quic(connection, alpn, remote_addr).await;
+                if !handshake_completed(established, &connection).await {
+                    metrics.handshake_failed();
+                    return Ok(());
                 }
+                // Counted, and held to the fingerprint policy, as an HTTP/3
+                // connection is before anything is served. The key-exchange
+                // policy answers requests and sessions 421, which MOQT has no
+                // way to say; it is not applied here.
+                {
+                    let data = current_handshake_data(&connection, hello_data);
+                    let (handshake_facts, client_hello) =
+                        read_handshake_facts(data.as_deref(), remote_addr);
+                    metrics
+                        .tls
+                        .handshake_completed(true, handshake_facts.is_post_quantum());
+                    if fingerprint_or_close(
+                        &connection,
+                        client_hello.as_deref(),
+                        remote_addr,
+                        &fingerprint_extractor,
+                        &security,
+                        &fingerprint_config,
+                    )
+                    .is_none()
+                    {
+                        return Ok(());
+                    }
+                }
+                watch_paths(&connection, remote_addr);
+                moq.serve_quic(connection, alpn, remote_addr).await;
                 return Ok(());
             }
+        }
+        // WebTransport over QUIC (draft-vvv-webtransport-quic): the whole
+        // connection is one session (webtransport_quic.rs). `wq-vvv-01` is in
+        // the ALPN list only when server.webtransport_over_quic is on, and
+        // nothing HTTP/3 sends is sent on it. Served once the handshake
+        // completes: the client indication is the first application data the
+        // server may process (section 3.2), and one carried in 0-RTT could
+        // be a replay.
+        if negotiated.as_deref() == Some(crate::wt_quic::ALPN) {
+            let _open = metrics
+                .connections
+                .connection_opened(ConnectionProtocol::WebTransport);
+            established.await;
+            if let Some(reason) = connection.close_reason() {
+                metrics.handshake_failed();
+                return Err(reason.into());
+            }
+            // Final once the handshake is done (application_protocol)
+            let data = current_handshake_data(&connection, hello_data);
+            let (handshake_facts, client_hello) =
+                read_handshake_facts(data.as_deref(), remote_addr);
+            let pqc = handshake_facts.is_post_quantum();
+            metrics.tls.handshake_completed(true, pqc);
+            crate::pqc_policy::handshake_completed(
+                remote_addr.ip(),
+                handshake_facts.kex_group.as_deref(),
+                pqc,
+            );
+            let Some(fingerprint) = fingerprint_or_close(
+                &connection,
+                client_hello.as_deref(),
+                remote_addr,
+                &fingerprint_extractor,
+                &security,
+                &fingerprint_config,
+            ) else {
+                return Ok(());
+            };
+            watch_paths(&connection, remote_addr);
+            // Boxed: the session's state machine (serve_session's) is held
+            // on the heap for its session alone, not inside every
+            // connection's future
+            Box::pin(webtransport_quic::serve(
+                webtransport_quic::Arrival {
+                    server_name: data.as_deref().and_then(|d| d.server_name.clone()),
+                    connection,
+                    remote_addr,
+                    local_port,
+                    handshake: Arc::new(handshake_facts),
+                    fingerprint: Arc::new(fingerprint),
+                },
+                webtransport_quic::Services {
+                    config,
+                    backend_pool,
+                    security,
+                    advanced_rate_limiter,
+                },
+            ))
+            .await;
+            return Ok(());
         }
         let _open = metrics
             .connections
@@ -1483,42 +1611,9 @@ impl QuicListener {
             (data.or(hello_data), None)
         };
 
-        // Read everything the handshake exposes in one pass: ALPN, the
-        // negotiated group and cipher suite for the Handshake Mirror, and the
-        // ClientHello bytes for fingerprinting.
-        //
-        // The hello is only reachable here. Over TCP a listener peeks the socket
-        // and parses the hello itself; over QUIC it arrives inside encrypted
-        // Initial CRYPTO frames, so the TLS stack holds the only plaintext copy
-        // and the vendored rustls/noq forks hand it out through HandshakeData.
-        let mut handshake_facts = quic_handshake_facts_empty();
-        let mut client_hello: Option<Vec<u8>> = None;
-
-        if let Some(crypto_data) = handshake_data.as_deref() {
-            if let Some(protocol) = &crypto_data.protocol {
-                let alpn = String::from_utf8_lossy(protocol);
-                debug!("ALPN negotiated: {} for {}", alpn, remote_addr);
-                handshake_facts.alpn = Some(alpn.into_owned());
-            }
-            handshake_facts.kex_group = crypto_data
-                .negotiated_key_exchange_group
-                .map(|g| format!("{g:?}"));
-            handshake_facts.cipher_suite = crypto_data
-                .negotiated_cipher_suite
-                .map(|c| format!("{c:?}"));
-            client_hello = crypto_data.client_hello_wire.clone();
-            // ECH applies over QUIC exactly as over TCP; the page reported
-            // it as "not observable over HTTP/3" only because nothing
-            // carried the result up here.
-            if let Some(ech) = crypto_data.ech_accepted {
-                handshake_facts.ech = match ech {
-                    rustls::server::EchAcceptance::NotOffered => "not-offered",
-                    rustls::server::EchAcceptance::Rejected => "rejected",
-                    rustls::server::EchAcceptance::UnknownConfig => "unknown-config",
-                    rustls::server::EchAcceptance::Accepted => "accepted",
-                };
-            }
-        }
+        // Everything the handshake exposed (read_handshake_facts)
+        let (handshake_facts, client_hello) =
+            read_handshake_facts(handshake_data.as_deref(), remote_addr);
 
         // Counted once the facts are final: now, or -- for a connection that
         // is already serving 0-RTT -- when its handshake completes, which a
@@ -1546,121 +1641,27 @@ impl QuicListener {
             }
         }
 
-        // Fingerprint the client, applying exactly the policy the TCP path
-        // applies — same classification order, same cache, same pentest bypass,
-        // same ban decision.
-        //
-        // Unlike TCP this happens *after* the handshake rather than before it. A
-        // QUIC server cannot decline earlier: the hello is encrypted under keys
-        // derived during the handshake it would be trying to avoid. The block
-        // still lands before any HTTP/3 request is served.
-        let fingerprint = match client_hello.as_deref() {
-            // `fingerprint.enabled = false` has to mean the same thing on both
-            // transports. The TCP listeners gate their whole fingerprint stage on
-            // it; this path did not, so an operator who turned fingerprinting off
-            // still had QUIC connections classified and banned — a security policy
-            // that applied over HTTP/3 and not over HTTP/1.1 or HTTP/2, with
-            // nothing in the configuration saying so. Found when a load generator
-            // was blocked as Suspicious on a run with the feature explicitly
-            // disabled.
-            Some(hello) if fingerprint_config.enabled => fingerprint_extractor
-                .process_client_hello_quic(hello, remote_addr.ip(), &security, &fingerprint_config),
-            Some(_) => crate::fingerprint::FingerprintResult {
-                allowed: true,
-                ja3_hash: None,
-                ja4_hash: None,
-                classification: None,
-                client_name: None,
-            },
-            None => {
-                debug!(
-                    "[QUIC] No ClientHello available for {} — not fingerprinted",
-                    remote_addr
-                );
-                crate::fingerprint::FingerprintResult {
-                    allowed: true,
-                    ja3_hash: None,
-                    ja4_hash: None,
-                    classification: None,
-                    client_name: None,
-                }
-            }
-        };
-
-        if !fingerprint.allowed {
-            warn!(
-                "[QUIC] Blocking {} on TLS fingerprint (class={:?}, ja4={:?})",
-                remote_addr, fingerprint.classification, fingerprint.ja4_hash
-            );
-            connection.close(0u32.into(), b"blocked");
+        // The client's fingerprint, held to the TCP path's policy
+        // (fingerprint_or_close)
+        let Some(fingerprint) = fingerprint_or_close(
+            &connection,
+            client_hello.as_deref(),
+            remote_addr,
+            &fingerprint_extractor,
+            &security,
+            &fingerprint_config,
+        ) else {
             return Ok(());
-        }
-
-        // Multipath path management is fully automatic in noq once
-        // negotiated (see max_concurrent_multipath_paths in the transport
-        // config) - the peer opens/validates additional paths and the stack
-        // schedules across them. Subscribe to noq's PathEvent stream so real
-        // multipath activity (a second path opening, its per-path stats, and
-        // teardown) is observable in the server logs, not silent inside the
-        // transport. Costs nothing when no extra paths are opened.
-        {
-            let conn_for_paths = connection.clone();
-            let peer = remote_addr;
-            tokio::spawn(async move {
-                let mut events = conn_for_paths.path_events();
-                while let Some(ev) = events.next().await {
-                    match ev {
-                        Ok(quinn::PathEvent::Established { id, .. }) => {
-                            let (rtt_ms, cwnd, mtu) = conn_for_paths
-                                .path_stats(id)
-                                .map(|s| {
-                                    (
-                                        u64::try_from(s.rtt.as_millis()).unwrap_or(u64::MAX),
-                                        s.cwnd,
-                                        u64::from(s.current_mtu),
-                                    )
-                                })
-                                .unwrap_or((0, 0, 0));
-                            info!(
-                                "Multipath: path {} ESTABLISHED for {} (rtt={}ms cwnd={}B mtu={}B)",
-                                id.get(),
-                                peer,
-                                rtt_ms,
-                                cwnd,
-                                mtu
-                            );
-                        }
-                        Ok(quinn::PathEvent::Abandoned { id, reason, .. }) => {
-                            info!(
-                                "Multipath: path {} ABANDONED for {} (reason: {:?})",
-                                id.get(),
-                                peer,
-                                reason
-                            );
-                        }
-                        Ok(quinn::PathEvent::Discarded { id, path_stats, .. }) => {
-                            info!(
-                                "Multipath: path {} DISCARDED for {} (final: rtt={}ms cwnd={}B lost_pkts={})",
-                                id.get(),
-                                peer,
-                                u64::try_from(path_stats.rtt.as_millis()).unwrap_or(u64::MAX),
-                                path_stats.cwnd,
-                                path_stats.lost_packets
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(_lagged) => {
-                            // Broadcast receiver fell behind; benign for logging.
-                        }
-                    }
-                }
-            });
-        }
+        };
+        watch_paths(&connection, remote_addr);
 
         match h3_built {
             Ok(mut h3) => {
                 // HTTP/3 connection established
-                Self::handle_h3_connection(
+                // Boxed: the HTTP/3 connection's state machine is the
+                // largest by far, and on the heap it is not carried inside
+                // this future, which every application shares
+                Box::pin(Self::handle_h3_connection(
                     &mut h3,
                     connection,
                     remote_addr,
@@ -1675,7 +1676,7 @@ impl QuicListener {
                     cache,
                     Arc::new(handshake_facts),
                     Arc::new(fingerprint),
-                )
+                ))
                 .await?;
             }
             Err(e) => {
@@ -2082,6 +2083,7 @@ impl QuicListener {
                                 remote_addr,
                                 &fingerprint,
                                 status.as_u16(),
+                                "HTTP/3",
                             );
                             warn!(
                                 "[QUIC/H3] extended CONNECT ({:?}) for {} from {} refused: {}",
@@ -2109,6 +2111,7 @@ impl QuicListener {
                             remote_addr,
                             &fingerprint,
                             status.as_u16(),
+                            "HTTP/3",
                         );
                     };
 
@@ -2691,6 +2694,201 @@ type Established = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Se
 /// was accepted, false on every ordinary connection: the close reason is what
 /// says it failed. Read as success, it kept the MoQ entrance from serving
 /// any client that sent no 0-RTT.
+/// Everything the handshake exposes, read in one pass: ALPN, the
+/// negotiated group and cipher suite for the Handshake Mirror, ECH's
+/// outcome, and the ClientHello bytes for fingerprinting.
+///
+/// The hello is only reachable here. Over TCP a listener peeks the socket
+/// and parses the hello itself; over QUIC it arrives inside encrypted
+/// Initial CRYPTO frames, so the TLS stack holds the only plaintext copy
+/// and the vendored rustls/noq forks hand it out through HandshakeData.
+fn read_handshake_facts(
+    data: Option<&quinn::crypto::rustls::HandshakeData>,
+    remote_addr: SocketAddr,
+) -> (crate::tls_acceptor::HandshakeFacts, Option<Vec<u8>>) {
+    let mut handshake_facts = quic_handshake_facts_empty();
+    let mut client_hello: Option<Vec<u8>> = None;
+
+    if let Some(crypto_data) = data {
+        if let Some(protocol) = &crypto_data.protocol {
+            let alpn = String::from_utf8_lossy(protocol);
+            debug!("ALPN negotiated: {} for {}", alpn, remote_addr);
+            handshake_facts.alpn = Some(alpn.into_owned());
+        }
+        handshake_facts.kex_group = crypto_data
+            .negotiated_key_exchange_group
+            .map(|g| format!("{g:?}"));
+        handshake_facts.cipher_suite = crypto_data
+            .negotiated_cipher_suite
+            .map(|c| format!("{c:?}"));
+        client_hello = crypto_data.client_hello_wire.clone();
+        // ECH applies over QUIC exactly as over TCP; the page reported
+        // it as "not observable over HTTP/3" only because nothing
+        // carried the result up here.
+        if let Some(ech) = crypto_data.ech_accepted {
+            handshake_facts.ech = match ech {
+                rustls::server::EchAcceptance::NotOffered => "not-offered",
+                rustls::server::EchAcceptance::Rejected => "rejected",
+                rustls::server::EchAcceptance::UnknownConfig => "unknown-config",
+                rustls::server::EchAcceptance::Accepted => "accepted",
+            };
+        }
+    }
+    (handshake_facts, client_hello)
+}
+
+/// Fingerprint the client, applying exactly the policy the TCP path
+/// applies — same classification order, same cache, same pentest bypass,
+/// same ban decision.
+///
+/// Unlike TCP this happens *after* the handshake rather than before it. A
+/// QUIC server cannot decline earlier: the hello is encrypted under keys
+/// derived during the handshake it would be trying to avoid. The block
+/// still lands before any request or session is served.
+fn fingerprint_client(
+    client_hello: Option<&[u8]>,
+    remote_addr: SocketAddr,
+    fingerprint_extractor: &FingerprintExtractor,
+    security: &SecurityState,
+    fingerprint_config: &crate::config::FingerprintConfig,
+) -> crate::fingerprint::FingerprintResult {
+    match client_hello {
+        // `fingerprint.enabled = false` has to mean the same thing on both
+        // transports. The TCP listeners gate their whole fingerprint stage on
+        // it; this path did not, so an operator who turned fingerprinting off
+        // still had QUIC connections classified and banned — a security policy
+        // that applied over HTTP/3 and not over HTTP/1.1 or HTTP/2, with
+        // nothing in the configuration saying so. Found when a load generator
+        // was blocked as Suspicious on a run with the feature explicitly
+        // disabled.
+        Some(hello) if fingerprint_config.enabled => fingerprint_extractor
+            .process_client_hello_quic(hello, remote_addr.ip(), security, fingerprint_config),
+        Some(_) => crate::fingerprint::FingerprintResult {
+            allowed: true,
+            ja3_hash: None,
+            ja4_hash: None,
+            classification: None,
+            client_name: None,
+        },
+        None => {
+            debug!(
+                "[QUIC] No ClientHello available for {} — not fingerprinted",
+                remote_addr
+            );
+            crate::fingerprint::FingerprintResult {
+                allowed: true,
+                ja3_hash: None,
+                ja4_hash: None,
+                classification: None,
+                client_name: None,
+            }
+        }
+    }
+}
+
+/// The client's fingerprint (`fingerprint_client`), or `None` once the
+/// connection is closed for it: whichever application it negotiated, a
+/// client the fingerprint policy refuses is refused before anything is
+/// served, as over TCP, where the check runs for every connection.
+fn fingerprint_or_close(
+    connection: &QuinnConnection,
+    client_hello: Option<&[u8]>,
+    remote_addr: SocketAddr,
+    fingerprint_extractor: &FingerprintExtractor,
+    security: &SecurityState,
+    fingerprint_config: &crate::config::FingerprintConfig,
+) -> Option<crate::fingerprint::FingerprintResult> {
+    let fingerprint = fingerprint_client(
+        client_hello,
+        remote_addr,
+        fingerprint_extractor,
+        security,
+        fingerprint_config,
+    );
+    if fingerprint.allowed {
+        return Some(fingerprint);
+    }
+    warn!(
+        "[QUIC] Blocking {} on TLS fingerprint (class={:?}, ja4={:?})",
+        remote_addr, fingerprint.classification, fingerprint.ja4_hash
+    );
+    connection.close(0u32.into(), b"blocked");
+    None
+}
+
+/// A connection's handshake data as it stands: final once the handshake has
+/// completed (application_protocol), else what the first ClientHello gave
+fn current_handshake_data(
+    connection: &QuinnConnection,
+    hello_data: Option<Box<quinn::crypto::rustls::HandshakeData>>,
+) -> Option<Box<quinn::crypto::rustls::HandshakeData>> {
+    connection
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .or(hello_data)
+}
+
+/// Log a connection's multipath activity. Path management is fully
+/// automatic in noq once negotiated (see max_concurrent_multipath_paths in
+/// the transport config) - the peer opens/validates additional paths and
+/// the stack schedules across them. Subscribing to noq's PathEvent stream
+/// makes real multipath activity (a second path opening, its per-path
+/// stats, and teardown) observable in the server logs, not silent inside
+/// the transport. Costs nothing when no extra paths are opened.
+fn watch_paths(connection: &QuinnConnection, remote_addr: SocketAddr) {
+    let conn_for_paths = connection.clone();
+    let peer = remote_addr;
+    tokio::spawn(async move {
+        let mut events = conn_for_paths.path_events();
+        while let Some(ev) = events.next().await {
+            match ev {
+                Ok(quinn::PathEvent::Established { id, .. }) => {
+                    let (rtt_ms, cwnd, mtu) = conn_for_paths
+                        .path_stats(id)
+                        .map(|s| {
+                            (
+                                u64::try_from(s.rtt.as_millis()).unwrap_or(u64::MAX),
+                                s.cwnd,
+                                u64::from(s.current_mtu),
+                            )
+                        })
+                        .unwrap_or((0, 0, 0));
+                    info!(
+                        "Multipath: path {} ESTABLISHED for {} (rtt={}ms cwnd={}B mtu={}B)",
+                        id.get(),
+                        peer,
+                        rtt_ms,
+                        cwnd,
+                        mtu
+                    );
+                }
+                Ok(quinn::PathEvent::Abandoned { id, reason, .. }) => {
+                    info!(
+                        "Multipath: path {} ABANDONED for {} (reason: {:?})",
+                        id.get(),
+                        peer,
+                        reason
+                    );
+                }
+                Ok(quinn::PathEvent::Discarded { id, path_stats, .. }) => {
+                    info!(
+                        "Multipath: path {} DISCARDED for {} (final: rtt={}ms cwnd={}B lost_pkts={})",
+                        id.get(),
+                        peer,
+                        u64::try_from(path_stats.rtt.as_millis()).unwrap_or(u64::MAX),
+                        path_stats.cwnd,
+                        path_stats.lost_packets
+                    );
+                }
+                Ok(_) => {}
+                Err(_lagged) => {
+                    // Broadcast receiver fell behind; benign for logging.
+                }
+            }
+        }
+    });
+}
+
 async fn handshake_completed(established: Established, connection: &quinn::Connection) -> bool {
     established.await;
     connection.close_reason().is_none()
@@ -3654,6 +3852,16 @@ mod listener_tests {
 
     /// A QUIC connection to the listener, ALPN h3
     async fn connect(addr: SocketAddr, der: &[u8]) -> (quinn::Connection, quinn::Endpoint) {
+        connect_alpn(addr, der, b"h3").await.unwrap()
+    }
+
+    /// A QUIC connection to the listener offering `alpn` alone, or how its
+    /// handshake failed
+    async fn connect_alpn(
+        addr: SocketAddr,
+        der: &[u8],
+        alpn: &[u8],
+    ) -> Result<(quinn::Connection, quinn::Endpoint), quinn::ConnectionError> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -3661,13 +3869,179 @@ mod listener_tests {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedTo(der.to_vec().into(), provider)))
             .with_no_client_auth();
-        tls.alpn_protocols = vec![b"h3".to_vec()];
+        tls.alpn_protocols = vec![alpn.to_vec()];
         let endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
         )));
-        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let conn = endpoint.connect(addr, "localhost").unwrap().await?;
+        Ok((conn, endpoint))
+    }
+
+    /// Send `indication` as a WebTransport over QUIC client does: on its
+    /// first unidirectional stream, then its FIN
+    async fn send_indication(conn: &quinn::Connection, indication: &[u8]) {
+        let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(indication).await.unwrap();
+        stream.finish().unwrap();
+    }
+
+    /// A WebTransport over QUIC session for `path`, from `origin`
+    async fn wq_session(
+        addr: SocketAddr,
+        der: &[u8],
+        origin: Option<&str>,
+        path: &str,
+    ) -> (quinn::Connection, quinn::Endpoint) {
+        let (conn, endpoint) = connect_alpn(addr, der, crate::wt_quic::ALPN).await.unwrap();
+        let indication = crate::wt_quic::ClientIndication {
+            origin: origin.map(str::to_string),
+            path: path.to_string(),
+        }
+        .encode()
+        .unwrap();
+        send_indication(&conn, &indication).await;
         (conn, endpoint)
+    }
+
+    /// The application error code and reason the listener closed `conn` with
+    async fn closed_with(conn: &quinn::Connection) -> (u64, String) {
+        match tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("closed within 5 s")
+        {
+            quinn::ConnectionError::ApplicationClosed(close) => (
+                close.error_code.into_inner(),
+                String::from_utf8_lossy(&close.reason).into_owned(),
+            ),
+            other => panic!("not an application close: {other}"),
+        }
+    }
+
+    /// A datagram the speed test echoes, sent until one comes back: its
+    /// payload as it was sent, with no session prefix either way
+    async fn echoed(conn: &quinn::Connection) -> Bytes {
+        let ping = Bytes::from_static(b"wq-vvv-01 ping 0123456789");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                conn.send_datagram(ping.clone()).unwrap();
+                if let Ok(back) =
+                    tokio::time::timeout(Duration::from_millis(300), conn.read_datagram()).await
+                {
+                    break back.unwrap();
+                }
+            }
+        })
+        .await
+        .expect("a datagram echoed within 5 s")
+    }
+
+    /// A WebTransport over QUIC session (draft-vvv-webtransport-quic) is
+    /// served as one over HTTP/3 is: the speed test at /speedtest echoes its
+    /// datagrams and answers its commands on its streams, with nothing
+    /// before either, and no HTTP/3 on the connection
+    #[tokio::test]
+    async fn webtransport_over_quic_serves_the_speed_test() {
+        let (addr, der, _stop) = listener().await;
+        let (conn, _endpoint) = wq_session(addr, &der, None, "/speedtest").await;
+        let negotiated = conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|d| d.protocol.clone());
+        assert_eq!(negotiated.as_deref(), Some(crate::wt_quic::ALPN));
+
+        assert_eq!(&echoed(&conn).await[..], b"wq-vvv-01 ping 0123456789");
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let command = br#"{"op":"info"}"#;
+        send.write_all(&u32::try_from(command.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(command).await.unwrap();
+        send.finish().unwrap();
+        let mut len = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut len))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut frame = vec![0u8; u32::from_be_bytes(len) as usize];
+        recv.read_exact(&mut frame).await.unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(info["op"], "info_result");
+
+        // The server opened no stream of its own: no HTTP/3 control stream
+        let opened = tokio::time::timeout(Duration::from_millis(300), conn.accept_uni()).await;
+        assert!(opened.is_err(), "the server opened a unidirectional stream");
+        conn.close(0u32.into(), b"");
+    }
+
+    /// A path with no WebTransport service is refused at once, its code the
+    /// 404 the HTTP/3 entrance answers
+    #[tokio::test]
+    async fn webtransport_over_quic_refuses_a_path_with_no_service() {
+        let (addr, der, _stop) = listener().await;
+        let (conn, _endpoint) = wq_session(addr, &der, None, "/nothing-here").await;
+        let (code, reason) = closed_with(&conn).await;
+        assert_eq!(code, 404);
+        assert!(reason.starts_with("404 Not Found"), "{reason}");
+    }
+
+    /// A client indication that sends a key twice ends the connection 400
+    /// (draft-vvv-webtransport-quic section 3.2)
+    #[tokio::test]
+    async fn a_malformed_client_indication_is_refused() {
+        let (addr, der, _stop) = listener().await;
+        let (conn, _endpoint) = connect_alpn(addr, &der, crate::wt_quic::ALPN)
+            .await
+            .unwrap();
+        let field = |path: &str| {
+            crate::wt_quic::ClientIndication {
+                origin: None,
+                path: path.into(),
+            }
+            .encode()
+            .unwrap()
+        };
+        let mut twice = field("/speedtest");
+        twice.extend(field("/telemetry"));
+        send_indication(&conn, &twice).await;
+        let (code, reason) = closed_with(&conn).await;
+        assert_eq!(code, 400);
+        assert!(reason.contains("0x0001 sent twice"), "{reason}");
+    }
+
+    /// The Origin allowlist holds as over HTTP/3: an origin it does not list
+    /// is refused 403, and one it lists is served
+    #[tokio::test]
+    async fn webtransport_over_quic_admits_only_listed_origins() {
+        let (addr, der, _stop) = listener_with(|c| {
+            c.server.webtransport_allowed_origins = vec!["https://pqcrypta.com".into()];
+        })
+        .await;
+        let (refused, _endpoint) =
+            wq_session(addr, &der, Some("https://elsewhere.example"), "/speedtest").await;
+        let (code, reason) = closed_with(&refused).await;
+        assert_eq!(code, 403);
+        assert!(reason.contains("webtransport_allowed_origins"), "{reason}");
+
+        let (admitted, _endpoint) =
+            wq_session(addr, &der, Some("https://pqcrypta.com"), "/speedtest").await;
+        assert_eq!(&echoed(&admitted).await[..], b"wq-vvv-01 ping 0123456789");
+        admitted.close(0u32.into(), b"");
+    }
+
+    /// Off, `wq-vvv-01` is not offered: the handshake fails with
+    /// no_application_protocol (TLS alert 120, RFC 9001 section 8.1)
+    #[tokio::test]
+    async fn webtransport_over_quic_is_not_offered_when_off() {
+        let (addr, der, _stop) = listener_with(|c| c.server.webtransport_over_quic = false).await;
+        match connect_alpn(addr, &der, crate::wt_quic::ALPN).await {
+            Err(quinn::ConnectionError::ConnectionClosed(close)) => {
+                assert_eq!(close.error_code, quinn::TransportErrorCode::crypto(120));
+            }
+            Err(other) => panic!("refused otherwise: {other}"),
+            Ok(_) => panic!("wq-vvv-01 negotiated while off"),
+        }
     }
 
     /// An HTTP/3 client on `conn`, its connection driven

@@ -533,6 +533,7 @@
     "webtransport_max_sessions_per_client": 64,
     "webtransport_max_sessions_per_origin": 4096,
     "webtransport_max_streams_per_session": 256,
+    "webtransport_over_quic": true,
     "webtransport_port": 4433,
     "worker_threads": 0
   },
