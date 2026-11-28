@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.25.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.3...v0.25.0) (2026-11-28)
+
+
+### Features
+
+* **quic:** one admission for every application a QUIC connection negotiates ([619bbc1](https://github.com/PQCrypta/pqcrypta-proxy/commit/619bbc12d8d8807501027c9097285291aac08d94))
+* **webtransport:** WebTransport over QUIC (draft-vvv-webtransport-quic, ALPN wq-vvv-01) ([619bbc1](https://github.com/PQCrypta/pqcrypta-proxy/commit/619bbc12d8d8807501027c9097285291aac08d94))
+
 ## [0.24.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.24.2...v0.24.3) (2026-11-26)
 
 
