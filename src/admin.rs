@@ -275,8 +275,9 @@ impl AdminServer {
         //
         // Public endpoints (no auth required):
         //   GET /health   — used by load balancer and container health probes.
-        //                   Returns only {status, version, uptime} to avoid leaking
-        //                   internal topology.
+        //                   Liveness only, {"status":"healthy"}: the version,
+        //                   traffic counters and backend states are the
+        //                   authenticated /metrics, /metrics/json and /backends'.
         //
         // All other endpoints require the Bearer token and are subject to per-IP
         // and global brute-force lockout via auth_middleware.
@@ -761,29 +762,14 @@ async fn auth_middleware(
     next.run(request).await.into_response()
 }
 
-/// Health check response (public endpoint — no topology disclosure)
+/// Health check response (public endpoint): liveness, and nothing about the
+/// node. Its version, uptime, traffic and backends are what an unauthenticated
+/// caller has no use for and an attacker would: a version names the advisories
+/// that apply, and backend names and states map the service behind it. They
+/// are on the authenticated `/metrics`, `/metrics/json` and `/backends`.
 #[derive(Serialize)]
 struct HealthResponse {
-    status: String,
-    version: String,
-    uptime_seconds: u64,
-    connections: u64,
-    requests: u64,
-    /// SR-01: Only name + healthy — address/type are omitted to prevent
-    /// leaking internal backend topology to unauthenticated callers.
-    backends: Vec<PublicBackendHealth>,
-}
-
-/// SR-01: Minimal backend status for the public /health endpoint.
-///
-/// Deliberately excludes `address` and `backend_type` so that internal service
-/// topology (e.g. "127.0.0.1:3003") cannot be discovered by unauthenticated
-/// clients or via SSRF pivots.  Full backend detail is available on the
-/// authenticated /backends endpoint only.
-#[derive(Serialize)]
-struct PublicBackendHealth {
-    name: String,
-    healthy: bool,
+    status: &'static str,
 }
 
 /// Backend health status — full detail, used by the authenticated /backends endpoint only
@@ -803,31 +789,9 @@ struct BackendHealth {
     last_check_at: Option<u64>,
 }
 
-/// Health check endpoint (public — no auth required)
-async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResponse> {
-    let config = state.config_manager.get();
-    let uptime = state.start_time.elapsed().as_secs();
-
-    // SR-01: Collect only name + healthy status; omit addresses and types.
-    let mut backends = Vec::new();
-    for name in config.backends.keys() {
-        let healthy = state.backend_pool.health().healthy(name);
-        backends.push(PublicBackendHealth {
-            name: name.clone(),
-            healthy,
-        });
-    }
-
-    let snapshot = state.metrics.snapshot();
-
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime_seconds: uptime,
-        connections: snapshot.connections.active,
-        requests: snapshot.requests.total,
-        backends,
-    })
+/// Health check endpoint (public, no auth): the process is up and answering
+async fn health_handler() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "healthy" })
 }
 
 /// Prometheus metrics endpoint - uses comprehensive MetricsRegistry
@@ -2495,6 +2459,31 @@ async fn waf_explain_handler(
         "body_bytes_inspected": body.as_ref().map_or(0, Vec::len),
         "rules_loaded": waf.rule_count(),
     })))
+}
+
+/// The public `/health`: liveness, and nothing else about the node
+#[cfg(test)]
+mod health_tests {
+    #[tokio::test]
+    async fn the_public_health_check_says_only_that_the_node_is_up() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let app = axum::Router::new().route("/health", axum::routing::get(super::health_handler));
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // No version, uptime, counters or backend names and states
+        assert_eq!(json, serde_json::json!({"status": "healthy"}));
+    }
 }
 
 #[cfg(test)]

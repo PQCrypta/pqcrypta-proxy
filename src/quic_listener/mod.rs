@@ -1400,10 +1400,11 @@ impl QuicListener {
             // Held to the fingerprint policy as every connection is, from the
             // ClientHello, which is readable now: DNS over QUIC answers 0-RTT
             // queries before the handshake completes (RFC 9250 section 4.5).
-            // Counted as a completed or failed handshake once it ends. The
-            // key-exchange policy answers requests and sessions 421, which
-            // DNS has no way to say; it is not applied here.
-            let pqc = {
+            // Counted, and its key exchange recorded by the key-exchange
+            // policy, once the handshake completes; where the policy blocks a
+            // classical one, every query is answered REFUSED, Prohibited
+            // (doq.rs), DNS's way of saying what HTTP says with 421.
+            let (pqc, group) = {
                 let data = current_handshake_data(&connection, hello_data);
                 let (handshake_facts, client_hello) =
                     read_handshake_facts(data.as_deref(), remote_addr);
@@ -1419,15 +1420,17 @@ impl QuicListener {
                 {
                     return Ok(());
                 }
-                handshake_facts.is_post_quantum()
+                (handshake_facts.is_post_quantum(), handshake_facts.kex_group)
             };
             let established: Established = {
                 let connection = connection.clone();
                 let metrics = metrics.clone();
+                let client = remote_addr.ip();
                 Box::pin(async move {
                     let accepted = established.await;
                     if connection.close_reason().is_none() {
                         metrics.tls.handshake_completed(true, pqc);
+                        crate::pqc_policy::handshake_completed(client, group.as_deref(), pqc);
                     } else {
                         metrics.handshake_failed();
                     }
@@ -1439,6 +1442,7 @@ impl QuicListener {
                     connection,
                     established,
                     early_data,
+                    crate::pqc_policy::refuses(pqc),
                     remote_addr.ip(),
                     service,
                     advanced_rate_limiter,
@@ -1452,7 +1456,7 @@ impl QuicListener {
         // nothing replayable in 0-RTT starts a subscription upstream
         // (draft-ietf-moq-transport section 6.3.1).
         if let (Some(alpn), Some(moq)) = (negotiated.as_deref(), crate::moq::running()) {
-            if crate::moq::version::Version::from_alpn(alpn).is_some() {
+            if let Some(version) = crate::moq::version::Version::from_alpn(alpn) {
                 let _open = metrics
                     .connections
                     .connection_opened(ConnectionProtocol::Moqt);
@@ -1461,10 +1465,12 @@ impl QuicListener {
                     return Ok(());
                 }
                 // Counted, and held to the fingerprint policy, as an HTTP/3
-                // connection is before anything is served. The key-exchange
-                // policy answers requests and sessions 421, which MOQT has no
-                // way to say; it is not applied here.
-                {
+                // connection is before anything is served, its key exchange
+                // recorded by the key-exchange policy; where that blocks a
+                // classical one, the session is closed UNAUTHORIZED before it
+                // starts (draft-ietf-moq-transport section 12.2), MOQT's way of
+                // saying what HTTP says with 421.
+                let (pqc, group) = {
                     let data = current_handshake_data(&connection, hello_data);
                     let (handshake_facts, client_hello) =
                         read_handshake_facts(data.as_deref(), remote_addr);
@@ -1483,6 +1489,16 @@ impl QuicListener {
                     {
                         return Ok(());
                     }
+                    (handshake_facts.is_post_quantum(), handshake_facts.kex_group)
+                };
+                crate::pqc_policy::handshake_completed(remote_addr.ip(), group.as_deref(), pqc);
+                if crate::pqc_policy::refuses(pqc) {
+                    let code = crate::moq::error::SessionCode::Unauthorized.code(version);
+                    connection.close(
+                        VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0x2)),
+                        crate::pqc_policy::REFUSAL.as_bytes(),
+                    );
+                    return Ok(());
                 }
                 watch_paths(&connection, remote_addr);
                 moq.serve_quic(connection, alpn, remote_addr).await;
@@ -3876,6 +3892,98 @@ mod listener_tests {
         )));
         let conn = endpoint.connect(addr, "localhost").unwrap().await?;
         Ok((conn, endpoint))
+    }
+
+    /// A QUIC connection offering `alpn` and classical key-exchange groups
+    /// alone (the provider's own less every hybrid ML-KEM one)
+    async fn connect_classical(
+        addr: SocketAddr,
+        der: &[u8],
+        alpn: &[u8],
+    ) -> (quinn::Connection, quinn::Endpoint) {
+        let default = rustls::crypto::aws_lc_rs::default_provider();
+        let provider = Arc::new(rustls::crypto::CryptoProvider {
+            kx_groups: default
+                .kx_groups
+                .iter()
+                .copied()
+                .filter(|g| !format!("{:?}", g.name()).contains("MLKEM"))
+                .collect(),
+            ..default
+        });
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTo(der.to_vec().into(), provider)))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![alpn.to_vec()];
+        let endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )));
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        (conn, endpoint)
+    }
+
+    /// `pqc.downgrade_action = "block"` refuses a classical key exchange in
+    /// each application's own terms: a MOQT session is closed UNAUTHORIZED
+    /// before it starts, and a DNS over QUIC query is answered REFUSED with
+    /// Extended DNS Error 18, Prohibited, the policy's reason with each
+    #[tokio::test]
+    async fn a_blocked_classical_key_exchange_is_refused_by_moqt_and_dns_over_quic() {
+        let _policy = crate::pqc_policy::TEST_POLICY.lock().await;
+        let block = crate::config::PqcConfig {
+            enabled: true,
+            downgrade_action: "block".into(),
+            ..crate::config::PqcConfig::default()
+        };
+        let (addr, der, _stop) = listener_with(|c| {
+            c.pqc = block.clone();
+            c.doq.enabled = true;
+        })
+        .await;
+        crate::pqc_policy::configure(&block);
+
+        let (moqt, _endpoint) = connect_classical(addr, &der, b"moqt-23").await;
+        let (code, reason) = closed_with(&moqt).await;
+        assert_eq!(code, 0x2, "UNAUTHORIZED");
+        assert_eq!(reason, crate::pqc_policy::REFUSAL);
+
+        // A standard query with EDNS, so the answer can carry the EDE
+        let mut query = vec![0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1];
+        for label in ["pqcrypta", "com"] {
+            query.push(u8::try_from(label.len()).unwrap());
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        query.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+        let (doq, _endpoint) = connect_classical(addr, &der, crate::doq::ALPN).await;
+        let (mut send, mut recv) = doq.open_bi().await.unwrap();
+        let mut framed = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
+        framed.extend_from_slice(&query);
+        send.write_all(&framed).await.unwrap();
+        send.finish().unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(4096))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer[2 + 3] & 0x0F, 5, "REFUSED");
+        // OPTION-CODE 15 (EDE), INFO-CODE 18, then the reason
+        let mut ede = vec![0, 15];
+        ede.extend_from_slice(
+            &u16::try_from(2 + crate::pqc_policy::REFUSAL.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        ede.extend_from_slice(&[0, 18]);
+        ede.extend_from_slice(crate::pqc_policy::REFUSAL.as_bytes());
+        assert!(
+            answer.windows(ede.len()).any(|w| w == ede),
+            "EDE 18 with the policy's reason"
+        );
+
+        crate::pqc_policy::configure(&crate::config::PqcConfig::default());
     }
 
     /// Send `indication` as a WebTransport over QUIC client does: on its

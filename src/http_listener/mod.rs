@@ -3938,10 +3938,26 @@ async fn proxy_handler(
             .get::<crate::route_gate::VerifiedContentDigest>()
             .is_some();
         let body = req.into_body();
-        // A signed route's body is held to the digest its signature covered,
-        // as it is forwarded: one that differs never reaches the backend whole.
+        // A signed route's body is read whole and held to the digests its
+        // signature covered before any of it is forwarded
+        // (security::signed_body), as over HTTP/3: the backend has it verified
+        // and whole, or is never asked. Its memory is held while the request
+        // lasts.
+        let mut signed_body_memory = crate::body_budget::Reservation::new();
         let body = match crate::route_gate::expected_body_digest(route, &headers, verified_digest) {
-            Some(digest) => Body::new(crate::route_gate::DigestChecked::new(body, digest)),
+            Some(digests) => {
+                match crate::security::signed_body(
+                    &state.security,
+                    body,
+                    &digests,
+                    &mut signed_body_memory,
+                )
+                .await
+                {
+                    Ok(verified) => Body::from(verified),
+                    Err(refusal) => return *refusal,
+                }
+            }
             None => body,
         };
 
@@ -5599,6 +5615,207 @@ mod peek_tests {
             client_hello_needs(b"GET / HTTP/1.1", 14),
             14,
             "not a handshake"
+        );
+    }
+}
+
+/// A signed route over TCP, through the listener's whole app (its middleware
+/// and the proxy handler), against a backend that records every connection it
+/// is asked on: a body that is not the one signed is refused 400 and the
+/// backend is never asked; the one signed, by sha-256 or sha-512, reaches it
+/// whole.
+#[cfg(test)]
+mod signed_body_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A value made for this run alone: the route's secret, a request's
+    /// nonce. Nothing fixed is signed with or accepted
+    fn fresh() -> String {
+        hex::encode(rand::random::<[u8; 16]>())
+    }
+
+    /// What the recording backend saw: one entry per connection, the bytes it
+    /// sent (head and body)
+    type Seen = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// An HTTP/1.1 backend that counts the connections it accepts and keeps
+    /// each request's bytes, then answers 200
+    async fn recording_backend() -> (SocketAddr, Arc<AtomicUsize>, Seen) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let seen: Seen = Arc::default();
+        let (count, keep) = (Arc::clone(&connections), Arc::clone(&seen));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let keep = Arc::clone(&keep);
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let read =
+                            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf));
+                        let Ok(Ok(n)) = read.await else { break };
+                        if n == 0 {
+                            break;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                        if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                            let length = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if got.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    keep.lock().unwrap().push(got);
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, connections, seen)
+    }
+
+    /// The listener's app with one route to `backend`, signed with `secret`
+    fn app(
+        backend: SocketAddr,
+        secret: &str,
+    ) -> impl tower::Service<
+        Request<Body>,
+        Response = Response,
+        Error = Infallible,
+        Future = impl Future<Output = Result<Response, Infallible>> + Send + 'static,
+    > + Clone {
+        let mut config = ProxyConfig::default();
+        config.security.geoip_db_path = None;
+        config.security.geoip_asn_db_path = None;
+        config.fingerprint.fingerprint_db_path = None;
+        config.backends.insert(
+            "recorder".into(),
+            toml::from_str(&format!(
+                "name = \"recorder\"\ntype = \"http1\"\naddress = \"{backend}\""
+            ))
+            .unwrap(),
+        );
+        config.routes = vec![toml::from_str(&format!(
+            "name = \"signed\"\npath_prefix = \"/signed\"\nbackend = \"recorder\"\n\
+             [security]\nhmac_secret = \"{secret}\""
+        ))
+        .unwrap()];
+        let config = Arc::new(config);
+        let parts = AppParts {
+            port: 443,
+            metrics: Arc::new(MetricsRegistry::new()),
+            load_balancer: Arc::new(LoadBalancer::new(Arc::new(config.load_balancer.clone()))),
+            security_state: SecurityState::new(&config),
+            rate_limiter: Arc::new(AdvancedRateLimiter::new(
+                config.advanced_rate_limiting.clone(),
+            )),
+            fingerprint_extractor: Arc::new(FingerprintExtractor::new()),
+        };
+        build_listener_app(&config, &parts)
+    }
+
+    /// A request on the signed route, signed with `secret` over
+    /// `content_digest` and a nonce of its own, carrying `body`
+    fn signed(secret: &str, content_digest: &str, body: &'static [u8]) -> Request<Body> {
+        let nonce = fresh();
+        let nonce = nonce.as_str();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let path = "/signed/transfer";
+        let signature = crate::route_gate::route_request_signature(
+            secret,
+            "POST",
+            path,
+            &ts,
+            nonce,
+            content_digest,
+        );
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .version(http::Version::HTTP_2)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len())
+            .header("content-digest", content_digest)
+            .header("x-request-timestamp", &ts)
+            .header("x-request-nonce", nonce)
+            .header("x-request-signature", signature)
+            .body(Body::from(body))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
+        request
+    }
+
+    fn digest(algorithm: &str, body: &[u8]) -> String {
+        use base64::Engine;
+        use sha2::Digest;
+        let bytes = match algorithm {
+            "sha-512" => sha2::Sha512::digest(body).to_vec(),
+            _ => sha2::Sha256::digest(body).to_vec(),
+        };
+        format!(
+            "{algorithm}=:{}:",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_the_one_signed_never_reaches_the_backend() {
+        let (backend, connections, seen) = recording_backend().await;
+        let secret = fresh();
+        let app = app(backend, &secret);
+        let signed_for = br#"{"amount":10}"#;
+        let sent = br#"{"amount":99}"#;
+        for algorithm in ["sha-256", "sha-512"] {
+            let refused = app
+                .clone()
+                .oneshot(signed(&secret, &digest(algorithm, signed_for), sent))
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{algorithm}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "the backend was asked"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        // The body signed, by either algorithm, is forwarded whole
+        for algorithm in ["sha-256", "sha-512"] {
+            let served = app
+                .clone()
+                .oneshot(signed(&secret, &digest(algorithm, sent), sent))
+                .await
+                .unwrap();
+            assert_eq!(served.status(), StatusCode::OK, "{algorithm}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter().all(|request| request.ends_with(sent)),
+            "the body whole"
         );
     }
 }

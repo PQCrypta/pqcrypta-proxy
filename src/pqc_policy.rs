@@ -7,8 +7,13 @@
 //!
 //! - `allow`: it is served and nothing is recorded.
 //! - `log` (the default): it is served, and recorded in the audit log.
-//! - `block`: every request on it is answered 421 (Misdirected Request,
-//!   RFC 9110 section 15.5.20), and it is recorded.
+//! - `block`: it is refused in its own protocol's terms, and recorded: every
+//!   HTTP request (and extended CONNECT) on it answered 421 (Misdirected
+//!   Request, RFC 9110 section 15.5.20), a WebTransport over QUIC session
+//!   closed with 421 as its code, every DNS over QUIC query answered REFUSED
+//!   with Extended DNS Error 18, Prohibited (RFC 8914 section 4.19), and a
+//!   MOQT session closed UNAUTHORIZED (draft-ietf-moq-transport section 12.2)
+//!   before it starts. Each carries [`REFUSAL`] as its reason.
 //!
 //! `pqc.log_downgrades = false` turns the record off and leaves the action.
 //! The policy is the process's: every listener asks it here, and a
@@ -91,7 +96,7 @@ pub fn handshake_completed(client: IpAddr, group: Option<&str>, post_quantum: bo
     debug!(
         "classical key exchange ({group}) from {client}{}",
         if blocked {
-            ": its requests are answered 421"
+            ": what it asks is refused"
         } else {
             ""
         }
@@ -107,7 +112,9 @@ pub fn refuses(post_quantum: bool) -> bool {
     !post_quantum && action() == ClassicalAction::Block
 }
 
-/// The body of the 421 a refused request gets.
+/// Why a refusal was made, in each protocol's place for a reason: the 421's
+/// body, the close reason of a session, a DNS answer's Extended DNS Error
+/// text.
 pub const REFUSAL: &str = "This server requires a post-quantum key exchange";
 
 /// Held by a test that moves the process's policy, so no other reads it

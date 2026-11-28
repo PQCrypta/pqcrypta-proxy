@@ -380,43 +380,100 @@ pub fn route_request_signature(
 #[derive(Debug, Clone)]
 pub struct VerifiedContentDigest(pub String);
 
-/// The SHA-256 a signed route request's body must have as it is forwarded.
+/// The digests a body must have, from a `Content-Digest` field (RFC 9530).
 ///
-/// The `sha-256` of its `Content-Digest` (RFC 9530), or that of no bytes when
-/// it sends none. `None` for a route that signs nothing, for a field with no
-/// usable sha-256 (the gate refuses it), and for a body already verified
-/// before it was decoded (`verified`).
+/// Its `sha-256` and `sha-512` members, the algorithms the IANA registry
+/// lists as active. A body matches when every member present matches; one
+/// with neither member cannot be held to anything and matches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyDigests {
+    sha256: Option<[u8; 32]>,
+    sha512: Option<[u8; 64]>,
+}
+
+impl BodyDigests {
+    /// The members of `field` this verifies
+    pub fn of_field(field: &str) -> Self {
+        Self {
+            sha256: content_digest_member(field, "sha-256").and_then(|b| b.try_into().ok()),
+            sha512: content_digest_member(field, "sha-512").and_then(|b| b.try_into().ok()),
+        }
+    }
+
+    /// The digest of no bytes: what a signed request that sends no
+    /// `Content-Digest` is held to
+    pub fn of_nothing() -> Self {
+        use sha2::Digest;
+        Self {
+            sha256: Some(sha2::Sha256::digest(b"").into()),
+            sha512: None,
+        }
+    }
+
+    /// Whether the field named an algorithm this verifies
+    pub const fn names_one(&self) -> bool {
+        self.sha256.is_some() || self.sha512.is_some()
+    }
+
+    /// Whether `body` has every digest named (and at least one is)
+    pub fn matches(&self, body: &[u8]) -> bool {
+        use sha2::Digest;
+        self.names_one()
+            && self
+                .sha256
+                .is_none_or(|d| <[u8; 32]>::from(sha2::Sha256::digest(body)) == d)
+            && self
+                .sha512
+                .is_none_or(|d| <[u8; 64]>::from(sha2::Sha512::digest(body)) == d)
+    }
+}
+
+/// The digests a signed route request's body must have before any of it is
+/// forwarded.
+///
+/// Those of its `Content-Digest` (RFC 9530; the gate refuses a field that
+/// names none this verifies), or that of no bytes when it sends none. `None`
+/// for a route that signs nothing, and for a body already verified before it
+/// was decoded (`verified`). The listeners read the body whole and check it
+/// before the backend has a byte of it: over TCP
+/// (`security::signed_body`), as over HTTP/3.
 pub fn expected_body_digest(
     route: &crate::config::RouteConfig,
     headers: &HeaderMap,
     verified: bool,
-) -> Option<[u8; 32]> {
-    use sha2::Digest;
+) -> Option<BodyDigests> {
     route.security.as_ref()?.hmac_secret.as_ref()?;
     match headers.get("content-digest") {
-        Some(field) => content_digest_sha256(field.to_str().ok()?),
+        Some(field) => Some(field.to_str().map_or(
+            BodyDigests {
+                sha256: None,
+                sha512: None,
+            },
+            BodyDigests::of_field,
+        )),
         None if verified => None,
-        None => Some(sha2::Sha256::digest(b"").into()),
+        None => Some(BodyDigests::of_nothing()),
     }
 }
 
 /// Whether `body` is what its `Content-Digest` says: `Ok(None)` without the
 /// field (or with none of the algorithms this checks), `Ok(Some(field))`
-/// when its sha-256 matches, `Err` when it does not.
+/// when every digest it names matches, `Err` when one does not.
 pub fn check_content_digest(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Option<String>, DigestMismatch> {
-    use sha2::Digest;
     let Some(field) = headers.get("content-digest").and_then(|v| v.to_str().ok()) else {
         return Ok(None);
     };
-    match content_digest_sha256(field) {
-        None => Ok(None),
-        Some(expected) if <[u8; 32]>::from(sha2::Sha256::digest(body)) == expected => {
-            Ok(Some(field.to_string()))
-        }
-        Some(_) => Err(DigestMismatch),
+    let digests = BodyDigests::of_field(field);
+    if !digests.names_one() {
+        return Ok(None);
+    }
+    if digests.matches(body) {
+        Ok(Some(field.to_string()))
+    } else {
+        Err(DigestMismatch)
     }
 }
 
@@ -432,98 +489,27 @@ impl std::fmt::Display for DigestMismatch {
 
 impl std::error::Error for DigestMismatch {}
 
-/// The `sha-256` member of a `Content-Digest` field: `sha-256=:<base64>:`
-/// among its comma-separated members (RFC 9530 section 2, a structured
-/// dictionary of byte sequences).
-fn content_digest_sha256(field: &str) -> Option<[u8; 32]> {
+/// One member of a `Content-Digest` field: `<algorithm>=:<base64>:` among its
+/// comma-separated members (RFC 9530 section 2, a structured dictionary of
+/// byte sequences), its key compared without case.
+fn content_digest_member(field: &str, algorithm: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     field.split(',').find_map(|member| {
         let (key, value) = member.trim().split_once('=')?;
-        if !key.trim().eq_ignore_ascii_case("sha-256") {
+        if !key.trim().eq_ignore_ascii_case(algorithm) {
             return None;
         }
         let bytes = value.trim().strip_prefix(':')?.strip_suffix(':')?;
-        base64::engine::general_purpose::STANDARD
-            .decode(bytes)
-            .ok()?
-            .try_into()
-            .ok()
+        base64::engine::general_purpose::STANDARD.decode(bytes).ok()
     })
-}
-
-pin_project_lite::pin_project! {
-    /// A request body checked against the digest its signature covered: at
-    /// its end, one whose SHA-256 differs ends in an error instead, so the
-    /// backend never has it whole.
-    pub struct DigestChecked<B> {
-        #[pin]
-        inner: B,
-        hasher: sha2::Sha256,
-        expected: [u8; 32],
-        finished: bool,
-    }
-}
-
-impl<B> DigestChecked<B> {
-    pub fn new(inner: B, expected: [u8; 32]) -> Self {
-        use sha2::Digest;
-        Self {
-            inner,
-            hasher: sha2::Sha256::new(),
-            expected,
-            finished: false,
-        }
-    }
-}
-
-impl<B> hyper::body::Body for DigestChecked<B>
-where
-    B: hyper::body::Body<Data = bytes::Bytes>,
-    B::Error: Into<axum::BoxError>,
-{
-    type Data = bytes::Bytes;
-    type Error = axum::BoxError;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, axum::BoxError>>> {
-        use sha2::Digest;
-        use std::task::Poll;
-        let this = self.project();
-        if *this.finished {
-            return Poll::Ready(None);
-        }
-        match std::task::ready!(this.inner.poll_frame(cx)) {
-            Some(Ok(frame)) => {
-                if let Some(data) = frame.data_ref() {
-                    this.hasher.update(data);
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Some(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            None => {
-                *this.finished = true;
-                let got: [u8; 32] = this.hasher.finalize_reset().into();
-                if got == *this.expected {
-                    Poll::Ready(None)
-                } else {
-                    warn!("A signed request's body does not match its Content-Digest");
-                    Poll::Ready(Some(Err(
-                        "the request body does not match its signed Content-Digest".into(),
-                    )))
-                }
-            }
-        }
-    }
 }
 
 /// Per-route HMAC proof-of-possession.
 ///
 /// Signature: [`route_request_signature`], over the method, path and query,
-/// timestamp, nonce and `Content-Digest`, whose sha-256 the body is held to
-/// as it is forwarded ([`DigestChecked`]; a request with no field must have
-/// no body). `X-Request-Nonce` (8 to 128 characters) is required, bound into
+/// timestamp, nonce and `Content-Digest`, whose digests (sha-256, sha-512)
+/// the body is held to before any of it is forwarded ([`BodyDigests`]; a
+/// request with no field must have no body). `X-Request-Nonce` (8 to 128 characters) is required, bound into
 /// the signature and accepted once within the window: a signed request cannot
 /// be sent again, which freshness alone (the timestamp) would allow for the
 /// whole window.
@@ -577,10 +563,10 @@ fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     let content_digest = match cx.headers.get("content-digest") {
         None => cx.verified_content_digest.unwrap_or_default(),
         Some(field) => match field.to_str() {
-            Ok(text) if content_digest_sha256(text).is_some() => text,
+            Ok(text) if BodyDigests::of_field(text).names_one() => text,
             _ => {
                 warn!(
-                    "Route {:?} HMAC request from {} has a Content-Digest with no sha-256",
+                    "Route {:?} HMAC request from {} has a Content-Digest with neither sha-256 nor sha-512",
                     cx.route.name, cx.client_ip
                 );
                 return refuse(StatusCode::BAD_REQUEST);
@@ -679,47 +665,48 @@ mod tests {
     }
 
     #[test]
-    fn content_digest_reads_its_sha256_member() {
+    fn content_digest_reads_its_sha256_and_sha512_members() {
         use base64::Engine;
         use sha2::Digest;
-        let digest: [u8; 32] = sha2::Sha256::digest(b"{\"a\":1}").into();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
-        assert_eq!(
-            content_digest_sha256(&format!("sha-256=:{b64}:")),
-            Some(digest)
+        let b64 = |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(d);
+        let body = b"{\"a\":1}";
+        let s256 = b64(&sha2::Sha256::digest(body));
+        let s512 = b64(&sha2::Sha512::digest(body));
+        // Either member alone, both, and among another algorithm's
+        for field in [
+            format!("sha-256=:{s256}:"),
+            format!("sha-512=:{s512}:"),
+            format!("sha-512=:{s512}:, sha-256=:{s256}:"),
+            format!("unixsum=:AAAA:, SHA-256=:{s256}:"),
+        ] {
+            let d = BodyDigests::of_field(&field);
+            assert!(d.names_one() && d.matches(body), "{field}");
+            assert!(!d.matches(b"{\"a\":2}"), "{field}");
+        }
+        // Every member named must match: a right sha-256 beside a wrong sha-512
+        let wrong512 = b64(&sha2::Sha512::digest(b"other"));
+        assert!(
+            !BodyDigests::of_field(&format!("sha-256=:{s256}:, sha-512=:{wrong512}:"))
+                .matches(body)
         );
-        assert_eq!(
-            content_digest_sha256(&format!("sha-512=:AAAA:, sha-256=:{b64}:")),
-            Some(digest)
-        );
-        assert_eq!(content_digest_sha256("sha-512=:AAAA:"), None);
-        assert_eq!(content_digest_sha256("sha-256=:not base64:"), None);
+        // Nothing this verifies: matches nothing
+        for field in ["sha-1=:AAAA:", "sha-256=:not base64:", "sha-256=:AAAA:", ""] {
+            let d = BodyDigests::of_field(field);
+            assert!(!d.names_one() && !d.matches(body), "{field}");
+        }
+        assert!(BodyDigests::of_nothing().matches(b""));
+        assert!(!BodyDigests::of_nothing().matches(b"x"));
 
         let mut h = HeaderMap::new();
         assert_eq!(check_content_digest(&h, b"x"), Ok(None));
         h.insert(
             "content-digest",
-            HeaderValue::from_str(&format!("sha-256=:{b64}:")).unwrap(),
+            HeaderValue::from_str(&format!("sha-512=:{s512}:")).unwrap(),
         );
-        assert!(check_content_digest(&h, b"{\"a\":1}").unwrap().is_some());
+        assert!(check_content_digest(&h, body).unwrap().is_some());
         assert_eq!(check_content_digest(&h, b"{\"a\":2}"), Err(DigestMismatch));
-    }
-
-    /// A signed body is forwarded as it comes, and ends in an error where it
-    /// is not the one signed, so the backend never has it whole.
-    #[tokio::test]
-    async fn a_signed_body_that_differs_ends_in_an_error() {
-        use http_body_util::BodyExt;
-        use sha2::Digest;
-        let signed: [u8; 32] = sha2::Sha256::digest(b"hello world").into();
-        let whole = DigestChecked::new(axum::body::Body::from("hello world"), signed)
-            .collect()
-            .await;
-        assert_eq!(whole.unwrap().to_bytes().as_ref(), b"hello world");
-        let other = DigestChecked::new(axum::body::Body::from("hello there"), signed)
-            .collect()
-            .await;
-        assert!(other.is_err());
+        h.insert("content-digest", HeaderValue::from_static("md5=:AAAA:"));
+        assert_eq!(check_content_digest(&h, body), Ok(None));
     }
 
     fn ctx<'a>(
