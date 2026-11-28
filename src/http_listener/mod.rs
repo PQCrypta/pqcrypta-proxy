@@ -5629,7 +5629,11 @@ mod signed_body_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const SECRET: &str = "signed-route-test-secret";
+    /// A value made for this run alone: the route's secret, a request's
+    /// nonce. Nothing fixed is signed with or accepted
+    fn fresh() -> String {
+        hex::encode(rand::random::<[u8; 16]>())
+    }
 
     /// What the recording backend saw: one entry per connection, the bytes it
     /// sent (head and body)
@@ -5683,9 +5687,10 @@ mod signed_body_tests {
         (addr, connections, seen)
     }
 
-    /// The listener's app with one signed route to `backend`
+    /// The listener's app with one route to `backend`, signed with `secret`
     fn app(
         backend: SocketAddr,
+        secret: &str,
     ) -> impl tower::Service<
         Request<Body>,
         Response = Response,
@@ -5705,7 +5710,7 @@ mod signed_body_tests {
         );
         config.routes = vec![toml::from_str(&format!(
             "name = \"signed\"\npath_prefix = \"/signed\"\nbackend = \"recorder\"\n\
-             [security]\nhmac_secret = \"{SECRET}\""
+             [security]\nhmac_secret = \"{secret}\""
         ))
         .unwrap()];
         let config = Arc::new(config);
@@ -5722,9 +5727,11 @@ mod signed_body_tests {
         build_listener_app(&config, &parts)
     }
 
-    /// A request on the signed route, signed over `content_digest`, carrying
-    /// `body`
-    fn signed(content_digest: &str, body: &'static [u8], nonce: &str) -> Request<Body> {
+    /// A request on the signed route, signed with `secret` over
+    /// `content_digest` and a nonce of its own, carrying `body`
+    fn signed(secret: &str, content_digest: &str, body: &'static [u8]) -> Request<Body> {
+        let nonce = fresh();
+        let nonce = nonce.as_str();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5732,7 +5739,7 @@ mod signed_body_tests {
             .to_string();
         let path = "/signed/transfer";
         let signature = crate::route_gate::route_request_signature(
-            SECRET,
+            secret,
             "POST",
             path,
             &ts,
@@ -5774,17 +5781,14 @@ mod signed_body_tests {
     #[tokio::test]
     async fn a_body_that_is_not_the_one_signed_never_reaches_the_backend() {
         let (backend, connections, seen) = recording_backend().await;
-        let app = app(backend);
+        let secret = fresh();
+        let app = app(backend, &secret);
         let signed_for = br#"{"amount":10}"#;
         let sent = br#"{"amount":99}"#;
         for algorithm in ["sha-256", "sha-512"] {
             let refused = app
                 .clone()
-                .oneshot(signed(
-                    &digest(algorithm, signed_for),
-                    sent,
-                    &format!("nonce-{algorithm}-bad"),
-                ))
+                .oneshot(signed(&secret, &digest(algorithm, signed_for), sent))
                 .await
                 .unwrap();
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{algorithm}");
@@ -5801,11 +5805,7 @@ mod signed_body_tests {
         for algorithm in ["sha-256", "sha-512"] {
             let served = app
                 .clone()
-                .oneshot(signed(
-                    &digest(algorithm, sent),
-                    sent,
-                    &format!("nonce-{algorithm}-good"),
-                ))
+                .oneshot(signed(&secret, &digest(algorithm, sent), sent))
                 .await
                 .unwrap();
             assert_eq!(served.status(), StatusCode::OK, "{algorithm}");
