@@ -165,8 +165,11 @@ malformed stream, or a unidirectional stream from the client, ends the
 connection with DOQ_PROTOCOL_ERROR. A query over the per-address rate limits
 has its stream reset with DOQ_EXCESSIVE_LOAD. In 0-RTT data, only standard
 queries are forwarded; anything else is answered REFUSED with Extended DNS
-Error 26, "Too Early" (RFC 9250 §4.5). Connections are counted under the `doq`
-protocol in `/metrics`, apart from HTTP/3.
+Error 26, "Too Early" (RFC 9250 §4.5). Where `pqc.downgrade_action` is
+`block`, every query on a connection whose key exchange was classical is
+answered REFUSED with Extended DNS Error 18, "Prohibited", and nothing is
+asked of the name server. Connections are counted under the `doq` protocol in
+`/metrics`, apart from HTTP/3.
 
 **Disabled by default.** Changes take effect on restart.
 
@@ -245,6 +248,10 @@ There are three entrances, all chosen by protocol negotiation, never by port:
   names the version chosen; a request that offers none is refused with 400.
 - **WebTransport on `webtransport_port`** (4433), in the same way: the same
   QUIC listener serves that port.
+
+Where `pqc.downgrade_action` is `block`, a native MOQT connection whose key
+exchange was classical is closed UNAUTHORIZED before the session starts (over
+WebTransport, the CONNECT is answered 421).
 
 Subscribing is open, held to the per-address rate limits. Publishing (PUBLISH,
 PUBLISH_NAMESPACE) needs an authorization token for the namespace. Tokens are
@@ -427,7 +434,7 @@ All responses automatically include these security headers. The `Server` header 
 | `additional_kems` | array[string] | `["SecP256r1MLKEM768", "SecP384r1MLKEM1024"]` | Additional KEMs to enable |
 | `experimental_groups` | array[string] | `[]` | Provider groups with no IANA codepoint (OQS: `frodo976shake`, `p384_frodo976shake`, ...), offered over TCP and QUIC after standard ML-KEM and before the classical fallback; hybrids only under `require_hybrid`, on both |
 | `enable_signatures` | bool | `true` | Serve ML-DSA-87 (FIPS 204) certificate keys with the PQDSA signer (scheme 0x0906); false refuses such keys, so a host configured with one stops serving rather than falling back. Needs the `pqc-signatures` build feature |
-| `downgrade_action` | string | `"log"` | What a connection whose key exchange is classical gets while `enabled` is true: `"allow"` (served), `"log"` (served, recorded in the audit log), `"block"` (every request on it answered 421). Any other value is refused at load |
+| `downgrade_action` | string | `"log"` | What a connection whose key exchange is classical gets while `enabled` is true: `"allow"` (served), `"log"` (served, recorded in the audit log), `"block"` (refused in its own protocol's terms: every HTTP request on it answered 421, a WebTransport over QUIC session closed with code 421, every DNS over QUIC query answered REFUSED with Extended DNS Error 18, Prohibited, a MOQT session closed UNAUTHORIZED). Any other value is refused at load |
 | `log_downgrades` | bool | `true` | Record classical handshakes in the audit log under `"log"` and `"block"`, once per address in 10 minutes |
 | `require_hybrid` | bool | `false` | Offer hybrid groups only (classical + PQC): no pure ML-KEM, no non-hybrid experimental group and no classical fallback, on every listener. A client with neither a hybrid nor PQC support fails the handshake |
 | `verify_provider` | bool | `true` | Verify PQC provider at startup |
@@ -1037,7 +1044,7 @@ Single backend definitions (use backend pools for load balancing).
 | `tls_sni` | string? | `null` | Custom SNI hostname |
 | `timeout_ms` | u64 | `30000` | Connection timeout (30 seconds) |
 | `max_connections` | u32 | `100` | Requests in flight to this backend at once, for the whole process and every transport; a request holds its place until its response body has been sent on, and one that cannot have a place within `connection_pool.acquire_timeout_ms` is refused |
-| `health_check` | string? | `null` | Path this backend is asked in the background, a GET over the transport its requests take, healthy on a 2xx (a `tcp` backend is connected to); the admin API's `/health`, `/backends` and `pqcrypta_backend_up` report the last answer. Without one the backend is reported up |
+| `health_check` | string? | `null` | Path this backend is asked in the background, a GET over the transport its requests take, healthy on a 2xx (a `tcp` backend is connected to); the admin API's `/backends` and `pqcrypta_backend_up` report the last answer. Without one the backend is reported up |
 | `health_check_interval_secs` | u64 | `30` | How often `health_check` is asked, under whatever configuration is current; a probe has half of it to answer, from 1 to 10 s |
 | `retries` | u8? | `null` | Attempts after the first (2 when unset) |
 | `retry_backoff_ms` | u64? | `null` | Before the first retry, doubled before each after it (50 ms when unset) |

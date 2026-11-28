@@ -3888,6 +3888,47 @@ async fn read_body(
     Ok(collected)
 }
 
+/// A signed route's body, read whole and held to the digests its signature
+/// covered before any of it is forwarded, as over HTTP/3
+/// (quic_listener/request.rs): the backend has a signed request's body
+/// verified and whole, or none of it. Read as every buffered body is, within
+/// `security.max_request_size` and the process's budget for request bodies,
+/// held by `reservation` while the request lasts; `Err` is the response that
+/// refuses it: 400 for a body that is not the one signed, and the answers the
+/// security layer gives a body too large (413), past the budget (503) or cut
+/// short (400).
+pub(crate) async fn signed_body(
+    security: &SecurityState,
+    body: Body,
+    digests: &crate::route_gate::BodyDigests,
+    reservation: &mut crate::body_budget::Reservation,
+) -> Result<Vec<u8>, Box<Response>> {
+    let alt_svc_value = security.alt_svc_header.load_full();
+    let alt_svc: &str = alt_svc_value.as_str();
+    let max = security.config.read().max_request_size;
+    let body = match read_body(body, max, reservation).await {
+        Ok(body) => body,
+        Err(BodyRefusal::TooLarge) => {
+            return Err(Box::new(payload_too_large_response(max, alt_svc)))
+        }
+        Err(BodyRefusal::NoMemory) => {
+            return Err(Box::new(body_memory_exhausted_response(alt_svc)))
+        }
+        Err(BodyRefusal::Incomplete) => return Err(Box::new(incomplete_body_response(alt_svc))),
+    };
+    if !digests.matches(&body) {
+        warn!("A signed request's body does not match its Content-Digest: not forwarded");
+        let mut response = (
+            StatusCode::BAD_REQUEST,
+            "The request body does not match its signed Content-Digest",
+        )
+            .into_response();
+        add_alt_svc(&mut response, alt_svc);
+        return Err(Box::new(response));
+    }
+    Ok(body)
+}
+
 /// A body whose request carries a content coding, decoded, with the request
 /// head made to describe the decoded body (see request_encoding.rs); the
 /// body as it came when there is none or the WAF does not decode bodies.

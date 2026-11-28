@@ -18,7 +18,11 @@
 //!   before the handshake completes (section 4.5).
 //!
 //! Each query is held to the per-address rate limits the HTTP routes use; one
-//! over the limit has its stream reset with DOQ_EXCESSIVE_LOAD.
+//! over the limit has its stream reset with DOQ_EXCESSIVE_LOAD. On a
+//! connection whose key exchange was classical, where `pqc.downgrade_action`
+//! is `block` (crate::pqc_policy), every query is answered REFUSED with
+//! Extended DNS Error 18, Prohibited, and the policy's reason, and nothing is
+//! asked of the name server: DNS's own way of saying what HTTP says with 421.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -59,6 +63,8 @@ const EDE_NO_REACHABLE_AUTHORITY: u16 = 22;
 const TOO_EARLY_TEXT: &[u8] =
     b"only standard queries are answered in 0-RTT data; send it again once the handshake is complete";
 const UNREACHABLE_TEXT: &[u8] = b"the name server did not answer";
+/// RFC 8914 section 4.19: Prohibited, for a client the server will not answer
+const EDE_PROHIBITED: u16 = 18;
 
 /// The name server DoQ on the QUIC listener asks, and how long it waits.
 pub struct Service {
@@ -117,11 +123,22 @@ enum Reply {
     ProtocolError,
 }
 
-/// The gateway's rule, with section 4.5's for 0-RTT data first.
-fn decide(query: &[u8], in_early_data: bool) -> Reply {
+/// The gateway's rule: the key-exchange policy's first (`classical_refused`:
+/// a classical key exchange where the policy blocks one), then section 4.5's
+/// for 0-RTT data.
+fn decide(query: &[u8], in_early_data: bool, classical_refused: bool) -> Reply {
     let Some(info) = inspect(query) else {
         return Reply::ProtocolError;
     };
+    if classical_refused {
+        return Reply::Here(answered_here(
+            query,
+            &info,
+            RCODE_REFUSED,
+            EDE_PROHIBITED,
+            crate::pqc_policy::REFUSAL.as_bytes(),
+        ));
+    }
     if info.forwardable() {
         return Reply::Forward;
     }
@@ -143,13 +160,17 @@ fn decide(query: &[u8], in_early_data: bool) -> Reply {
     ))
 }
 
-/// Serve one QUIC connection that negotiated `doq`. `early_data` is whether
-/// the server accepted the client's 0-RTT data; `established` resolves when
-/// the handshake completes.
+/// Serve one QUIC connection that negotiated `doq`.
+///
+/// `early_data` is whether the server accepted the client's 0-RTT data;
+/// `established` resolves when the handshake completes; `classical_refused`,
+/// whether the key-exchange policy refuses this connection's
+/// (`pqc_policy::refuses`).
 pub async fn serve(
     connection: quinn::Connection,
     established: impl std::future::Future<Output = bool> + Send + 'static,
     early_data: bool,
+    classical_refused: bool,
     peer: IpAddr,
     service: Arc<Service>,
     limiter: Arc<AdvancedRateLimiter>,
@@ -172,7 +193,17 @@ pub async fn serve(
                     let service = Arc::clone(&service);
                     let limiter = Arc::clone(&limiter);
                     tokio::spawn(async move {
-                        stream(connection, send, recv, in_early_data, peer, service, limiter).await;
+                        stream(
+                            connection,
+                            send,
+                            recv,
+                            in_early_data,
+                            classical_refused,
+                            peer,
+                            service,
+                            limiter,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
@@ -193,11 +224,13 @@ pub async fn serve(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn stream(
     connection: quinn::Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     in_early_data: bool,
+    classical_refused: bool,
     peer: IpAddr,
     service: Arc<Service>,
     limiter: Arc<AdvancedRateLimiter>,
@@ -232,7 +265,7 @@ async fn stream(
         let _ = send.reset(quinn::VarInt::from_u32(DOQ_EXCESSIVE_LOAD));
         return;
     }
-    let answer = match decide(query, in_early_data) {
+    let answer = match decide(query, in_early_data, classical_refused) {
         Reply::ProtocolError => {
             connection.close(
                 quinn::VarInt::from_u32(DOQ_PROTOCOL_ERROR),
@@ -371,20 +404,20 @@ mod tests {
     #[test]
     fn a_standard_query_goes_to_the_name_server_in_0rtt_or_after() {
         for early in [false, true] {
-            assert_eq!(decide(&query(0, true), early), Reply::Forward);
+            assert_eq!(decide(&query(0, true), early, false), Reply::Forward);
         }
     }
 
     #[test]
     fn anything_else_in_0rtt_is_too_early_and_after_it_refused() {
         // Opcode 5, UPDATE: not replayable
-        let Reply::Here(early) = decide(&query(5, true), true) else {
+        let Reply::Here(early) = decide(&query(5, true), true, false) else {
             panic!("answered here");
         };
         assert_eq!(early[3] & 0x0F, 5, "REFUSED");
         assert_eq!(ede(&early), Some(EDE_TOO_EARLY));
         assert_eq!(&early[..2], &[0, 0], "Message ID 0");
-        let Reply::Here(late) = decide(&query(5, true), false) else {
+        let Reply::Here(late) = decide(&query(5, true), false, false) else {
             panic!("answered here");
         };
         assert_eq!(late[3] & 0x0F, 5);
@@ -392,9 +425,32 @@ mod tests {
     }
 
     #[test]
+    fn a_classical_key_exchange_the_policy_blocks_is_refused_prohibited() {
+        // Every query, standard or not, in 0-RTT or after: REFUSED with
+        // Extended DNS Error 18 and the policy's reason, never forwarded
+        for (opcode, early) in [(0, false), (0, true), (5, false)] {
+            let Reply::Here(answer) = decide(&query(opcode, true), early, true) else {
+                panic!("opcode {opcode}, early {early}: not answered here");
+            };
+            assert_eq!(answer[3] & 0x0F, 5, "REFUSED");
+            assert_eq!(ede(&answer), Some(EDE_PROHIBITED));
+            assert!(
+                answer
+                    .windows(crate::pqc_policy::REFUSAL.len())
+                    .any(|w| w == crate::pqc_policy::REFUSAL.as_bytes()),
+                "the policy's reason as the EDE's text"
+            );
+        }
+        // A message that is no query is still a protocol error
+        let mut response = query(0, false);
+        response[2] |= 0x80;
+        assert_eq!(decide(&response, false, true), Reply::ProtocolError);
+    }
+
+    #[test]
     fn a_response_on_a_stream_is_a_protocol_error() {
         let mut response = query(0, false);
         response[2] |= 0x80;
-        assert_eq!(decide(&response, false), Reply::ProtocolError);
+        assert_eq!(decide(&response, false, false), Reply::ProtocolError);
     }
 }

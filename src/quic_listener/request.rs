@@ -1409,11 +1409,10 @@ impl QuicListener {
 
         // A signed route's body is held to the digest its signature covered
         // (route_gate), as received, before any content coding is decoded.
-        if let Some(expected) =
+        if let Some(digests) =
             crate::route_gate::expected_body_digest(route, request.headers(), false)
         {
-            use sha2::Digest;
-            if <[u8; 32]>::from(sha2::Sha256::digest(&body)) != expected {
+            if !digests.matches(&body) {
                 warn!(
                     "HTTP/3 {} {}: the body does not match its signed Content-Digest",
                     method, path
